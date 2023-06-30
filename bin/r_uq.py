@@ -126,19 +126,19 @@ class R_UQ:
                                )
 
         # Hash things
-        self.hash2pair2b = {pair: hashed_pair for pair, hashed_pair in 
+        self.pair2hash2b = {pair: hashed_pair for pair, hashed_pair in 
                             zip(self.bspline_config.chemical_system.interactions_map[2],
                             self.bspline_config.chemical_system.interaction_hashes[2]
                             )
                            }
         if self.bspline_config.degree > 2:
-            self.hash2pair3b = {pair: hashed_pair for pair, hashed_pair in 
+            self.pair2hash3b = {pair: hashed_pair for pair, hashed_pair in 
                                 zip(self.bspline_config.chemical_system.interactions_map[3],
                                 self.bspline_config.chemical_system.interaction_hashes[3]
                                 )
                                }
-        self.r_min_2b_hashed = {self.hash2pair2b[pair]: value for pair, value in self.bspline_config.r_min_map.items() if len(pair) == 2}  # e.g.: {("Pt", "Pt"): 0.1} --> {6240: 0.1}
-        self.r_max_2b_hashed = {self.hash2pair2b[pair]: value for pair, value in self.bspline_config.r_max_map.items() if len(pair) == 2}
+        self.r_min_2b_hashed = {self.pair2hash2b[pair]: value for pair, value in self.bspline_config.r_min_map.items() if len(pair) == 2}  # e.g.: {("Pt", "Pt"): 0.1} --> {6240: 0.1}
+        self.r_max_2b_hashed = {self.pair2hash2b[pair]: value for pair, value in self.bspline_config.r_max_map.items() if len(pair) == 2}
         self.pair_hash_array = self.build_pair_hash_array()
         # TODO: implement similar "hash tensor" for 3 body
 
