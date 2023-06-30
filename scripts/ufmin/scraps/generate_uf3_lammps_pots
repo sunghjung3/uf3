@@ -1,0 +1,8 @@
+#!/bin/bash
+
+if [ $1 = "-h" ] || [ $1 = "--help" ]; then
+    echo Usage: generate_uf3_lammps_pots NAME_of_POSCAR NAME_of_UF3_model_File DIR_PATH_or_NAME
+    exit
+fi
+
+python /home/sung/uf3_pylammps/tmp/uf3/lammps_plugin/scripts/generate_uf3_lammps_pots.py $1 $2 $3
