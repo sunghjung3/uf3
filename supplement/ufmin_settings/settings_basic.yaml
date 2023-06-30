@@ -1,0 +1,35 @@
+outputs_path: "."
+
+elements:
+  - Pt
+degree: 3
+
+basis:
+  r_min:
+    Pt-Pt: 0.1
+    Pt-Pt-Pt:
+      - 1.5
+      - 1.5
+      - 1.5
+  r_max:
+    Pt-Pt: 5.3
+    Pt-Pt-Pt:
+      - 4.0
+      - 4.0
+      - 8.0
+  resolution:
+    Pt-Pt: 20
+    Pt-Pt-Pt:
+      - 7
+      - 7
+      - 10
+
+data:
+  db_path: emt_pt38.traj
+features:
+  features_path: features.h5
+  n_cores: 16
+model:
+  model_path: model.json
+learning:
+  weight: 0.225

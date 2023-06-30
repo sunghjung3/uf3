@@ -1,0 +1,68 @@
+# At the bare minimum, "elements" and "degree" should be included
+
+outputs_path: "./output"  # all file will be written to this path
+
+elements:
+  - Si
+  - N
+degree: 3  # value of n in n-body interaction
+seed: 1234  # random number seed
+
+
+basis:
+  # Range of B-spline's support is from r_min to r_max (in Angstroms)
+
+  r_min:
+    Si-Si: 0.01
+    Si-Si-Si:  # i, j, k (where i is the center atom)
+      - 1.5  # r_ij
+      - 1.5  # r_ik
+      - 1.5  # r_jk
+    # With multiple elements, it can get annoying trying to write all pairs and triples
+    # Instead, to use the same values for all other pairs/triples, include "other_2b" and "other_3b"
+    other_2b: 0.01  # 2 body
+    other_3b:  # 3 body
+      - 1.5
+      - 1.5
+      - 1.5
+    # Alternatively, if not r_min is not explictly specidfied NOR other_2b/3b is included, the default UF3 value (1.0) will be used
+
+  r_max:  # also can use other_2b/3b
+    Si-Si: 5.3
+    Si-Si-Si:
+      - 4.0
+      - 4.0
+      - 8.0
+    # Default UF3 values: 8.0 (2b), 4.0 (3b)
+
+  resolution:  # number of knot intervals. Also can use other_2b/3b
+    Si-Si: 20
+    Si-Si-Si:
+      - 7
+      - 7
+      - 10
+    # Default UF3 values: 15 (2b), [5, 5, 10] (3b)
+
+  knot_strategy: linear  # how to space knots. Possible values: linear, inverse, geometric, or lammps (default: linear)
+  load_knots: no  # if yes, uses custom knot vector from ./knots_path
+  dump_knots: no  # if yes, writes knot vector to outputs_path/knots_path
+  knots_path: knots.json  # only if load_knots=yes (read) or dump_knots=yes (write)
+
+data:
+  db_path: "data.db"  # training data file (.db or anything supported by ase.io.read())
+features:
+  features_path: "df_features.h5"  # file name to write featurizations (h5 file)
+  n_cores: 16  # number of cores to use in featurization (default: 16)
+  fit_forces: yes  # whether to generate force features
+  column_prefix: x  # as far as I'm aware, this has no functionality anywhere
+model:
+  model_path: "model.json"
+learning:
+  weight: 0.225 # higher values = more energy contribution over force (default: 0.5)
+  regularizer:  # parameters for the regularization matrix (listed below are default values)
+    ridge_1b: 1e-8
+    ridge_2b: 0.0
+    ridge_3b: 1e-8
+    curvature_1b: 0.0
+    curvature_2b: 1e-8
+    curvature_3b: 1e-8

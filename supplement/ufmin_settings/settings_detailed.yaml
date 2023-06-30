@@ -1,0 +1,59 @@
+outputs_path: ./output
+elements: 
+    - H
+degree: 2
+seed: 1234
+
+data:
+    db_path: data_all.db
+    max_per_file: -1
+    min_diff: 0
+    generate_stats: True
+    progress: bar
+    vasp_pressure: no
+    sources:
+        path: .
+        pattern: "*vasprun.xml"
+    keys:
+        atoms_key: geometry
+        energy_key: energy
+        force_key: forces
+        size_key: size
+
+basis:
+    r_min:
+        H-H: 2
+    r_max:
+        H-H: 3.5
+    resolution:
+        H-H: 10
+    fit_offsets: yes
+    trailing_trim: 3
+    mask_trim: yes
+    knot_strategy: linear
+    knots_path: knots.json
+    load_knots: no
+    dump_knots: yes
+
+features:
+    features_path: features_all.h5
+    n_cores: 4
+    parallel: python
+    fit_forces: yes
+    column_prefix: x
+
+model:
+    model_path: model.json
+
+learning:
+    splits_path: training.json
+    weight: 0.225
+    regularizer:
+        ridge_1b: 1.0e-8
+        ridge_2b: 1.0e-9
+        ridge_3b: 1.0e-6
+        curvature_1b: 0.0
+        curvature_2b: 1.0e-9 
+        curvature_3b: 1.0e-6
+
+
