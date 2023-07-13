@@ -16,7 +16,7 @@ from uf3.forcefield import calculator
 from uf3.regression import least_squares
 from uf3.util import cubehelix
 
-from libufmin_analysis import plot_pair_energy
+from libufmin_analysis import plot_pair_energy, calc_pair_energy
 
 
 def lj(r_min, depth, r):
@@ -59,7 +59,7 @@ def opt_pair_pot_frames(radial_potential, traj, model=None, training_traj=None, 
         coefficients_2b = solutions[pair]
         knot_sequence = model.bspline_config.knots_map[pair]
         pair_model = copy.deepcopy(model)
-        pair_model.coefficients[0] /= (nAtoms * (nAtoms-1) / 2)  # 1 body offset corrected to 2 atoms
+        pair_model.coefficients[0] *= nAtoms / (nAtoms * (nAtoms-1) / 2) / 2 # 1 body offset corrected to 2 atoms
         model_calc = calculator.UFCalculator(pair_model)
         model_calc_atoms = Atoms(element * model_calc.bspline_config.degree)
         model_calc_atoms.positions = np.zeros((len(model_calc_atoms), 3))
