@@ -301,9 +301,10 @@ class WeightedLinearModel(BasicLinearModel):
         gram_e, ord_e = batched_moore_penrose(x_e, y_e, batch_size=batch_size)
         if x_f is not None:
             try:
+                warnings.filterwarnings("error")  # to catch divide by zero warnings
                 energy_weight = 1 / len(y_e) / np.std(y_e)
                 force_weight = 1 / len(y_f) / np.std(y_f)
-            except (ZeroDivisionError, FloatingPointError):
+            except (ZeroDivisionError, FloatingPointError, RuntimeWarning):
                 energy_weight = 1.0
                 force_weight = 1 / len(y_f)
             x_f, y_f = freeze_columns(x_f,
@@ -669,9 +670,6 @@ def dataframe_to_tuples(df_features,
         y (np.ndarray): target vector.
         w (np.ndarray): weight vector for machine learning.
     """
-    if len(df_features) <= 1:
-        raise ValueError(
-            "Not enough samples ({} provided)".format(len(df_features)))
     names = df_features.index.get_level_values(0)
     y_index = df_features.index.get_level_values(-1)
     energy_mask = (y_index == energy_key)
