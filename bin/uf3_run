@@ -435,12 +435,13 @@ def train(features: pd.DataFrame | str,
     if regularization_values is None:
         regularization_values = dict()
     regularizer = bspline_config.get_regularization_matrix(**regularization_values)
+    normalize_residual = learning_settings["normalize_residual"]
     model = least_squares.WeightedLinearModel(bspline_config=bspline_config,
                                               regularizer=regularizer,
                                               )  # XXX: there is another arg called "data coverage", and I have no idea what it does
     n_elements = len(bspline_config.chemical_system.element_list)
     x_e, y_e, x_f, y_f = least_squares.dataframe_to_tuples(df_features, n_elements=n_elements)  # x: input, y: prediction
-    model.fit(x_e, y_e, x_f, y_f, weight=learning_weight)
+    model.fit(x_e, y_e, x_f, y_f, weight=learning_weight, normalize_residual=normalize_residual)
     if model_file is not None:
         output_dir_root = settings.get("outputs_path", ".")
         model_outfile_path = os.path.join(output_dir_root, model_file)

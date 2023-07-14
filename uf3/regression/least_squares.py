@@ -278,8 +278,8 @@ class WeightedLinearModel(BasicLinearModel):
             y_f: np.ndarray = None,
             weight: float = 0.5,
             batch_size=2500,
-            no_normalize: bool = False,
-            ):
+            normalize_residual: bool = True,
+            ):  # TODO: should be merged with fit_from_file() and gram_from_df()
         """
         Direct solution from input-output pairs corresponding to
         energies and forces, with option to weigh their respective
@@ -293,6 +293,8 @@ class WeightedLinearModel(BasicLinearModel):
             weight (float): parameter balancing contribution from energies
                 vs. forces. Higher values favor energies; defaults to 0.5.
             batch_size: maximum batch size for gram matrix construction.
+            normalize_residual (bool): whether to normalize the residual
+                by the standard deviation of the training set.
         """
         x_e, y_e = freeze_columns(x_e,
                                   y_e,
@@ -303,7 +305,7 @@ class WeightedLinearModel(BasicLinearModel):
         if x_f is not None:
             energy_weight = 1 / len(y_e)
             force_weight = 1 / len(y_f)
-            if not no_normalize:
+            if normalize_residual:
                 force_weight /= np.std(y_f)
                 warnings.filterwarnings("error", append=True)  # to catch divide by zero warnings
                 try:
@@ -366,7 +368,9 @@ class WeightedLinearModel(BasicLinearModel):
                       batch_size=2500,
                       sample_weights: Dict = None,
                       energy_key="energy",
-                      progress: str = "bar"):
+                      progress: str = "bar",
+                      normalize_residual: bool = True,
+                      ):  # TODO: should be merged with fit()
         """
         Accumulate inputs and outputs from batched parsing of HDF5 file
         and compute direct solution via LU decomposition.
@@ -381,6 +385,8 @@ class WeightedLinearModel(BasicLinearModel):
             sample_weights (dict):
             energy_key (str): column name for energies, default "energy".
             progress (str): style for progress indicators.
+            normalize_residual (bool): whether to normalize the residual
+                by the standard deviation of the training set.
         """
         if not os.path.isfile(filename):
             raise FileNotFoundError(filename)
@@ -408,8 +414,17 @@ class WeightedLinearModel(BasicLinearModel):
             gram_f += g_f
             ord_e += o_e
             ord_f += o_f
-        energy_weight = 1 / e_variance.n / e_variance.std
-        force_weight = 1 / f_variance.n / f_variance.std
+        energy_weight = 1 / e_variance.n
+        force_weight = 1 / f_variance.n
+        if normalize_residual:
+            force_weight /= f_variance.std
+            warnings.filterwarnings("error", append=True)  # to catch divide by zero warnings
+            try:
+                energy_weight /= e_variance.std
+            except (ZeroDivisionError, FloatingPointError, RuntimeWarning):
+                energy_weight = 1.0
+            warnings.filters.pop()  # undo the filter
+
         gram, ordinate = self.combine_weighted_gram(gram_e,
                                                     gram_f,
                                                     ord_e,
