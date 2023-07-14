@@ -300,13 +300,14 @@ class WeightedLinearModel(BasicLinearModel):
                                   self.col_idx)
         gram_e, ord_e = batched_moore_penrose(x_e, y_e, batch_size=batch_size)
         if x_f is not None:
+            warnings.filterwarnings("error", append=True)  # to catch divide by zero warnings
             try:
-                warnings.filterwarnings("error")  # to catch divide by zero warnings
                 energy_weight = 1 / len(y_e) / np.std(y_e)
                 force_weight = 1 / len(y_f) / np.std(y_f)
             except (ZeroDivisionError, FloatingPointError, RuntimeWarning):
                 energy_weight = 1.0
                 force_weight = 1 / len(y_f)
+            warnings.filters.pop()  # undo the filter
             x_f, y_f = freeze_columns(x_f,
                                       y_f,
                                       self.mask,
