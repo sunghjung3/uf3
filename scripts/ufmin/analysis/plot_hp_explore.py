@@ -6,7 +6,7 @@ import math
 
 results_file = "results.csv"
 resolution_key = "resolution"
-learning_weight_key = "lr"
+learning_weight_key = "lw"
 curvature_2b_key = "curvature_2b"
 
 
