@@ -12,7 +12,8 @@ curvature_2b_key = "curvature_2b"
 
 df = pd.read_csv(results_file)
 #df = df[ df['forcecalls'] != -1 ]  # remove buggy rows
-df['forcecalls'] = df['forcecalls'].replace(-1, 1000)  # replace buggy rows with large number
+max_observed_forcecalls = df['forcecalls'].max()
+df['forcecalls'] = df['forcecalls'].replace(-1, max_observed_forcecalls)  # replace buggy rows with large number
 forcecalls = df['forcecalls']
 
 
