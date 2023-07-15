@@ -62,7 +62,7 @@ learning:
   regularizer:  # parameters for the regularization matrix (listed below are default values)
     ridge_1b: 1e-8
     ridge_2b: 0.0
-    ridge_3b: 1e-8
+    ridge_3b: 1e-5
     curvature_1b: 0.0
     curvature_2b: 1e-8
     curvature_3b: 1e-8
