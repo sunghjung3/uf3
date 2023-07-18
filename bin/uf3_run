@@ -53,7 +53,7 @@ def complete_map_construction(map: dict,
 
     # populate map from user with correct UF3 syntax
     for key, value in map.items():  
-        interaction = key.strip().split('-')  # e.g. "Si-C-N " -> ["Si", "C", "N"]
+        interaction = tuple(key.strip().split('-'))  # e.g. "Si-C-N " -> ["Si", "C", "N"]
         for element in interaction:
             if element not in element_list:  # verify that extraneous elements are not present
                 raise Exception(f"Extraneous element {element} found in {map_name} {key}. Only include elements in {element_list}.")
