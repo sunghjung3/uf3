@@ -263,7 +263,9 @@ class BSplineBasis:
             self.r_max_map[trio],
             self.resolution_map[trio]
         ))
-        self.symmetry[trio] = len(configs)
+
+        # 1->3, 2->2, 3->1
+        self.symmetry[trio] = -1 * (len(configs) - 2) + 2
 
 
     def update_knots_from_dict(self, knots_map):
