@@ -335,9 +335,6 @@ def featurize(bspline_config: bspline.BSplineBasis,
         except:
             raise Exception("Could not read data. Check if it is a valid Atoms object or a list of Atoms objects. If they have a calculator attached, make sure it has been initialized properly.")
     df_data = data_coordinator.consolidate()
-    elements_in_data = set(df_data.iloc[0][data_coordinator.atoms_key].get_chemical_symbols())
-    if set(bspline_config.element_list) != elements_in_data:
-        raise TypeError(f"Element types in the data ({elements_in_data}) do not match the element list provided in the settings file ({bspline_config.element_list}).")
     logger(f"Number of training images: {len(df_data)}", message_verbosity=1)
     logger(f"Data:\n{df_data.info}", message_verbosity=2)
 
