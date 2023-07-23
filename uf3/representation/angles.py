@@ -417,10 +417,10 @@ def generate_triplets(i_where: np.ndarray,
     for i in range(len(i_groups)):
         tuples = np.array(np.meshgrid(i_groups[i],
                                       i_groups[i])).T.reshape(-1, 2)
-        tuples = np.insert(tuples, 0, i_values[i], axis=1)
+        tuples = np.insert(tuples, 0, i_values[i], axis=1)  # each row: [i, j, k] by atom id
 
-        comp_tuples = sup_composition[tuples]
-        comp_tuples[:, 1:] = np.sort(comp_tuples[:, 1:], axis=1)
+        comp_tuples = sup_composition[tuples]  # each row: [i, j, k] by element number
+        comp_tuples[:, 1:] = np.sort(comp_tuples[:, 1:], axis=1)  # sort j & k in each row
 
         ijk_hash = composition.get_szudzik_hash(comp_tuples)
 

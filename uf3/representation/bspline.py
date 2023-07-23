@@ -176,7 +176,8 @@ class BSplineBasis:
             if isinstance(r_max, (float, np.floating, int)):
                 values.append(r_max)
             else:
-                values.append(r_max[0])
+                # higher body interactions: get max r involving central atom
+                values.append( max(r_max[:len(interaction)-1]) )
         return max(values)
 
     def update_knots(self,
@@ -234,16 +235,36 @@ class BSplineBasis:
             self.r_max_map[trio] = self.r_max_map.get(trio, default_max)
             self.resolution_map[trio] = self.resolution_map.get(trio,
                                                                 default_res)
-            min_set = len(set(self.r_min_map[trio]))
-            max_set = len(set(self.r_max_map[trio]))
-            res_set = len(set(self.resolution_map[trio]))
-            if min_set == 1 and max_set == 1 and res_set == 1:
-                self.symmetry[trio] = 3
-            elif min_set <= 2 and max_set <= 2 and res_set <= 2:
-                self.symmetry[trio] = 2
-            else:
-                self.symmetry[trio] = 1
+            self.find_symmetry_3B(trio)
         self.r_cut = self.get_cutoff()
+
+
+    def find_symmetry_3B(self, trio):
+        """
+        Sets self.symmetry[trio] based on r_min, r_max, and resolution_map
+
+        Args:
+            trio (tuple): tuple containing 3 elements
+        Updates:
+            self.symmetry[trio]
+        Returns:
+            None
+        """
+        elem_set = len(set(trio[1:]))
+
+        # 2 neighboring elements are different
+        if elem_set == 2:
+            self.symmetry[trio] = 1
+            return None
+        
+        # 2 neighboring elements are identical
+        configs = set(zip(
+            self.r_min_map[trio],
+            self.r_max_map[trio],
+            self.resolution_map[trio]
+        ))
+        self.symmetry[trio] = len(configs)
+
 
     def update_knots_from_dict(self, knots_map):
         """"""
@@ -509,9 +530,9 @@ class BSplineBasis:
                 template[-trim_idx, :, :] = 1
                 template[:, -trim_idx, :] = 1
                 template[:, :, -trim_idx] = 1
-            template = self.compress_3B(template, trio)
+            template = self.compress_3B(template, trio)  # isn't this always a zero vector for self.symmetry[trio] > 1?
             mask = np.where(template > 0)[0]
-            for idx in mask:
+            for idx in mask:  # does this even work properly for self.symmetry[trio] == 1?
                 col_idx.append(idx)
                 frozen_c.append(value)
         if not offset_1b:
@@ -574,7 +595,7 @@ class BSplineBasis:
                    + grid.transpose(2, 1, 0))
             vec = vec.flat[self.template_mask[interaction]]
             vec = vec * self.flat_weights[interaction]
-        return vec
+        return vec  # isn't this always a zero vector if self.symmetry[interaction] != 1?
 
     def decompress_3B(self, vec, interaction):
         """
