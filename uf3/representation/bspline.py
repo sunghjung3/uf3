@@ -597,7 +597,7 @@ class BSplineBasis:
                    + grid.transpose(2, 1, 0))
             vec = vec.flat[self.template_mask[interaction]]
             vec = vec * self.flat_weights[interaction]
-        return vec  # isn't this always a zero vector if self.symmetry[interaction] != 1?
+        return vec
 
     def decompress_3B(self, vec, interaction):
         """
