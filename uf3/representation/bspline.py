@@ -534,7 +534,7 @@ class BSplineBasis:
                 template[:, :, -trim_idx] = 1
             template = self.compress_3B(template, trio)  # isn't this always a zero vector for self.symmetry[trio] > 1?
             mask = np.where(template > 0)[0]
-            for idx in mask:  # does this even work properly for self.symmetry[trio] == 1?
+            for idx in mask:
                 col_idx.append(idx)
                 frozen_c.append(value)
         if not offset_1b:
@@ -572,7 +572,7 @@ class BSplineBasis:
             self.flat_weights[trio] = template_flat[template_mask]
             self.templates[trio] = template
 
-    def compress_3B(self, grid, interaction, fitting = True):
+    def compress_3B(self, grid, interaction):
         """
 
         Args:
@@ -583,11 +583,9 @@ class BSplineBasis:
 
         """
         if self.symmetry[interaction] == 1:
-            vec = grid.flatten()
+            vec = grid
         elif self.symmetry[interaction] == 2:
             vec = grid + grid.transpose(1, 0, 2)
-            vec = vec.flat[self.template_mask[interaction]]
-            vec = vec * (self.flat_weights[interaction] if fitting else 0.5)
         elif self.symmetry[interaction] == 3:
             vec = (grid
                    + grid.transpose(0, 2, 1)
@@ -595,8 +593,8 @@ class BSplineBasis:
                    + grid.transpose(1, 2, 0)
                    + grid.transpose(2, 0, 1)
                    + grid.transpose(2, 1, 0))
-            vec = vec.flat[self.template_mask[interaction]]
-            vec = vec * self.flat_weights[interaction]
+        vec = vec.flat[self.template_mask[interaction]]
+        vec = vec * self.flat_weights[interaction]
         return vec
 
     def decompress_3B(self, vec, interaction):
