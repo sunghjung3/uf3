@@ -439,21 +439,21 @@ def train(features: pd.DataFrame | str,
         tensor_decomposition_settings = settings["tensor_decomposition"]
         if tensor_decomposition_settings is None:
             tensor_decomposition_settings = dict()
-        rank_2b = tensor_decomposition_settings.get("rank_2b", 2)
-        rank_3b = tensor_decomposition_settings.get("rank_3b", 5)
+        nterms = tensor_decomposition_settings.get("nterms", None)
         seed = tensor_decomposition_settings.get("seed", None)
+        max_epochs = int(tensor_decomposition_settings.get("max_epochs", 1000))
+        tol = float(tensor_decomposition_settings.get("tol", 1e-6))
         model = tensor_decomposition.Model(bspline_config=bspline_config,
                                            regularizer=regularizer,
-                                           rank_2b=rank_2b,
-                                           rank_3b=rank_3b,
+                                           nterms=nterms,
                                            seed=seed,
                                            )
+        model.fit(x_e, y_e, x_f, y_f, weight=learning_weight, max_epochs=max_epochs, tol=tol)
     else:
         model = least_squares.WeightedLinearModel(bspline_config=bspline_config,
                                                   regularizer=regularizer,
                                                   )  # XXX: there is another arg called "data coverage", and I have no idea what it does
-
-    model.fit(x_e, y_e, x_f, y_f, weight=learning_weight)
+        model.fit(x_e, y_e, x_f, y_f, weight=learning_weight)
 
     if model_file is not None:
         output_dir_root = settings.get("outputs_path", ".")

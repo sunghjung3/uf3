@@ -532,7 +532,7 @@ class BSplineBasis:
                 template[-trim_idx, :, :] = 1
                 template[:, -trim_idx, :] = 1
                 template[:, :, -trim_idx] = 1
-            template = self.compress_3B(template, trio)  # isn't this always a zero vector for self.symmetry[trio] > 1?
+            template = self.compress_3B(template, trio)
             mask = np.where(template > 0)[0]
             for idx in mask:
                 col_idx.append(idx)
