@@ -614,7 +614,16 @@ class BSplineBasis:
         N = len(n_space) - 4
         grid = np.zeros((L, M, N))
         grid.flat[self.template_mask[interaction]] = vec
-        grid = grid + grid.transpose(1, 0, 2)
+        if self.symmetry[interaction] == 2:
+            grid = grid + grid.transpose(1, 0, 2)
+        if self.symmetry[interaction] == 3:
+            grid = (grid
+                    + grid.transpose(0, 2, 1)
+                    + grid.transpose(1, 0, 2)
+                    + grid.transpose(1, 2, 0)
+                    + grid.transpose(2, 0, 1)
+                    + grid.transpose(2, 1, 0))
+
         return grid
 
 
