@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 
-import argparse, os, warnings, functools
+import argparse, os, warnings, functools, re
 from typing import List, Tuple, Dict, Callable
 from concurrent.futures import ProcessPoolExecutor
 import time
@@ -13,7 +13,7 @@ from ase.atoms import Atoms
 
 from uf3.data import composition, io
 from uf3.representation import bspline, process
-from uf3.regression import least_squares, tensor_decomposition
+from uf3.regression import least_squares, tensor_decomposition, regularize
 from uf3.util import user_config, json_io
 
 
@@ -431,7 +431,6 @@ def train(features: pd.DataFrame | str,
     regularization_values = resolve_input_conflict(regularization_values, learning_settings, "regularizer", "regularizer", override)
     if regularization_values is None:
         regularization_values = dict()
-    regularizer = bspline_config.get_regularization_matrix(**regularization_values)
     n_elements = len(bspline_config.chemical_system.element_list)
     x_e, y_e, x_f, y_f = least_squares.dataframe_to_tuples(df_features, n_elements=n_elements)  # x: input, y: prediction
 
@@ -444,12 +443,15 @@ def train(features: pd.DataFrame | str,
         max_epochs = int(tensor_decomposition_settings.get("max_epochs", 1000))
         tol = float(tensor_decomposition_settings.get("tol", 1e-6))
         model = tensor_decomposition.Model(bspline_config=bspline_config,
-                                           regularizer=regularizer,
+                                           regularization=regularization_values,
                                            nterms=nterms,
                                            seed=seed,
                                            )
         model.fit(x_e, y_e, x_f, y_f, weight=learning_weight, max_epochs=max_epochs, tol=tol)
     else:
+        ridge_map, curvature_map = bspline_config.get_regularization_maps(**regularization_values)
+        regularizer = bspline_config.get_regularization_matrix(ridge_map=ridge_map,
+                                                               curvature_map=curvature_map)
         model = least_squares.WeightedLinearModel(bspline_config=bspline_config,
                                                   regularizer=regularizer,
                                                   )  # XXX: there is another arg called "data coverage", and I have no idea what it does

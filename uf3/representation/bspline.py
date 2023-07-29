@@ -372,25 +372,11 @@ class BSplineBasis:
         self.col_idx = ci
         self.frozen_c = cf
 
-    def get_regularization_matrix(self,
-                                  ridge_map={},
-                                  curvature_map={},
-                                  **kwargs):
-        """
 
-
-        Args:
-            ridge_map (dict): n-body term ridge regularizer strengths.
-                default: {1: 1e-8, 2: 0e0, 3: 1e-5}
-            curvature_map (dict): n-body term curvature regularizer strengths.
-                default: {1: 0.0, 2: 1e-8, 3: 1e-8}
-
-        TODO: refactor to break up into smaller, reusable functions
-
-        Returns:
-            combined_matrix (np.ndarray): regularization matrix made up of
-                individual matrices per n-body interaction.
-        """
+    def get_regularization_maps(self,
+                                ridge_map={},
+                                curvature_map={},
+                                **kwargs):
         for k in kwargs:
             if k.lower()[0] == 'r':
                 ridge_map[int(re.sub('[^0-9]', '', k))] = float(kwargs[k])
@@ -405,6 +391,27 @@ class BSplineBasis:
                          2: regularize.DEFAULT_REGULARIZER_GRID["curve_2b"],
                          3: regularize.DEFAULT_REGULARIZER_GRID["curve_3b"],
                          **curvature_map}
+
+        return ridge_map, curvature_map
+
+
+    def get_regularization_matrix(self,
+                                  ridge_map={},
+                                  curvature_map={},
+                                  ):
+        """
+        Args:
+            ridge_map (dict): n-body term ridge regularizer strengths.
+                default: {1: 1e-8, 2: 0e0, 3: 1e-5}
+            curvature_map (dict): n-body term curvature regularizer strengths.
+                default: {1: 0.0, 2: 1e-8, 3: 1e-8}
+
+        TODO: refactor to break up into smaller, reusable functions
+
+        Returns:
+            combined_matrix (np.ndarray): regularization matrix made up of
+                individual matrices per n-body interaction.
+        """
         # one-body element terms
         n_elements = len(self.chemical_system.element_list)
         matrix = regularize.get_regularizer_matrix(n_elements,

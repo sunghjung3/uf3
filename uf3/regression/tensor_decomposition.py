@@ -10,7 +10,7 @@ import functools
 class Model(WeightedLinearModel):
     def __init__(self,
                  bspline_config,
-                 regularizer=None,
+                 regularization={},
                  data_coverage=None,
                  nterms=None,
                  seed=None,
@@ -19,6 +19,10 @@ class Model(WeightedLinearModel):
             raise NotImplementedError(
                 "Tensor decomposition currently only supports up to 2 body interactions."
                 )
+        ridge_map, curvature_map = bspline_config.get_regularization_maps(regularization)
+        regularizer = dict()
+        regularizer['ridge'] = ridge_map
+        regularizer['curvature'] = curvature_map
         super().__init__(bspline_config, regularizer, data_coverage, **params)
         if seed is None:
             seed = time_ns()
@@ -101,40 +105,50 @@ class Model(WeightedLinearModel):
                     # to be written...
 
 
-    def predict_from_singular_vectors(self, x: jnp.array, singular_vectors: dict):
-        # NOTE: x should alreay have frozen indices removed (1b and 2b)
-
-        # 1 body contribution
-        pred = jnp.dot(x[:, :self.body_offsets[2]], singular_vectors[1])
-
-        # 2 body contribution
+    def flatten_coeff_2b(self, singular_vectors_2b):
         # TODO: constrain first element of the element_vector to be 1
         '''
         coeff_tensor_2b = jnp.einsum('pi,pj,pk->ijk',
-                                     singular_vectors[2][0],
-                                     singular_vectors[2][0],
-                                     singular_vectors[2][1])
+                                     singular_vectors_2b[0],
+                                     singular_vectors_2b[0],
+                                     singular_vectors_2b[1])
         mask = jnp.triu_indices(coeff_tensor_2b.shape[0])
         flattened_coeff_2b = coeff_tensor_2b[mask[0], mask[1]].flatten()  # TODO: test efficiency compared to below
         '''
         coeff_by_pair = []  # TODO: compare efficiency and memory usage if flattened_coeff_2b is preallocated and filled
-        for i in range(singular_vectors[2][0].shape[1]):
-            for j in range(i, singular_vectors[2][0].shape[1]):
-                vec = jnp.sum((singular_vectors[2][0][:, i] *  # TODO: test if it is faster if singular_vectors[2][0] is stored column-wise
-                               singular_vectors[2][0][:, j]).reshape(-1, 1) *
-                               singular_vectors[2][1],
+        for i in range(singular_vectors_2b[0].shape[1]):
+            for j in range(i, singular_vectors_2b[0].shape[1]):
+                vec = jnp.sum((singular_vectors_2b[0][:, i] *  # TODO: test if it is faster if singular_vectors[2][0] is stored column-wise
+                               singular_vectors_2b[0][:, j]).reshape(-1, 1) *
+                               singular_vectors_2b[1],
                                axis=0)
                 coeff_by_pair.append(vec)
         flattened_coeff_2b = jnp.concatenate(coeff_by_pair)
-        pred += jnp.dot(x[:, self.body_offsets[2]:self.body_offsets[3]], flattened_coeff_2b)
 
-        # 3 body contribution
-        if self.bspline_config.degree > 2:
-            raise NotImplementedError(
-                "Tensor decomposition currently only supports up to 2 body interactions."
-                )
+        return flattened_coeff_2b
 
-        return pred
+    
+    def singular_vectors_to_flattened_coeffs(self, singular_vectors):
+        flattened_coeffs = dict()
+        flattened_coeffs[1] = singular_vectors[1]
+        flattened_coeffs[2] = self.flatten_coeff_2b(singular_vectors[2])
+        # TODO: add higher order
+        return flattened_coeffs
+
+
+    def train_predict(self, x: jnp.array, coefficients: jnp.array):
+        """
+        Predict using fit coefficients.
+
+        Args:
+            x (jnp.array): input matrix of shape (n_samples, n_features).
+            coefficients (jnp.array): 1-dimensional vector of coefficients.
+
+        Returns:
+            predictions (jnp.array): vector of predictions.
+        """
+        predictions = jnp.dot(x, coefficients)
+        return predictions
 
 
     def loss_function(self,
@@ -147,11 +161,25 @@ class Model(WeightedLinearModel):
                       f_weight: float = 1.0,
                       # TODO: add regularization terms
                       ):
-        p_e = self.predict_from_singular_vectors(x_e, singular_vectors)
-        loss = e_weight * jnp.sum((p_e-y_e)**2)
+        loss = 0.0
+        flattened_coeffs = self.singular_vectors_to_flattened_coeffs(singular_vectors)
+
+        # ridge regularization
+        #loss += self.regularizer['ridge'][1] * jnp.sum(flattened_coeffs[1]**2)  # 1 body ridge
+        #loss += self.regularizer['ridge'][2] * jnp.sum(flattened_coeffs[2]**2)  # 2 body ridge
+        # TODO: add higher order ridge
+
+        # curvature regularization
+        # TODO: figure out curvature regularization for 3 body
+
+        # error
+        coefficients = jnp.concatenate( tuple(flattened_coeffs.values()) )
+        p_e = self.train_predict(x_e, coefficients)
+        loss += e_weight * jnp.sum((p_e-y_e)**2)
         if x_f is not None:
-            p_f = self.predict_from_singular_vectors(x_f, singular_vectors)
+            p_f = self.train_predict(x_f, coefficients)
             loss += f_weight * jnp.sum((p_f-y_f)**2)
+
         return loss
 
 
@@ -214,16 +242,7 @@ class Model(WeightedLinearModel):
         print(f"Final loss: {loss_value}")
         #print(f"Final state: {state}")
 
-        # TODO: combine this compression with the predict_from_singular_vectors function
-        coeff_by_pair = []  # TODO: compare efficiency and memory usage if flattened_coeff_2b is preallocated and filled
-        for i in range(self.singular_vectors[2][0].shape[1]):
-            for j in range(i, self.singular_vectors[2][0].shape[1]):
-                vec = jnp.sum((self.singular_vectors[2][0][:, i] *  # TODO: test if it is faster if singular_vectors[2][0] is stored column-wise
-                               self.singular_vectors[2][0][:, j]).reshape(-1, 1) *
-                               self.singular_vectors[2][1],
-                               axis=0)
-                coeff_by_pair.append(vec)
-        flattened_coeff_2b = jnp.concatenate(coeff_by_pair)
+        flattened_coeff_2b = self.flatten_coeff_2b(self.singular_vectors[2])
         solved_coefficients = np.array( jnp.concatenate(
             [self.singular_vectors[1], flattened_coeff_2b]
         ) )
