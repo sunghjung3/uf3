@@ -1,7 +1,7 @@
 from .least_squares import *
 import jax
 import jax.numpy as jnp
-import jaxopt
+import optax
 import numpy as np
 from time import time_ns
 import functools
@@ -265,17 +265,39 @@ class Model(WeightedLinearModel):
         # train
         self.loss = functools.partial(self.loss_function, x_e=x_e, y_e=y_e, x_f=x_f, y_f=y_f,
                                  e_weight=energy_weight, f_weight=force_weight)
-        self.loss_grad = jax.grad(self.loss, argnums=0)
-        self.loss_and_grad = jax.jit(lambda params: (self.loss(params), self.loss_grad(params)))
-        optimizer = jaxopt.LBFGS
-        solver = optimizer(fun=self.loss_and_grad,
-                           value_and_grad=True,
-                           maxiter=max_epochs,
-                           tol=tol,
-                           #verbose=True,
-                           #jit=True,
-                           )
-        self.singular_vectors, state = solver.run(self.singular_vectors)
+        #self.loss_grad = jax.grad(self.loss, argnums=0)
+        #self.loss_and_grad = jax.jit(lambda params: (self.loss(params), self.loss_grad(params)))
+
+        warmup_steps = 10
+        schedule = optax.warmup_cosine_decay_schedule(
+                        init_value=0.0,
+                        peak_value=1.0,
+                        warmup_steps=warmup_steps,  # with warmup, the training loop should not break early because of tol
+                        decay_steps=200,
+                        end_value=1e-6,
+                        )
+        optimizer = optax.adamw(learning_rate=schedule)
+        opt_state = optimizer.init(self.singular_vectors)
+
+        @jax.jit
+        def step(params, opt_state):
+            loss_value, grads = jax.value_and_grad(self.loss)(params)
+            updates, opt_state = optimizer.update(grads, opt_state, params)
+            params = optax.apply_updates(params, updates)
+            return params, opt_state, loss_value
+
+        prev_loss_value = self.loss(self.singular_vectors)
+        print(f"Epoch [0/{max_epochs}], Loss: {prev_loss_value}")
+        for i in range(1, max_epochs+1):
+            self.singular_vectors, opt_state, loss_value = \
+                step(self.singular_vectors, opt_state)
+            steptol = abs(prev_loss_value - loss_value) / prev_loss_value
+            if i % 1 == 0:
+                print(f"Epoch [{i}/{max_epochs}], Loss: {loss_value}, tol: {steptol}")
+            if i > warmup_steps and steptol < tol:
+                break
+            prev_loss_value = loss_value
+
         loss_value = self.loss(self.singular_vectors)
         print(f"Trained singular vectors: {self.singular_vectors}")
         print(f"Final loss: {loss_value}")
