@@ -15,10 +15,6 @@ class Model(WeightedLinearModel):
                  nterms=None,
                  seed=None,
                  **params):
-        if bspline_config.degree > 2:
-            raise NotImplementedError(
-                "Tensor decomposition currently only supports up to 2 body interactions."
-                )
         ridge_map, curvature_map = bspline_config.get_regularization_maps(regularization)
         regularizer = dict()
         regularizer['ridge'] = ridge_map
@@ -81,28 +77,34 @@ class Model(WeightedLinearModel):
 
         ## Higher order
         if self.bspline_config.degree > 2:
-            for degree in range(3, self.bspline_config.degree + 1):
-                if degree > 3:
+            for degree in range(3, self.bspline_config.degree+1):
+                if self.bspline_config.degree > 3:
                     raise NotImplementedError(
                         "UF3 currently only supports up to 3 body interactions."
                         )
                 interactions = self.interactions_map[degree]
-
                 try:  # dimensions of the coefficient tensor must be the same
-                    all(self.bspline_config.resolution_map[interaction] == 
-                        self.bspline_config.resolution_map[interactions[0]]
+                    ref = self.bspline_config.resolution_map[interactions[0]]
+                    all(self.bspline_config.resolution_map[interaction] == ref
                         for interaction in interactions[1:])
                 except AssertionError:
                     raise AssertionError(
                         f"Tensor decomposition requires that all {degree} body interactions have the same resolution."
                         )
 
-                raise NotImplementedError(
-                    "Tensor decomposition currently only supports up to 2 body interactions."
-                    )
-                for interaction in interactions:
-                    template_mask = self.bspline_config.template_mask[interaction]
-                    # to be written...
+                element_vectors = []
+                for _ in range(degree - 1):
+                    self.prng_key, subkey = jax.random.split(self.prng_key)
+                    element_vectors.append( jax.random.normal(subkey, shape=(self.nterms[degree], nelements)) )
+                coeff_vectors = []
+                for i in range( round(degree * (degree-1) / 2) ):
+                    self.prng_key, subkey = jax.random.split(self.prng_key)
+                    length = ref[i] + 3
+                    coeff_vectors.append( jax.random.normal(subkey, shape=(self.nterms[degree], length)) )
+                self.singular_vectors[degree] = [element_vectors, coeff_vectors]
+                self.body_offsets[degree+1] = self.body_offsets[degree] + \
+                    self.component_offsets[interactions[-1]] - self.component_offsets[interactions[0]] \
+                    + self.component_sizes[interactions[-1]]
 
 
     def flatten_coeff_2b(self, singular_vectors_2b):
@@ -127,12 +129,47 @@ class Model(WeightedLinearModel):
 
         return flattened_coeff_2b
 
+
+    def flatten_coeff_3b(self, singular_vectors_3b):
+        '''
+        coeff_tensor_3b = jnp.einsum('pi,pj,pk,pl,pm,pn->ijklmn',
+                                     singular_vectors_3b[0][0],  # v
+                                     singular_vectors_3b[0][1],  # w
+                                     singular_vectors_3b[0][1],  # w
+                                     singular_vectors_3b[1][0],  # a
+                                     singular_vectors_3b[1][1],  # b
+                                     singular_vectors_3b[1][2])  # c
+        '''
+        reduced_abc = jnp.einsum('pi,pj,pk->ijk',
+                                  singular_vectors_3b[1][0],  # a
+                                  singular_vectors_3b[1][1],  # b
+                                  singular_vectors_3b[1][2]   # c
+                                  ).flatten()
+        coeff_by_triplet = []
+        trio_counter = 0
+        for i in range(singular_vectors_3b[0][0].shape[1]):
+            for j in range(singular_vectors_3b[0][1].shape[1]):
+                for k in range(j, singular_vectors_3b[0][1].shape[1]):
+                    vec = jnp.sum((singular_vectors_3b[0][0][:, i] *
+                                   singular_vectors_3b[0][1][:, j] *
+                                   singular_vectors_3b[0][1][:, k]).reshape(-1, 1) *
+                                   reduced_abc,
+                                   axis=0)
+                    trio = self.bspline_config.interactions_map[3][trio_counter]
+                    template_mask = self.bspline_config.template_mask[trio]
+                    coeff_by_triplet.append( vec[template_mask] )
+                    trio_counter += 1
+        flattened_coeff_3b = jnp.concatenate(coeff_by_triplet)
+
+        return flattened_coeff_3b
+
     
-    def singular_vectors_to_flattened_coeffs(self, singular_vectors):
+    def singular_vectors_to_flattened_coeffs(self, singular_vectors, d):
         flattened_coeffs = dict()
         flattened_coeffs[1] = singular_vectors[1]
         flattened_coeffs[2] = self.flatten_coeff_2b(singular_vectors[2])
-        # TODO: add higher order
+        if d > 2:
+            flattened_coeffs[3] = self.flatten_coeff_3b(singular_vectors[3])
         return flattened_coeffs
 
 
@@ -162,7 +199,8 @@ class Model(WeightedLinearModel):
                       # TODO: add regularization terms
                       ):
         loss = 0.0
-        flattened_coeffs = self.singular_vectors_to_flattened_coeffs(singular_vectors)
+        flattened_coeffs = self.singular_vectors_to_flattened_coeffs(singular_vectors,
+                                                                     self.bspline_config.degree)
 
         # ridge regularization
         #loss += self.regularizer['ridge'][1] * jnp.sum(flattened_coeffs[1]**2)  # 1 body ridge
@@ -234,6 +272,7 @@ class Model(WeightedLinearModel):
                            value_and_grad=True,
                            maxiter=max_epochs,
                            tol=tol,
+                           #verbose=True,
                            #jit=True,
                            )
         self.singular_vectors, state = solver.run(self.singular_vectors)
@@ -242,10 +281,12 @@ class Model(WeightedLinearModel):
         print(f"Final loss: {loss_value}")
         #print(f"Final state: {state}")
 
-        flattened_coeff_2b = self.flatten_coeff_2b(self.singular_vectors[2])
+        flattened_coeff = \
+            self.singular_vectors_to_flattened_coeffs(self.singular_vectors,
+                                                      self.bspline_config.degree)
         solved_coefficients = np.array( jnp.concatenate(
-            [self.singular_vectors[1], flattened_coeff_2b]
-        ) )
+            tuple(flattened_coeff.values())
+            ) )
         solved_coefficients = revert_frozen_coefficients(solved_coefficients,
                                                          self.n_feats,
                                                          self.mask,
