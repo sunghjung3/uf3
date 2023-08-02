@@ -579,7 +579,7 @@ class BSplineBasis:
             self.flat_weights[trio] = template_flat[template_mask]
             self.templates[trio] = template
 
-    def compress_3B(self, grid, interaction):
+    def compress_3B(self, grid, interaction, fitting = True):
         """
 
         Args:
@@ -591,8 +591,10 @@ class BSplineBasis:
         """
         if self.symmetry[interaction] == 1:
             vec = grid
+            redundancy = self.flat_weights[interaction] if fitting else 1.0
         elif self.symmetry[interaction] == 2:
             vec = grid + grid.transpose(1, 0, 2)
+            redundancy = self.flat_weights[interaction] if fitting else 0.5
         elif self.symmetry[interaction] == 3:
             vec = (grid
                    + grid.transpose(0, 2, 1)
@@ -600,8 +602,9 @@ class BSplineBasis:
                    + grid.transpose(1, 2, 0)
                    + grid.transpose(2, 0, 1)
                    + grid.transpose(2, 1, 0))
+            redundancy = self.flat_weights[interaction] if fitting else 1/6
         vec = vec.flat[self.template_mask[interaction]]
-        vec = vec * self.flat_weights[interaction]
+        vec = vec * redundancy
         return vec
 
     def decompress_3B(self, vec, interaction):
