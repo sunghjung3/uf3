@@ -480,7 +480,8 @@ def calculate_errors(model: least_squares.WeightedLinearModel | str,
         mae_e = least_squares.mae_metric(y_e, p_e)
         mae_f = least_squares.mae_metric(y_f, p_f)
     elif isinstance(features, pd.DataFrame):  # from dataframe
-        y_e, p_e, y_f, p_f = least_squares.subset_prediction(features, model)
+        n_elements = len(model.bspline_config.element_list)
+        y_e, p_e, y_f, p_f = least_squares.subset_prediction(features, model, n_elements=n_elements)
         rmse_e = least_squares.rmse_metric(y_e, p_e)
         rmse_f = least_squares.rmse_metric(y_f, p_f)
         mae_e = least_squares.mae_metric(y_e, p_e)
