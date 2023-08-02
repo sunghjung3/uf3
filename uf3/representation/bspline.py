@@ -398,6 +398,7 @@ class BSplineBasis:
     def get_regularization_matrix(self,
                                   ridge_map={},
                                   curvature_map={},
+                                  **kwargs
                                   ):
         """
         Args:
@@ -412,6 +413,9 @@ class BSplineBasis:
             combined_matrix (np.ndarray): regularization matrix made up of
                 individual matrices per n-body interaction.
         """
+        ridge_map, curvature_map = self.get_regularization_maps(
+            ridge_map, curvature_map, **kwargs)
+
         # one-body element terms
         n_elements = len(self.chemical_system.element_list)
         matrix = regularize.get_regularizer_matrix(n_elements,

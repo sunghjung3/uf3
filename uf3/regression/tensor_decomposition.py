@@ -214,7 +214,7 @@ class Model(WeightedLinearModel):
         coefficients = jnp.concatenate( tuple(flattened_coeffs.values()) )
         p_e = self.train_predict(x_e, coefficients)
         loss += e_weight * jnp.sum((p_e-y_e)**2)
-        if x_f is not None:
+        if x_f is not None and len(x_f) > 0:
             p_f = self.train_predict(x_f, coefficients)
             loss += f_weight * jnp.sum((p_f-y_f)**2)
 
@@ -241,26 +241,28 @@ class Model(WeightedLinearModel):
                                   self.mask,
                                   self.frozen_c,
                                   self.col_idx)
-        x_e = jnp.array(x_e)
-        y_e = jnp.array(y_e)
-        energy_weight = 1.0
 
-        if x_f is not None:
+        energy_weight = 1.0
+        force_weight = 0.0
+
+        if x_f is not None and len(x_f) > 0:
             x_f, y_f = freeze_columns(x_f,
                                       y_f,
                                       self.mask,
                                       self.frozen_c,
                                       self.col_idx)
-            x_f = jnp.array(x_f)
-            y_f = jnp.array(y_f)
             warnings.filterwarnings("error", append=True)  # to catch divide by zero warnings
             try:
-                energy_weight = weight / len(y_e) / jnp.var(y_e)
-                force_weight = (1-weight) / len(y_f) / jnp.var(y_f)
+                energy_weight = weight / len(y_e) / np.var(y_e)
+                force_weight = (1-weight) / len(y_f) / np.var(y_f)
             except (ZeroDivisionError, FloatingPointError, RuntimeWarning):
                 energy_weight = 1.0
                 force_weight = 1 / len(y_f)
             warnings.filters.pop()  # undo the filter
+            x_f = jnp.array(x_f)  # convert to jax array here because jax numpy doesn't raise divide-by-zero warnings
+            y_f = jnp.array(y_f)
+        x_e = jnp.array(x_e)
+        y_e = jnp.array(y_e)
 
         # train
         self.loss = functools.partial(self.loss_function, x_e=x_e, y_e=y_e, x_f=x_f, y_f=y_f,
@@ -268,13 +270,13 @@ class Model(WeightedLinearModel):
         #self.loss_grad = jax.grad(self.loss, argnums=0)
         #self.loss_and_grad = jax.jit(lambda params: (self.loss(params), self.loss_grad(params)))
 
-        warmup_steps = 10
+        warmup_steps = 100
         schedule = optax.warmup_cosine_decay_schedule(
                         init_value=0.0,
-                        peak_value=1.0,
+                        peak_value=2.0,
                         warmup_steps=warmup_steps,  # with warmup, the training loop should not break early because of tol
-                        decay_steps=200,
-                        end_value=1e-6,
+                        decay_steps=5000, 
+                        end_value=1e-1,
                         )
         optimizer = optax.adamw(learning_rate=schedule)
         opt_state = optimizer.init(self.singular_vectors)

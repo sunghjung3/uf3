@@ -449,9 +449,7 @@ def train(features: pd.DataFrame | str,
                                            )
         model.fit(x_e, y_e, x_f, y_f, weight=learning_weight, max_epochs=max_epochs, tol=tol)
     else:
-        ridge_map, curvature_map = bspline_config.get_regularization_maps(**regularization_values)
-        regularizer = bspline_config.get_regularization_matrix(ridge_map=ridge_map,
-                                                               curvature_map=curvature_map)
+        regularizer = bspline_config.get_regularization_matrix(**regularization_values)
         model = least_squares.WeightedLinearModel(bspline_config=bspline_config,
                                                   regularizer=regularizer,
                                                   )  # XXX: there is another arg called "data coverage", and I have no idea what it does
