@@ -6,6 +6,7 @@ with JSON files.
 import json
 from typing import Union
 import numpy as np
+import jaxlib
 
 
 def dump_interaction_map(interaction_map,
@@ -37,12 +38,16 @@ def dump_interaction_map(interaction_map,
 def encode_interaction_map(interaction_map):
     """Recursive function for converting arrays to lists and
     tuples into dash-joined keys for JSON serialization."""
+    array_type = (np.ndarray, jaxlib.xla_extension.ArrayImpl)
     encoded_map = {}
     for key, value in interaction_map.items():
         if isinstance(value, list):  # array to list
-            if isinstance(value[0], np.ndarray):
+            if isinstance(value[0], array_type):
                 value = [entry.tolist() for entry in value]
-        if isinstance(value, np.ndarray):  # array to list
+            elif isinstance(value[0], list) and isinstance(value[0][0],
+                                                            array_type):
+                value = [[entry.tolist() for entry in row] for row in value]
+        if isinstance(value, array_type):  # array to list
             value = value.tolist()
         elif isinstance(value, dict):
             value = encode_interaction_map(value)

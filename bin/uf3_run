@@ -435,6 +435,7 @@ def train(features: pd.DataFrame | str,
     x_e, y_e, x_f, y_f = least_squares.dataframe_to_tuples(df_features, n_elements=n_elements)  # x: input, y: prediction
 
     if "tensor_decomposition" in settings:
+        logger(f"* fit method: tensor decomposition", message_verbosity=2)
         tensor_decomposition_settings = settings["tensor_decomposition"]
         if tensor_decomposition_settings is None:
             tensor_decomposition_settings = dict()
@@ -442,13 +443,23 @@ def train(features: pd.DataFrame | str,
         seed = tensor_decomposition_settings.get("seed", None)
         max_epochs = int(tensor_decomposition_settings.get("max_epochs", 1000))
         tol = float(tensor_decomposition_settings.get("tol", 1e-6))
-        model = tensor_decomposition.Model(bspline_config=bspline_config,
-                                           regularization=regularization_values,
-                                           nterms=nterms,
-                                           seed=seed,
-                                           )
+        ridge_map, curvature_map = bspline_config.get_regularization_maps(**regularization_values)
+        regularizer = dict(ridge=ridge_map,
+                           curvature=curvature_map,)
+        initial_model = tensor_decomposition_settings.get("initial_model", None)
+        initialize = True if initial_model is None else False
+        model = tensor_decomposition.TensorModel(bspline_config=bspline_config,
+                                                 regularizer=regularizer,
+                                                 nterms=nterms,
+                                                 seed=seed,
+                                                 initialize=initialize,
+                                                 )
+        if initial_model is not None:
+            logger(f"\tusing {initial_model} as initial guess", message_verbosity=2)
+            model.load(filename=initial_model)  # set initial singular vectors for training
         model.fit(x_e, y_e, x_f, y_f, weight=learning_weight, max_epochs=max_epochs, tol=tol)
     else:
+        logger(f"* fit method: original UF3", message_verbosity=2)
         regularizer = bspline_config.get_regularization_matrix(**regularization_values)
         model = least_squares.WeightedLinearModel(bspline_config=bspline_config,
                                                   regularizer=regularizer,

@@ -7,22 +7,23 @@ from time import time_ns
 import functools
 
 
-class Model(WeightedLinearModel):
+class TensorModel(WeightedLinearModel):
     def __init__(self,
                  bspline_config,
-                 regularization={},
+                 regularizer=None,
                  data_coverage=None,
                  nterms=None,
                  seed=None,
+                 prng_key=None,
+                 initialize=True,
                  **params):
-        ridge_map, curvature_map = bspline_config.get_regularization_maps(regularization)
-        regularizer = dict()
-        regularizer['ridge'] = ridge_map
-        regularizer['curvature'] = curvature_map
         super().__init__(bspline_config, regularizer, data_coverage, **params)
-        if seed is None:
-            seed = time_ns()
-        self.prng_key = jax.random.PRNGKey(seed)
+        if prng_key is not None:
+            self.prng_key = prng_key
+        else:
+            if seed is None:
+                seed = time_ns()
+            self.prng_key = jax.random.PRNGKey(seed)
 
         self.nterms = {2: 2, 3: 5}  # interaction order: number of expansion terms
         if nterms:
@@ -35,7 +36,133 @@ class Model(WeightedLinearModel):
 
         self.singular_vectors = None
         self.body_offsets = dict()
-        self.initialize_singular_vectors()
+
+        if initialize:
+            self.initialize_singular_vectors()
+
+
+    def as_dict(self):
+        knots_map = self.bspline_config.knots_map
+        dump = dict(singular_vectors=self.singular_vectors,
+                    knots=knots_map,
+                    nterms=self.nterms,
+                    prng_key=self.prng_key,
+                    data_coverage=self.data_coverage,
+                    **self.bspline_config.as_dict())
+        return dump
+
+    @staticmethod
+    def from_config(config):
+        return TensorModel.from_dict(config)
+
+    @staticmethod
+    def from_dict(config):
+        bspline_config = bspline.BSplineBasis.from_dict(config)
+        regularizer = config.get("regularizer", None)
+        data_coverage = config.get("data_coverage", None)
+        nterms = config.get("nterms", None)
+        prng_key = config.get("prng_key", None)
+        model = TensorModel(bspline_config,
+                            regularizer=regularizer,
+                            data_coverage=data_coverage,
+                            nterms=nterms,
+                            prng_key=prng_key,
+                            initialize=False)
+        model.load(solution=config)
+        return model
+
+    @staticmethod
+    def from_json(filename):
+        dump = json_io.load_interaction_map(filename)
+        return TensorModel.from_dict(dump)
+
+
+    def load(self,
+             singular_vectors: Dict = None,
+             filename: str = None,
+             flatten: bool = False
+             ):
+        """
+        Load model's singular vectors and flatten it for prediction
+
+        Args:
+            singular_vectors (dict): singular vectors to load.
+            filename (str): filename of json dump containing solution.
+        """
+        if filename is not None:
+            if singular_vectors is not None:
+                warnings.warn("Provided vectors ignored; loading file.")
+            singular_vectors = json_io.load_interaction_map(filename)
+            singular_vectors = singular_vectors["singular_vectors"]
+        elif singular_vectors is None:
+            raise ValueError("Neither singular vectors nor filename were provided.")
+
+        ## consistency check
+
+        # 1 body
+        n_elements = len(self.bspline_config.element_list)
+        singular_vectors[1] = jnp.array(singular_vectors[1]).flatten()
+        if len(singular_vectors[1]) != n_elements:
+            raise ValueError(
+                f"Incorrect shape: 1 body, {len(singular_vectors[1])} != {n_elements}"
+                )
+        self.body_offsets[1] = 0
+        self.body_offsets[2] = self.body_offsets[1] + length
+
+        # 2 body
+        if jnp.shape(singular_vectors[2][0]) != (self.nterms[2], n_elements):
+            raise ValueError(
+                f"Incorrect shape: 2 body, {jnp.shape(singular_vectors[2][0])} != {(self.nterms[2], n_elements)}"
+                )
+        pairs = self.bspline_config.interactions_map[2]
+        ncomponents = self.component_sizes[pairs[0]]
+        length = ncomponents - self.bspline_config.leading_trim - self.bspline_config.trailing_trim
+        if jnp.shape(singular_vectors[2][1]) != (self.nterms[2], length):
+            raise ValueError(
+                f"Incorrect shape: 2 body, {jnp.shape(singular_vectors[2][1])} != {(self.nterms[2], length)}"
+                )
+        self.body_offsets[3] = self.body_offsets[2] + length * len(pairs)
+    
+        # Higher order
+        if self.bspline_config.degree > 2:
+            for degree in range(3, self.bspline_config.degree+1):
+                if self.bspline_config.degree > 3:
+                    raise NotImplementedError(
+                        "UF3 currently only supports up to 3 body interactions."
+                        )
+                interactions = self.interactions_map[degree]
+                ref = self.bspline_config.resolution_map[interactions[0]]
+
+                element_vectors = singular_vectors[degree][0]
+                if len(element_vectors) != degree - 1:
+                    raise ValueError(
+                        f"Incorrect number of element vectors for {degree} body: {len(element_vectors)} != {degree-1}"
+                    )
+                for i, vec in enumerate(element_vectors):
+                    if jnp.shape(vec) != (self.nterms[degree], n_elements):
+                        raise ValueError(
+                            f"Incorrect shape of the {i}th element vector for {degree} body, {jnp.shape(vec)} != {(self.nterms[degree], n_elements)}"
+                            )
+                coeff_vectors = singular_vectors[degree][1]
+                if len(coeff_vectors) != round(degree * (degree-1) / 2):
+                    raise ValueError(
+                        f"Incorrect number of coefficient vectors for {degree} body: {len(coeff_vectors)} != {round(degree * (degree-1) / 2)}"
+                    )
+                for i, vec in enumerate(coeff_vectors):
+                    if jnp.shape(vec) != (self.nterms[degree], ref[i] + 3):
+                        raise ValueError(
+                            f"Incorrect shape of the {i}th coefficient vector for {degree} body, {jnp.shape(vec)} != {(self.nterms[degree], ref[i] + 3)}"
+                            )
+                self.body_offsets[degree+1] = self.body_offsets[degree] + \
+                    self.component_offsets[interactions[-1]] - self.component_offsets[interactions[0]] \
+                    + self.component_sizes[interactions[-1]]
+
+        self.singular_vectors = singular_vectors
+        if flatten:
+            self.coefficients = \
+                self.singular_vectors_to_unfrozen_coeffs(self.singular_vectors,
+                                                         self.bspline_config.degree
+                                                         )
 
 
     def initialize_singular_vectors(self, sigma=10.0):
@@ -172,6 +299,19 @@ class Model(WeightedLinearModel):
             flattened_coeffs[3] = self.flatten_coeff_3b(singular_vectors[3])
         return flattened_coeffs
 
+    def singular_vectors_to_unfrozen_coeffs(self, singular_vectors, d):
+        flattened_coeffs = \
+            self.singular_vectors_to_flattened_coeffs(singular_vectors, d)
+        flattened_coeffs = np.array( jnp.concatenate(
+            tuple(flattened_coeffs.values())
+            ) )
+        unfrozen_coeffs = revert_frozen_coefficients(flattened_coeffs,
+                                                     self.n_feats,
+                                                     self.mask,
+                                                     self.frozen_c,
+                                                     self.col_idx)
+        return unfrozen_coeffs
+
 
     def train_predict(self, x: jnp.array, coefficients: jnp.array):
         """
@@ -305,15 +445,5 @@ class Model(WeightedLinearModel):
         print(f"Final loss: {loss_value}")
         #print(f"Final state: {state}")
 
-        flattened_coeff = \
-            self.singular_vectors_to_flattened_coeffs(self.singular_vectors,
-                                                      self.bspline_config.degree)
-        solved_coefficients = np.array( jnp.concatenate(
-            tuple(flattened_coeff.values())
-            ) )
-        solved_coefficients = revert_frozen_coefficients(solved_coefficients,
-                                                         self.n_feats,
-                                                         self.mask,
-                                                         self.frozen_c,
-                                                         self.col_idx)
-        self.coefficients = solved_coefficients
+        self.coefficients = self.singular_vectors_to_unfrozen_coeffs(self.singular_vectors,
+                                                                     self.bspline_config.degree)
