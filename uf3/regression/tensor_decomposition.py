@@ -94,8 +94,8 @@ class TensorModel(WeightedLinearModel):
         if filename is not None:
             if singular_vectors is not None:
                 warnings.warn("Provided vectors ignored; loading file.")
-            singular_vectors = json_io.load_interaction_map(filename)
-            singular_vectors = singular_vectors["singular_vectors"]
+            ref_model = TensorModel.from_json(filename, flatten=False)
+            singular_vectors = ref_model.singular_vectors
         elif singular_vectors is None:
             raise ValueError("Neither singular vectors nor filename were provided.")
 
