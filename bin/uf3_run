@@ -440,6 +440,8 @@ def train(features: pd.DataFrame | str,
         if tensor_decomposition_settings is None:
             tensor_decomposition_settings = dict()
         nterms = tensor_decomposition_settings.get("nterms", None)
+        for key in list(nterms.keys()):  # convert all keys to str
+            nterms[str(key)] = nterms.pop(key)
         seed = tensor_decomposition_settings.get("seed", None)
         max_epochs = int(tensor_decomposition_settings.get("max_epochs", 1000))
         tol = float(tensor_decomposition_settings.get("tol", 1e-6))
@@ -478,15 +480,16 @@ def train(features: pd.DataFrame | str,
     return model
 
 
-def calculate_errors(model: least_squares.WeightedLinearModel | str,
+def calculate_errors(model: least_squares.WeightedLinearModel | tensor_decomposition.TensorModel| str,
                      features: pd.DataFrame | str,
+                     settings_file: str = "settings.yaml"
                      ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, float, float, float]:
     """
     Wrapper for uf3.regression.least_squares.batched_prediction() and subset_prediction().
     Get model predictions for featurized data (either dataframe or file) and calculate RMSEs.
 
     Args:
-        model (least_squares.WeightedLinearModel | str): UF3 model object or file name
+        model (least_squares.WeightedLinearModel | tensor_decomposition.TensorModel| str): UF3 model object or file name
         features (pd.DataFrame | str): featurization dataframe or file name
 
     Returns:
@@ -500,7 +503,12 @@ def calculate_errors(model: least_squares.WeightedLinearModel | str,
         mae_f (float): force MAE of the model
     """
     if isinstance(model, str):  # model from file
-        model = least_squares.WeightedLinearModel.from_json(model)
+        settings = user_config.read_config(settings_file)
+        if "tensor_decomposition" in settings:
+            model_class = tensor_decomposition.TensorModel
+        else:
+            model_class = least_squares.WeightedLinearModel
+        model = model_class.from_json(model)
 
     if isinstance(features, str):  # from file
         y_e, p_e, y_f, p_f, rmse_e, rmse_f = model.batched_predict(features)
@@ -608,10 +616,14 @@ if __name__ == "__main__":  # if this script is called from command line instead
         model = train(df_features,
                       bspline_config,
                       model_file=model_file,
+                      settings_file=settings_file,
                       override=override,
                       overwrite=overwrite,
                       verbose=verbose)
-        _, _, _, _, rmse_e, rmse_f, mae_e, mae_f = calculate_errors(model, df_features)
+        _, _, _, _, rmse_e, rmse_f, mae_e, mae_f = calculate_errors(model,
+                                                                    df_features,
+                                                                    settings_file=settings_file
+                                                                    )
         print(f"Energy RMSE: {rmse_e}")
         print(f"Force RMSE : {rmse_f}")
         print(f"Energy MAE : {mae_e}")

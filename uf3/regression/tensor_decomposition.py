@@ -56,7 +56,7 @@ class TensorModel(WeightedLinearModel):
         return TensorModel.from_dict(config)
 
     @staticmethod
-    def from_dict(config):
+    def from_dict(config, flatten=True):
         bspline_config = bspline.BSplineBasis.from_dict(config)
         regularizer = config.get("regularizer", None)
         data_coverage = config.get("data_coverage", None)
@@ -68,19 +68,21 @@ class TensorModel(WeightedLinearModel):
                             nterms=nterms,
                             prng_key=prng_key,
                             initialize=False)
-        model.load(solution=config)
+        model.load(singular_vectors=config['singular_vectors'], flatten=flatten)
         return model
 
     @staticmethod
-    def from_json(filename):
-        dump = json_io.load_interaction_map(filename)
-        return TensorModel.from_dict(dump)
+    def from_json(filename, flatten=True):
+        dump = json_io.load_interaction_map(filename, list2array=False)
+        dump['singular_vectors'] = json_io.decode_singular_vectors(dump['singular_vectors'],
+                                                                   jax=True)
+        return TensorModel.from_dict(dump, flatten=flatten)
 
 
     def load(self,
              singular_vectors: Dict = None,
              filename: str = None,
-             flatten: bool = False
+             flatten: bool = True,
              ):
         """
         Load model's singular vectors and flatten it for prediction
@@ -101,10 +103,14 @@ class TensorModel(WeightedLinearModel):
 
         # 1 body
         n_elements = len(self.bspline_config.element_list)
+        if self.bspline_config.offset_1b:
+            length = n_elements
+        else:
+            length = 0
         singular_vectors['1'] = jnp.array(singular_vectors['1']).flatten()
-        if len(singular_vectors['1']) != n_elements:
+        if len(singular_vectors['1']) != length:
             raise ValueError(
-                f"Incorrect shape: 1 body, {len(singular_vectors['1'])} != {n_elements}"
+                f"Incorrect shape: 1 body, {len(singular_vectors['1'])} != {length}"
                 )
         self.body_offsets[1] = 0
         self.body_offsets[2] = self.body_offsets[1] + length

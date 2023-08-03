@@ -7,6 +7,7 @@ import json
 from typing import Union
 import numpy as np
 import jaxlib
+import jax.numpy as jnp
 
 
 def dump_interaction_map(interaction_map,
@@ -57,26 +58,26 @@ def encode_interaction_map(interaction_map):
     return encoded_map
 
 
-def load_interaction_map(filename):
+def load_interaction_map(filename, **kwargs):
     """Parse interaction map(s) from JSON."""
     with open(filename, "r") as f:
         formatted_map = json.load(f)
-    interaction_map = decode_interaction_map(formatted_map)
+    interaction_map = decode_interaction_map(formatted_map, **kwargs)
     return interaction_map
 
 
-def decode_interaction_map(formatted_map):
+def decode_interaction_map(formatted_map, list2array=True, **kwargs):
     """Recursive function for converting lists to arrays and
     dash-joined keys into tuples for JSON deserialization."""
     decoded_map = {}
     for key, value in formatted_map.items():
-        if isinstance(value, list):  # list to array
+        if isinstance(value, list) and list2array:  # list to array
             if isinstance(value[0], list):
                 value = [np.array(row) for row in value]
             else:
                 value = np.array(value)
         elif isinstance(value, dict):
-            value = decode_interaction_map(value)
+            value = decode_interaction_map(value, list2array=list2array, **kwargs)
         if '-' in key:  # joined str to tuple
             key = key.split('-')
             try:
@@ -86,6 +87,36 @@ def decode_interaction_map(formatted_map):
             key = tuple(key)
         decoded_map[key] = value
     return decoded_map
+
+
+def decode_singular_vectors(singular_vectors, jax=True):
+    """Convert singular vectors loaded from JSON to arrays."""
+    array = jnp.array if jax else np.array
+    decoded_vectors = {}
+    for order, value in singular_vectors.items():
+        if int(order) == 1:
+            if isinstance(value[0], list):
+                raise ValueError(
+                    f"Order {order} singular vector must be 1D. Double check your JSON file."
+                    )
+            value = array(value)
+        elif int(order) == 2:
+            value = [array(entry) for entry in value]
+            for i, arr in enumerate(value):
+                if arr.ndim != 2:
+                    raise ValueError(
+                        f"The {i}th singular vector of order {order} must be 2D. Double check your JSON file."
+                        )
+        else:
+            value = [[array(entry) for entry in row] for row in value]
+            for i, vecs in enumerate(value):
+                for j, arr in enumerate(vecs):
+                    if arr.ndim != 2:
+                        raise ValueError(
+                            f"The {i},{j}th singular vector of order {order} must be 2D. Double check your JSON file."
+                            )
+        decoded_vectors[order] = value
+    return decoded_vectors
 
 
 class CompactJSONEncoder(json.JSONEncoder):
