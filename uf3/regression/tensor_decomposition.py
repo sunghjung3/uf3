@@ -25,7 +25,7 @@ class TensorModel(WeightedLinearModel):
                 seed = time_ns()
             self.prng_key = jax.random.PRNGKey(seed)
 
-        self.nterms = {2: 2, 3: 5}  # interaction order: number of expansion terms
+        self.nterms = {'2': 2, '3': 5}  # interaction order: number of expansion terms
         if nterms:
             self.nterms.update({order: nterms[order]
                                 for order in nterms.keys() & self.nterms.keys()})
@@ -101,25 +101,25 @@ class TensorModel(WeightedLinearModel):
 
         # 1 body
         n_elements = len(self.bspline_config.element_list)
-        singular_vectors[1] = jnp.array(singular_vectors[1]).flatten()
-        if len(singular_vectors[1]) != n_elements:
+        singular_vectors['1'] = jnp.array(singular_vectors['1']).flatten()
+        if len(singular_vectors['1']) != n_elements:
             raise ValueError(
-                f"Incorrect shape: 1 body, {len(singular_vectors[1])} != {n_elements}"
+                f"Incorrect shape: 1 body, {len(singular_vectors['1'])} != {n_elements}"
                 )
         self.body_offsets[1] = 0
         self.body_offsets[2] = self.body_offsets[1] + length
 
         # 2 body
-        if jnp.shape(singular_vectors[2][0]) != (self.nterms[2], n_elements):
+        if jnp.shape(singular_vectors['2'][0]) != (self.nterms['2'], n_elements):
             raise ValueError(
-                f"Incorrect shape: 2 body, {jnp.shape(singular_vectors[2][0])} != {(self.nterms[2], n_elements)}"
+                f"Incorrect shape: 2 body, {jnp.shape(singular_vectors['2'][0])} != {(self.nterms['2'], n_elements)}"
                 )
         pairs = self.bspline_config.interactions_map[2]
         ncomponents = self.component_sizes[pairs[0]]
         length = ncomponents - self.bspline_config.leading_trim - self.bspline_config.trailing_trim
-        if jnp.shape(singular_vectors[2][1]) != (self.nterms[2], length):
+        if jnp.shape(singular_vectors['2'][1]) != (self.nterms['2'], length):
             raise ValueError(
-                f"Incorrect shape: 2 body, {jnp.shape(singular_vectors[2][1])} != {(self.nterms[2], length)}"
+                f"Incorrect shape: 2 body, {jnp.shape(singular_vectors['2'][1])} != {(self.nterms['2'], length)}"
                 )
         self.body_offsets[3] = self.body_offsets[2] + length * len(pairs)
     
@@ -133,25 +133,26 @@ class TensorModel(WeightedLinearModel):
                 interactions = self.interactions_map[degree]
                 ref = self.bspline_config.resolution_map[interactions[0]]
 
-                element_vectors = singular_vectors[degree][0]
+                sdegree = str(degree)
+                element_vectors = singular_vectors[sdegree][0]
                 if len(element_vectors) != degree - 1:
                     raise ValueError(
                         f"Incorrect number of element vectors for {degree} body: {len(element_vectors)} != {degree-1}"
                     )
                 for i, vec in enumerate(element_vectors):
-                    if jnp.shape(vec) != (self.nterms[degree], n_elements):
+                    if jnp.shape(vec) != (self.nterms[sdegree], n_elements):
                         raise ValueError(
-                            f"Incorrect shape of the {i}th element vector for {degree} body, {jnp.shape(vec)} != {(self.nterms[degree], n_elements)}"
+                            f"Incorrect shape of the {i}th element vector for {degree} body, {jnp.shape(vec)} != {(self.nterms[sdegree], n_elements)}"
                             )
-                coeff_vectors = singular_vectors[degree][1]
+                coeff_vectors = singular_vectors[sdegree][1]
                 if len(coeff_vectors) != round(degree * (degree-1) / 2):
                     raise ValueError(
                         f"Incorrect number of coefficient vectors for {degree} body: {len(coeff_vectors)} != {round(degree * (degree-1) / 2)}"
                     )
                 for i, vec in enumerate(coeff_vectors):
-                    if jnp.shape(vec) != (self.nterms[degree], ref[i] + 3):
+                    if jnp.shape(vec) != (self.nterms[sdegree], ref[i] + 3):
                         raise ValueError(
-                            f"Incorrect shape of the {i}th coefficient vector for {degree} body, {jnp.shape(vec)} != {(self.nterms[degree], ref[i] + 3)}"
+                            f"Incorrect shape of the {i}th coefficient vector for {degree} body, {jnp.shape(vec)} != {(self.nterms[sdegree], ref[i] + 3)}"
                             )
                 self.body_offsets[degree+1] = self.body_offsets[degree] + \
                     self.component_offsets[interactions[-1]] - self.component_offsets[interactions[0]] \
@@ -182,7 +183,7 @@ class TensorModel(WeightedLinearModel):
             length = 0
         self.prng_key, subkey = jax.random.split(self.prng_key)
         element_vector = jax.random.normal(subkey, shape=(length,))
-        self.singular_vectors[1] = element_vector
+        self.singular_vectors['1'] = element_vector
         self.body_offsets[1] = 0
         self.body_offsets[2] = self.body_offsets[1] + length
 
@@ -195,11 +196,11 @@ class TensorModel(WeightedLinearModel):
                 f"Tensor decomposition requires that all 2 body interactions have the same resolution."
                 )
         self.prng_key, subkey = jax.random.split(self.prng_key)
-        element_vector = jax.random.normal(subkey, shape=(self.nterms[2], nelements))
+        element_vector = jax.random.normal(subkey, shape=(self.nterms['2'], nelements))
         self.prng_key, subkey = jax.random.split(self.prng_key)
         length = ncomponents - leading_trim - trailing_trim
-        coeff_vector = jax.random.normal(subkey, shape=(self.nterms[2], length))
-        self.singular_vectors[2] = [element_vector, coeff_vector]
+        coeff_vector = jax.random.normal(subkey, shape=(self.nterms['2'], length))
+        self.singular_vectors['2'] = [element_vector, coeff_vector]
         self.body_offsets[3] = self.body_offsets[2] + length * len(pairs)
 
         ## Higher order
@@ -219,16 +220,17 @@ class TensorModel(WeightedLinearModel):
                         f"Tensor decomposition requires that all {degree} body interactions have the same resolution."
                         )
 
+                sdegree = str(degree)
                 element_vectors = []
                 for _ in range(degree - 1):
                     self.prng_key, subkey = jax.random.split(self.prng_key)
-                    element_vectors.append( jax.random.normal(subkey, shape=(self.nterms[degree], nelements)) )
+                    element_vectors.append( jax.random.normal(subkey, shape=(self.nterms[sdegree], nelements)) )
                 coeff_vectors = []
                 for i in range( round(degree * (degree-1) / 2) ):
                     self.prng_key, subkey = jax.random.split(self.prng_key)
                     length = ref[i] + 3
-                    coeff_vectors.append( jax.random.normal(subkey, shape=(self.nterms[degree], length)) )
-                self.singular_vectors[degree] = [element_vectors, coeff_vectors]
+                    coeff_vectors.append( jax.random.normal(subkey, shape=(self.nterms[sdegree], length)) )
+                self.singular_vectors[sdegree] = [element_vectors, coeff_vectors]
                 self.body_offsets[degree+1] = self.body_offsets[degree] + \
                     self.component_offsets[interactions[-1]] - self.component_offsets[interactions[0]] \
                     + self.component_sizes[interactions[-1]]
@@ -293,10 +295,10 @@ class TensorModel(WeightedLinearModel):
     
     def singular_vectors_to_flattened_coeffs(self, singular_vectors, d):
         flattened_coeffs = dict()
-        flattened_coeffs[1] = singular_vectors[1]
-        flattened_coeffs[2] = self.flatten_coeff_2b(singular_vectors[2])
+        flattened_coeffs[1] = singular_vectors['1']
+        flattened_coeffs[2] = self.flatten_coeff_2b(singular_vectors['2'])
         if d > 2:
-            flattened_coeffs[3] = self.flatten_coeff_3b(singular_vectors[3])
+            flattened_coeffs[3] = self.flatten_coeff_3b(singular_vectors['3'])
         return flattened_coeffs
 
     def singular_vectors_to_unfrozen_coeffs(self, singular_vectors, d):
