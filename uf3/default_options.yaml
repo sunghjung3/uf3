@@ -50,3 +50,4 @@ learning:
         ridge_1b: 1.0e-8
         curvature_2b: 1.0e-8
         curvature_3b: 1.0e-8
+    normalize_residual: yes

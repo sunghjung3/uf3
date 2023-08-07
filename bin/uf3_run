@@ -432,6 +432,7 @@ def train(features: pd.DataFrame | str,
     if regularization_values is None:
         regularization_values = dict()
     n_elements = len(bspline_config.chemical_system.element_list)
+    normalize_residual = learning_settings["normalize_residual"]
     x_e, y_e, x_f, y_f = least_squares.dataframe_to_tuples(df_features, n_elements=n_elements)  # x: input, y: prediction
 
     if "tensor_decomposition" in settings:
@@ -459,14 +460,23 @@ def train(features: pd.DataFrame | str,
         if initial_model is not None:
             logger(f"\tusing {initial_model} as initial guess", message_verbosity=2)
             model.load(filename=initial_model)  # set initial singular vectors for training
-        model.fit(x_e, y_e, x_f, y_f, weight=learning_weight, max_epochs=max_epochs, tol=tol)
+        model.fit(x_e, y_e, x_f, y_f,
+                  weight=learning_weight,
+                  max_epochs=max_epochs,
+                  tol=tol
+                  normalize_residual=normalize_residual,
+                  )
     else:
         logger(f"* fit method: original UF3", message_verbosity=2)
         regularizer = bspline_config.get_regularization_matrix(**regularization_values)
         model = least_squares.WeightedLinearModel(bspline_config=bspline_config,
                                                   regularizer=regularizer,
                                                   )  # XXX: there is another arg called "data coverage", and I have no idea what it does
-        model.fit(x_e, y_e, x_f, y_f, weight=learning_weight)
+        model.fit(x_e, y_e, x_f, y_f,
+                  weight=learning_weight,
+                  normalize_residual=normalize_residual,
+                  )
+
 
     if model_file is not None:
         output_dir_root = settings.get("outputs_path", ".")

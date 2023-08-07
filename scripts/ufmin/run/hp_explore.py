@@ -121,7 +121,7 @@ def run_hpsearch():
             nForceCalls = comm.recv(source=MPI.ANY_SOURCE, status=stat)
             recv_counter += 1
             worker_rank = stat.Get_source()
-            print("end: master received {nForceCalls} from {worker_rank}", flush=True)
+            print(f"end: master received {nForceCalls} from {worker_rank}", flush=True)
             #with open(results_file, 'a') as rf:
             #    rf.write(str(result_tracker[worker_rank][resolution_key]) + ", " +
             #             str(result_tracker[worker_rank][learning_weight_key]) + ", "+
