@@ -463,7 +463,7 @@ def train(features: pd.DataFrame | str,
         model.fit(x_e, y_e, x_f, y_f,
                   weight=learning_weight,
                   max_epochs=max_epochs,
-                  tol=tol
+                  tol=tol,
                   normalize_residual=normalize_residual,
                   )
     else:

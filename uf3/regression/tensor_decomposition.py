@@ -378,6 +378,7 @@ class TensorModel(WeightedLinearModel):
             max_epochs: int = 1000,
             tol: float = 1e-6,
             batch_size=2500,
+            normalize_residual=True,
             reinitialize=False,
             ):
 
@@ -399,14 +400,16 @@ class TensorModel(WeightedLinearModel):
                                       self.mask,
                                       self.frozen_c,
                                       self.col_idx)
-            warnings.filterwarnings("error", append=True)  # to catch divide by zero warnings
-            try:
-                energy_weight = weight / len(y_e) / np.var(y_e)
-                force_weight = (1-weight) / len(y_f) / np.var(y_f)
-            except (ZeroDivisionError, FloatingPointError, RuntimeWarning):
-                energy_weight = 1.0
-                force_weight = 1 / len(y_f)
-            warnings.filters.pop()  # undo the filter
+            energy_weight = weight / len(y_e)
+            force_weight = (1-weight) / len(y_f)
+            if normalize_residual:
+                force_weight /= np.var(y_f)
+                warnings.filterwarnings("error", append=True)  # to catch divide by zero warnings
+                try:
+                    energy_weight /= np.var(y_e)
+                except (ZeroDivisionError, FloatingPointError, RuntimeWarning):
+                    energy_weight = 1.0
+                warnings.filters.pop()  # undo the filter
             x_f = jnp.array(x_f)  # convert to jax array here because jax numpy doesn't raise divide-by-zero warnings
             y_f = jnp.array(y_f)
         x_e = jnp.array(x_e)
