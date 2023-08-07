@@ -27,6 +27,28 @@ import copy, sys, time, os, glob, pickle, gc, concurrent
 #from memory_profiler import profile
 
 
+def generate_sample_weights(current_forcecall, strength):
+    """
+    Generate sample weights for training data.
+
+    Args:
+        current_forcecall (int): Current forcecall number.
+        strength (int): How strongly to weigh the most recent sample vs the oldest.
+            The most recent datapoint will be weighted by 2**(strength).
+            Each previous datapoint will be weighted half as much until a weight of 1.0 is reached.
+            All datapoints before that will be weighted 1.0.
+
+    Returns:
+        sample_weights (dict): Sample weights for training data.
+    """
+    sample_weights = dict()
+    for i in range(current_forcecall, 0, -1):
+        key = str(i) + "_" + '0'  # the '0' is assuming that UF3 names each configuration by its index in the trajetory and that we only have one new configuration per forcecall
+        sample_weights[key] = 2 ** max(strength - (current_forcecall - i), 0)
+    sample_weights["1_1"] = sample_weights["1_0"]  # we start with 2 forcecalls
+    return sample_weights
+
+
 #@profile
 def ufmin(initial_structure = "POSCAR",
           live_features_file = "live_features.h5",
@@ -50,8 +72,43 @@ def ufmin(initial_structure = "POSCAR",
           learning_weight = 0.5,
           regularization_values = None,
           dr_trust = global_dr_trust,
+          sample_weight_strength = 6,
           resume = 0  # start from scratch if 0. Do `resume` additional forcecalls if non-zero. If non-zero, overrides `max_forcecalls` parameter.
           ):
+    """
+    Energy minimization using UF3 surrogate model.
+
+    Args:
+        initial_structure (str | ase.Atoms): Initial structure to start optimization from.
+            If str, then it is a path to a structure file.
+            If ase.Atoms, then it is the structure itself.
+        live_features_file (str): Path to HDF5 file to store live features during optimization.
+        model_file_prefix (str): Prefix for model files.
+            Each model will be saved as `model_file_prefix`_`forcecall_counter`.json
+        settings_file (str): Path to settings file.
+        opt_traj_file (str): Path to ASE trajectory file to store optimization trajectory at all real force evaluations.
+        model_traj_file (str): Path to ASE trajectory file to store optimization trajectory at each UF3 minimization for all real force evaluations.
+        true_calc_file (str): Path to pickle file to store energy and forces from each true force call.
+        model_calc_file (str): Path to pickle file to store energy and forces from UF3 calls (real and MLFF).
+        train_uq_file (str): Path to pickle file to store UQ from training data (only for delta_uq).
+        test_uq_file (str): Path to pickle file to store UQ from testing data (each structure in UF3 minimization steps) (only for delta_uq).
+        status_update_file (str): Path to file to store status updates.
+        ufmin_true_fmax (float): Force tolerance for the actual optimization.
+        ufmin_uf3_fmax (float): Force tolerance for the optimization on the uf3 surface.
+        optimizer (ase.optimize.Optimizer): ASE optimizer to use for UF3 minimization.
+        max_forcecalls (int): Maximum number of force calls to make on the true energy surface.
+        max_uf3_calls (int): Maximum number of force calls to make on the UF3 surface.
+        verbose (int): Verbosity level.
+        true_calc (ase.calculator.Calculator): ASE calculator to use for true energy and force evaluations.
+        resolution_map (dict): Resolution map for features.
+        learning_weight (float): Weight for learning term in loss function.
+        regularization_values (list): ridge and curvature regularization values.
+        dr_trust (float): Trust distance deviation for r-based UQ.
+        sample_weight_strength (int): how strongly to weigh the most recent sample vs the oldest.
+            See `generate_sample_weights` function for more details.
+        resume (int): Start from scratch if 0.
+    """
+
     ufmin_true_fmax_squared = ufmin_true_fmax ** 2
     ufmin_uf3_fmax_squared = ufmin_uf3_fmax ** 2
 
@@ -178,6 +235,7 @@ def ufmin(initial_structure = "POSCAR",
             os.remove(live_features_file)
             del prev_features
         process.save_feature_db(dataframe=df_features, filename=live_features_file)
+        sample_weights = generate_sample_weights(forcecall_counter, sample_weight_strength)
         if model_file_prefix is None:
             model_file = None
         else:
@@ -190,7 +248,8 @@ def ufmin(initial_structure = "POSCAR",
                                     settings_file=settings_file,
                                     verbose=verbose,
                                     learning_weight=learning_weight,
-                                    regularization_values=regularization_values
+                                    regularization_values=regularization_values,
+                                    sample_weights=sample_weights,
                                     ).result()
         #model = uf3_run.train(df_features, bspline_config, model_file=model_file, settings_file=settings_file, verbose=verbose,
         #                      learning_weight=learning_weight,

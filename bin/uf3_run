@@ -377,6 +377,7 @@ def train(features: pd.DataFrame | str,
           model_file: str = None,
           learning_weight: float = 0.5,
           regularization_values: dict = None,
+          sample_weights: dict = None,
           settings_file: str = "settings.yaml",
           override: bool = True,
           overwrite: bool = True,
@@ -392,6 +393,8 @@ def train(features: pd.DataFrame | str,
         learning_weight (float): parameter balancing contribution from energies vs. forces (default: 0.5). Higher values favor energies.
         regularization_values (dict): dict of regularization values.
             Keys: ridge_1b, ridge_2b, ridge_3b, curvature_2b, curvature_3b
+        sample_weights (dict): weighs each data point in the training set.
+            Keys: an entry in df_features.index.get_level_values(0)
         settings_file (str): name of the settings file (default: settings.yaml).
             For an example of the content, see "defaults_options.yaml" at `uf3.__file__` (execute this in Python to see path)
         override (bool): these inputs override any conflicting values in the settings file in case of a conflict (default: True)
@@ -433,7 +436,10 @@ def train(features: pd.DataFrame | str,
         regularization_values = dict()
     regularizer = bspline_config.get_regularization_matrix(**regularization_values)
     n_elements = len(bspline_config.chemical_system.element_list)
-    x_e, y_e, x_f, y_f = least_squares.dataframe_to_tuples(df_features, n_elements=n_elements)  # x: input, y: prediction
+    x_e, y_e, x_f, y_f = least_squares.dataframe_to_tuples(df_features,
+                                                           n_elements=n_elements,
+                                                           sample_weights=sample_weights,
+                                                           )  # x: input, y: prediction
     model = least_squares.WeightedLinearModel(bspline_config=bspline_config,
                                               regularizer=regularizer,
                                               )  # XXX: there is another arg called "data coverage", and I have no idea what it does
