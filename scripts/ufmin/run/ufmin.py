@@ -6,6 +6,7 @@ from ase.optimize import FIRE
 #from myopts import GD, MGD
 from ase.io import trajectory
 from ase.atoms import Atoms
+from ase.data import covalent_radii, atomic_numbers
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -47,6 +48,19 @@ def generate_sample_weights(current_forcecall, strength):
         sample_weights[key] = 2 ** max(strength - (current_forcecall - i), 0)
     sample_weights["1_1"] = sample_weights["1_0"]  # we start with 2 forcecalls
     return sample_weights
+
+
+class Pseudodict(dict):
+    """
+    An object that appears like a dictionary but returns one value for any
+    existing and nonexistent keys.
+    """
+    def __init__(self, value):
+        self.value = value
+    def __getitem__(self, key):
+        return self.value
+    def get(self, key, default=None):
+        return self.value
 
 
 #@profile
@@ -196,6 +210,48 @@ def ufmin(initial_structure = "POSCAR",
     # one-time bspline configuration
     bspline_config = uf3_run.initialize(settings_file, verbose=verbose, resolution_map=resolution_map)
 
+    settings = user_config.read_config(settings_file)
+    try:
+        n_cores = settings["features"]['n_cores']
+    except KeyError:
+        n_cores = 1
+
+    '''
+    # 2-body preconditioning
+    preconditioner_traj = list()
+    for pair in bspline_config.interactions_map[2]:
+        composition = ''.join(pair)
+        estimate_bond_length = \
+            covalent_radii[atomic_numbers[pair[0]]] + covalent_radii[atomic_numbers[pair[1]]]
+        sigma = estimate_bond_length * 2**(-1/6)
+        preconditioner_rcut = bspline_config.r_max_map[pair]
+        preconditioner_sample_res = 12
+        for r in np.linspace(sigma, preconditioner_rcut, preconditioner_sample_res):
+            preconditioner_calc = LennardJones(sigma=sigma, epsilon=1.0, rc=preconditioner_rcut)
+            preconditioner_traj.append(Atoms(composition,
+                                             positions=[[0, 0, 0], [r, 0, 0]],
+                                             pbc=[False, False, False],
+                                             calculator=preconditioner_calc,
+                                             )
+                                       )
+            preconditioner_traj[-1].get_forces()
+    with concurrent.futures.ProcessPoolExecutor(max_workers=n_cores) as executor:
+        preconditioner_df_features = executor.submit(uf3_run.featurize,
+                                                     bspline_config,
+                                                     preconditioner_traj,
+                                                     settings_file=settings_file,
+                                                     data_prefix='preconditioner',
+                                                     verbose=verbose
+                                                     ).result()
+    preconditioner_weight = 0.001
+    _, _, preconditioner_x_f, preconditioner_y_f = \
+        least_squares.dataframe_to_tuples(preconditioner_df_features,
+                                          sample_weights=Pseudodict(preconditioner_weight),
+                                          )
+    preconditioner_f = [preconditioner_x_f, preconditioner_y_f]
+    '''
+    preconditioner_f = None
+
     # initialize UQ object
     r_uq_obj = r_uq.R_UQ(atoms, traj, bspline_config, dr_trust)
 
@@ -206,11 +262,7 @@ def ufmin(initial_structure = "POSCAR",
         max_forcecalls = forcecall_counter + resume - 1  # -1 because of the way the outer while loop termination was written
     else:
         forcecall_counter = 1  # already have forcecalls 0 and 1 from the setup stage
-    settings = user_config.read_config(settings_file)
-    try:
-        n_cores = settings["features"]['n_cores']
-    except KeyError:
-        n_cores = 1
+
     while True:  # minimization on true energy surface
         # train UF3
         if forcecall_counter > 1:
@@ -250,6 +302,7 @@ def ufmin(initial_structure = "POSCAR",
                                     learning_weight=learning_weight,
                                     regularization_values=regularization_values,
                                     sample_weights=sample_weights,
+                                    extra_data_f=preconditioner_f,
                                     ).result()
         #model = uf3_run.train(df_features, bspline_config, model_file=model_file, settings_file=settings_file, verbose=verbose,
         #                      learning_weight=learning_weight,
