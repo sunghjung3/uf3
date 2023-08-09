@@ -87,6 +87,7 @@ def ufmin(initial_structure = "POSCAR",
           regularization_values = None,
           dr_trust = global_dr_trust,
           sample_weight_strength = 6,
+          pretrained_models = None,
           resume = 0  # start from scratch if 0. Do `resume` additional forcecalls if non-zero. If non-zero, overrides `max_forcecalls` parameter.
           ):
     """
@@ -120,6 +121,8 @@ def ufmin(initial_structure = "POSCAR",
         dr_trust (float): Trust distance deviation for r-based UQ.
         sample_weight_strength (int): how strongly to weigh the most recent sample vs the oldest.
             See `generate_sample_weights` function for more details.
+        pretrained_models (dict): List of pretrained models to use for training. 
+            forcecall number -> model file path
         resume (int): Start from scratch if 0.
     """
 
@@ -287,26 +290,31 @@ def ufmin(initial_structure = "POSCAR",
             os.remove(live_features_file)
             del prev_features
         process.save_feature_db(dataframe=df_features, filename=live_features_file)
-        sample_weights = generate_sample_weights(forcecall_counter, sample_weight_strength)
-        if model_file_prefix is None:
-            model_file = None
+
+        if pretrained_models is None or pretrained_models.get(forcecall_counter, None) is None:
+            sample_weights = generate_sample_weights(forcecall_counter, sample_weight_strength)
+            if model_file_prefix is None:
+                model_file = None
+            else:
+                model_file = model_file_prefix + "_" + str(forcecall_counter) + ".json"
+            with concurrent.futures.ProcessPoolExecutor(max_workers=n_cores) as executor:
+                model = executor.submit(uf3_run.train,
+                                        df_features,
+                                        bspline_config,
+                                        model_file=model_file,
+                                        settings_file=settings_file,
+                                        verbose=verbose,
+                                        learning_weight=learning_weight,
+                                        regularization_values=regularization_values,
+                                        sample_weights=sample_weights,
+                                        extra_data_f=preconditioner_f,
+                                        ).result()
+            #model = uf3_run.train(df_features, bspline_config, model_file=model_file, settings_file=settings_file, verbose=verbose,
+            #                      learning_weight=learning_weight,
+            #                      regularization_values=regularization_values)
         else:
-            model_file = model_file_prefix + "_" + str(forcecall_counter) + ".json"
-        with concurrent.futures.ProcessPoolExecutor(max_workers=n_cores) as executor:
-            model = executor.submit(uf3_run.train,
-                                    df_features,
-                                    bspline_config,
-                                    model_file=model_file,
-                                    settings_file=settings_file,
-                                    verbose=verbose,
-                                    learning_weight=learning_weight,
-                                    regularization_values=regularization_values,
-                                    sample_weights=sample_weights,
-                                    extra_data_f=preconditioner_f,
-                                    ).result()
-        #model = uf3_run.train(df_features, bspline_config, model_file=model_file, settings_file=settings_file, verbose=verbose,
-        #                      learning_weight=learning_weight,
-        #                      regularization_values=regularization_values)
+            model_file = pretrained_models[forcecall_counter]
+            model = least_squares.WeightedLinearModel.from_json(model_file)
         del df_features
         #model = "entire_traj_training/model.json"
         #model = least_squares.WeightedLinearModel.from_json(model)
@@ -485,6 +493,7 @@ if __name__ == "__main__":
     max_forcecalls = 200
     max_uf3_calls = 1000
     verbose = 0
+    pretrained_models = None
     resume = 0
 
     r_min = 2.22
@@ -511,6 +520,7 @@ if __name__ == "__main__":
                 verbose,
                 true_calc,
                 dr_trust=dr_trust,
+                pretrained_models=pretrained_models,
                 resume=resume,
                 )
     del tmp
