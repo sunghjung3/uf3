@@ -259,6 +259,7 @@ def initialize(settings_file: str = "settings.yaml",
 def featurize(bspline_config: bspline.BSplineBasis,
               data: Atoms | List[Atoms] | str = None,
               features_file: str = None,
+              use_zbl: bool = False,
               settings_file: str = "settings.yaml",
               data_prefix: str = None,
               return_df_data: bool = False,
@@ -279,6 +280,7 @@ def featurize(bspline_config: bspline.BSplineBasis,
             Atoms.get_forces() have been called before.
             Or instead, it may be possible to set both Atoms.calc = <calc> and Atoms.calc.atoms = <Atoms> (but not guaranteed to work).
         features_file (str): name of features file to store results from this function.
+        use_zbl (bool): augment the UF3 model with the ZBL potential for the 2-body repulsive core (default: False).
         settings_file (str): name of the settings file (default: settings.yaml).
             For an example of the content, see "defaults_options.yaml" at `uf3.__file__` (execute this in Python to see path)
         data_prefix (str): prefix for data and features labeling.
@@ -310,8 +312,11 @@ def featurize(bspline_config: bspline.BSplineBasis,
     if data is None:
         raise Exception("You must provide training data.")
     features_file = resolve_input_conflict(features_file, features_settings, "features_path", "features file name", override)
+    model_settings = settings.get("model", dict())
+    use_zbl = resolve_input_conflict(use_zbl, model_settings, "use_zbl", "use_zbl", override)
     logger(f"* data: {data}", message_verbosity=2)
     logger(f"* features_file: {features_file}", message_verbosity=2)
+    logger(f"* use_zbl: {use_zbl}", message_verbosity=2)
 
     # read training data and create dataframe
     data_coordinator = io.DataCoordinator()
@@ -356,7 +361,8 @@ def featurize(bspline_config: bspline.BSplineBasis,
     column_prefix = features_settings.get("column_prefix", 'x')
     representation = process.BasisFeaturizer(bspline_config=bspline_config,
                                             fit_forces=fit_forces,
-                                            prefix=column_prefix) 
+                                            prefix=column_prefix,
+                                            use_zbl=use_zbl,) 
     df_features = representation.evaluate_parallel(df_data, client, n_jobs=n_cores*50, progress="bar")
     logger(f"Number of features: {len(df_features)}", message_verbosity=2)
     logger(f"Features:\n{df_features.info}", message_verbosity=2)

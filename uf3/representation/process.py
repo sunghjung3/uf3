@@ -12,6 +12,7 @@ import pandas as pd
 from uf3.representation import distances
 from uf3.representation import angles
 from uf3.representation import bspline
+from uf3.representation import zbl
 from uf3.data import io
 from uf3.data import geometry
 from uf3.util import parallel
@@ -24,16 +25,18 @@ class BasisFeaturizer:
     -Arrange features into DataFrame
     -Process DataFrame into tuples of (x, y, weight)
     """
-    def __init__(self, bspline_config, fit_forces=True, prefix='x'):
+    def __init__(self, bspline_config, fit_forces=True, prefix='x', use_zbl=False):
         """
         Args:
             bspline_config (uf3.representation.bspline.BsplineConfig)
             fit_forces (bool): whether to generate force features.
             prefix (str): prefix for feature columns.
+            use_zbl (bool): subtract ZBL potential from 2-body features.
         """
         self.bspline_config = bspline_config
         self.fit_forces = fit_forces
         self.prefix = prefix
+        self.use_zbl = use_zbl
 
         # generate column labels
         self.columns = self.bspline_config.get_column_names()
