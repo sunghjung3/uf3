@@ -9,6 +9,7 @@ import warnings
 import sqlite3
 import numpy as np
 import pandas as pd
+import ase.data as ase_data
 from uf3.representation import distances
 from uf3.representation import angles
 from uf3.representation import bspline
@@ -36,7 +37,16 @@ class BasisFeaturizer:
         self.bspline_config = bspline_config
         self.fit_forces = fit_forces
         self.prefix = prefix
-        self.use_zbl = use_zbl
+
+        # ZBL
+        self.zbls = dict()
+        if use_zbl:
+            for pair in self.interactions_map[2]:
+                z1, z2 = (ase_data.atomic_numbers[el] for el in pair)
+                approximate_bond_length = \
+                    ase_data.covalent_radii[z1] + ase_data.covalent_radii[z2]
+                sigma = approximate_bond_length * 2**(-1/6)  # sigma from LJ
+                self.zbls[pair] = zbl.SwitchingZBL(z1, z2, 0.9*sigma, sigma)
 
         # generate column labels
         self.columns = self.bspline_config.get_column_names()

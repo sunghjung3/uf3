@@ -116,9 +116,9 @@ class SwitchingZBL:
 
 if __name__ == "__main__":
     # test ZBL
-    z1 = 3
-    z2 = 5
-    r1 = 1
+    z1 = 78
+    z2 = 78
+    r1 = 1.9
     rc = 2
     zbl = SwitchingZBL(z1, z2, r1, rc)
 
@@ -126,9 +126,9 @@ if __name__ == "__main__":
     import matplotlib.pyplot as plt
     r = np.linspace(0.1, 3, 1000)
     plt.plot(r, zbl(r), label="V")
-    plt.plot(r, zbl.d(r), label="dV/dr")
-    plt.plot(r, zbl.d2(r), label="d2V/dr2")
-    plt.ylim([-0.25, 0.25])
-    plt.xlim([1.9, 2.1])
+    #plt.plot(r, zbl.d(r), label="dV/dr")
+    #plt.plot(r, zbl.d2(r), label="d2V/dr2")
+    plt.ylim([-0.25, 20])
+    plt.xlim([1.8, 2.0])
     plt.legend()
     plt.show()

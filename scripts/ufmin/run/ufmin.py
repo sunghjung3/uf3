@@ -88,6 +88,7 @@ def ufmin(initial_structure = "POSCAR",
           dr_trust = global_dr_trust,
           sample_weight_strength = 6,
           pretrained_models = None,
+          normalize_forces = True,
           resume = 0  # start from scratch if 0. Do `resume` additional forcecalls if non-zero. If non-zero, overrides `max_forcecalls` parameter.
           ):
     """
@@ -123,6 +124,7 @@ def ufmin(initial_structure = "POSCAR",
             See `generate_sample_weights` function for more details.
         pretrained_models (dict): List of pretrained models to use for training. 
             forcecall number -> model file path
+        normalize_forces (bool): Whether or not to normalize features by max true force value.
         resume (int): Start from scratch if 0.
     """
 
@@ -307,6 +309,7 @@ def ufmin(initial_structure = "POSCAR",
                                         learning_weight=learning_weight,
                                         regularization_values=regularization_values,
                                         sample_weights=sample_weights,
+                                        normalize_forces=normalize_forces,
                                         extra_data_f=preconditioner_f,
                                         ).result()
             #model = uf3_run.train(df_features, bspline_config, model_file=model_file, settings_file=settings_file, verbose=verbose,

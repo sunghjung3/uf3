@@ -378,12 +378,13 @@ def featurize(bspline_config: bspline.BSplineBasis,
     return df_features
 
 
-def train(features: pd.DataFrame | str,
+def train(features: pd.DataFrame | str | Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray],
           bspline_config: bspline.BSplineBasis,
           model_file: str = None,
           learning_weight: float = 0.5,
           regularization_values: dict = None,
           sample_weights: dict = None,
+          normalize_forces: bool = True,
           extra_data_e: list[np.ndarray] = None,
           extra_data_f: list[np.ndarray] = None,
           settings_file: str = "settings.yaml",
@@ -395,7 +396,9 @@ def train(features: pd.DataFrame | str,
     Trains a UF3 model.
 
     Args:
-        features (pd.DataFrame | str): Pandas dataframe or name of .h5 file containing featurizations.
+        features (pd.DataFrame | str | Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]):
+            Pandas dataframe, name of .h5 file, or tuple of arrays containing featurizations.
+            The tuple should be formatted like uf3.regression.least_squuares.dataframe_to_tuples().
         bspline_config (bspline.BSplineBasis): B-spline basis configurations computed from the initialize() function.
         model_file (str): name of the .json file to write the trained model to.
         learning_weight (float): parameter balancing contribution from energies vs. forces (default: 0.5). Higher values favor energies.
@@ -403,6 +406,9 @@ def train(features: pd.DataFrame | str,
             Keys: ridge_1b, ridge_2b, ridge_3b, curvature_2b, curvature_3b
         sample_weights (dict): weighs each data point in the training set.
             Keys: an entry in df_features.index.get_level_values(0)
+            Only used if features is a dataframe or a file.
+        normalize_forces (bool): normalize features by the magnitude of the maximum true force value (default: False)
+            Only used if features is a dataframe or a file.,
         extra_data_e (list[np.ndarray]): additional energies to include in the training set.
             [x_e, y_e]
         extra_data_f (list[np.ndarray]): additional forces to include in the training set.
@@ -430,13 +436,28 @@ def train(features: pd.DataFrame | str,
     learning_settings = settings.get("learning", dict())
     model_file = resolve_input_conflict(model_file, models_settings, "model_path", "model file name", override)
     logger(f"* model_file: {model_file}", message_verbosity=2)
-    if isinstance(features, str):
-        features = resolve_input_conflict(features, features_settings, "features_path", "features file", override)
-        df_features = load_all_features(features)
-    elif isinstance(features, pd.DataFrame):
-        df_features = features
+    if isinstance(features, tuple):
+        x_e, y_e, x_f, y_f = features
     else:
-        raise TypeError(f"Invalid data type of features. Please provide a features dataframe or file name.")
+        if isinstance(features, str):
+            features = resolve_input_conflict(features, features_settings, "features_path", "features file", override)
+            df_features = load_all_features(features)
+        elif isinstance(features, pd.DataFrame):
+            df_features = features
+        else:
+            raise TypeError(f"Invalid data type of features. Please provide a features dataframe or file name.")
+        n_elements = len(bspline_config.chemical_system.element_list)
+        x_e, y_e, x_f, y_f = least_squares.dataframe_to_tuples(df_features,
+                                                            n_elements=n_elements,
+                                                            sample_weights=sample_weights,
+                                                            normalize_forces=normalize_forces,
+                                                            )  # x: input, y: prediction
+    if extra_data_e is not None:
+        x_e = np.concatenate((x_e, extra_data_e[0]))
+        y_e = np.concatenate((y_e, extra_data_e[1]))
+    if extra_data_f is not None:
+        x_f = np.concatenate((x_f, extra_data_f[0]))
+        y_f = np.concatenate((y_f, extra_data_f[1])) 
 
     ### Fit UF3 model from features dataframe ###
     logger("Training model...", message_verbosity=1)
@@ -447,17 +468,7 @@ def train(features: pd.DataFrame | str,
     if regularization_values is None:
         regularization_values = dict()
     regularizer = bspline_config.get_regularization_matrix(**regularization_values)
-    n_elements = len(bspline_config.chemical_system.element_list)
-    x_e, y_e, x_f, y_f = least_squares.dataframe_to_tuples(df_features,
-                                                           n_elements=n_elements,
-                                                           sample_weights=sample_weights,
-                                                           )  # x: input, y: prediction
-    if extra_data_e is not None:
-        x_e = np.concatenate((x_e, extra_data_e[0]))
-        y_e = np.concatenate((y_e, extra_data_e[1]))
-    if extra_data_f is not None:
-        x_f = np.concatenate((x_f, extra_data_f[0]))
-        y_f = np.concatenate((y_f, extra_data_f[1]))
+
     model = least_squares.WeightedLinearModel(bspline_config=bspline_config,
                                               regularizer=regularizer,
                                               )  # XXX: there is another arg called "data coverage", and I have no idea what it does

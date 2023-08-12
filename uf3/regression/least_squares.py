@@ -673,7 +673,8 @@ def get_spline_taylor_expansion(r_target,
 def dataframe_to_tuples(df_features,
                         n_elements=None,
                         energy_key='energy',
-                        sample_weights=None):
+                        sample_weights=None,
+                        normalize_forces=False):
     """
     Extract energy/force inputs/outputs from DataFrame.
 
@@ -685,6 +686,10 @@ def dataframe_to_tuples(df_features,
         energy_key (str): key for energy samples, used to slice df_features
             into energies and forces for weight generation.
         sample_weights (dict):
+        normalize_forces (bool): whether to normalize features by the
+            magnitude of the maximum force (energy features) or the magnitude
+            of the true force component value (force features).
+                Normalized before sample weighting.
 
     Returns:
         x (np.ndarray): features for machine learning.
@@ -709,6 +714,20 @@ def dataframe_to_tuples(df_features,
         x_e = x[energy_mask]
     x_f = x[force_mask]
 
+    # normalize forces
+    if normalize_forces:
+        abs_y_f = np.abs(y_f)
+        force_normalization = (abs_y_f > 0.005) * abs_y_f + (abs_y_f <= 0.005) * 0.005
+        energy_normalization = np.array(
+            [(3*np.mean((y_f[names[force_mask] == name])**2))**0.5 for name in names[energy_mask]]
+        )
+        print(f"energy normalization: {energy_normalization}")
+        x_f /= force_normalization[:, None]
+        y_f /= force_normalization
+        x_e /= energy_normalization[:, None]
+        y_e /= energy_normalization
+
+    # sample weighting
     if sample_weights is not None:
         w = np.array([sample_weights.get(name, 1.0) for name in names])
         w_e = w[energy_mask]
