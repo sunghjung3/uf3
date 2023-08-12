@@ -98,6 +98,8 @@ class ZBL:
 
 class SwitchingZBL:
     def __init__(self, z1, z2, r1, rc):
+        self.r1 = r1
+        self.rc = rc
         self.zbl = ZBL(z1, z2)
         self.switch = SwitchingFunction(r1, rc,
                                         self.zbl(rc),
@@ -105,13 +107,13 @@ class SwitchingZBL:
                                         self.zbl.d2(rc))
         
     def __call__(self, r):
-        return (r < self.switch.rc) * self.zbl(r) + self.switch(r)
+        return (r < self.rc) * self.zbl(r) + self.switch(r)
     
     def d(self, r):
-        return (r < self.switch.rc) * self.zbl.d(r) + self.switch.d(r)
+        return (r < self.rc) * self.zbl.d(r) + self.switch.d(r)
 
     def d2(self, r):
-        return (r < self.switch.rc) * self.zbl.d2(r) + self.switch.d2(r)
+        return (r < self.rc) * self.zbl.d2(r) + self.switch.d2(r)
 
 
 if __name__ == "__main__":

@@ -721,7 +721,6 @@ def dataframe_to_tuples(df_features,
         energy_normalization = np.array(
             [(3*np.mean((y_f[names[force_mask] == name])**2))**0.5 for name in names[energy_mask]]
         )
-        print(f"energy normalization: {energy_normalization}")
         x_f /= force_normalization[:, None]
         y_f /= force_normalization
         x_e /= energy_normalization[:, None]
