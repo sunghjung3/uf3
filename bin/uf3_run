@@ -387,6 +387,7 @@ def train(features: pd.DataFrame | str | Tuple[np.ndarray, np.ndarray, np.ndarra
           normalize_forces: bool = True,
           extra_data_e: list[np.ndarray] = None,
           extra_data_f: list[np.ndarray] = None,
+          use_zbl: bool = False,
           settings_file: str = "settings.yaml",
           override: bool = True,
           overwrite: bool = True,
@@ -413,6 +414,7 @@ def train(features: pd.DataFrame | str | Tuple[np.ndarray, np.ndarray, np.ndarra
             [x_e, y_e]
         extra_data_f (list[np.ndarray]): additional forces to include in the training set.
             [x_f, y_f]
+        use_zbl (bool): augment the UF3 model with the ZBL potential for the 2-body repulsive core (default: False).
         settings_file (str): name of the settings file (default: settings.yaml).
             For an example of the content, see "defaults_options.yaml" at `uf3.__file__` (execute this in Python to see path)
         override (bool): these inputs override any conflicting values in the settings file in case of a conflict (default: True)
@@ -431,10 +433,11 @@ def train(features: pd.DataFrame | str | Tuple[np.ndarray, np.ndarray, np.ndarra
     logger(f"* overwriting files that exist already: {overwrite}", message_verbosity=2)
 
     settings = user_config.read_config(settings_file)
-    models_settings = settings.get("model", dict())
+    model_settings = settings.get("model", dict())
     features_settings = settings.get("features", dict())
     learning_settings = settings.get("learning", dict())
-    model_file = resolve_input_conflict(model_file, models_settings, "model_path", "model file name", override)
+    model_file = resolve_input_conflict(model_file, model_settings, "model_path", "model file name", override)
+    use_zbl = resolve_input_conflict(use_zbl, model_settings, "use_zbl", "use_zbl", override)
     logger(f"* model_file: {model_file}", message_verbosity=2)
     if isinstance(features, tuple):
         x_e, y_e, x_f, y_f = features
@@ -471,6 +474,7 @@ def train(features: pd.DataFrame | str | Tuple[np.ndarray, np.ndarray, np.ndarra
 
     model = least_squares.WeightedLinearModel(bspline_config=bspline_config,
                                               regularizer=regularizer,
+                                              zbl=use_zbl,
                                               )  # XXX: there is another arg called "data coverage", and I have no idea what it does
     normalize_residual = learning_settings["normalize_residual"]
     model.fit(x_e, y_e, x_f, y_f, weight=learning_weight, normalize_residual=normalize_residual)

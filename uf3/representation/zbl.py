@@ -1,4 +1,5 @@
 import numpy as np
+import ase.data as ase_data
 
 
 class SwitchingFunction:
@@ -114,6 +115,18 @@ class SwitchingZBL:
 
     def d2(self, r):
         return (r < self.rc) * self.zbl.d2(r) + self.switch.d2(r)
+
+
+class LJSwitchingZBL(SwitchingZBL):
+    def __init__(self, z1, z2):
+        approximate_bond_length = \
+            ase_data.covalent_radii[z1] + ase_data.covalent_radii[z2]
+        sigma = approximate_bond_length * 2**(-1/6)  # sigma from LJ
+        r1_factor = 0.9
+        rc_factor = 1.0
+        r1 = r1_factor * sigma
+        rc = rc_factor * sigma
+        super().__init__(z1, z2, r1, rc)
 
 
 if __name__ == "__main__":

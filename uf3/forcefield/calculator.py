@@ -13,11 +13,13 @@ import ase
 from ase import optimize as ase_optim
 from ase import constraints as ase_constraints
 from ase.calculators import calculator as ase_calc
+from ase import data as ase_data
 
 from uf3.data import geometry
 from uf3.representation import distances
 from uf3.representation import bspline
 from uf3.representation import angles
+from uf3.representation import zbl
 from uf3.regression import regularize
 from uf3.regression import least_squares
 from uf3.forcefield.properties import elastic
@@ -53,6 +55,13 @@ class UFCalculator(ase_calc.Calculator):
                                                      model.coefficients)
         self.pair_potentials = construct_pair_potentials(self.solutions,
                                                          self.bspline_config)
+
+        self.zbls = dict()
+        if model.zbl:
+            for pair in self.bspline_config.interactions_map[2]:
+                z1, z2 = (ase_data.atomic_numbers[el] for el in pair)
+                self.zbls[pair] = zbl.LJSwitchingZBL(z1, z2)
+
         if self.degree > 2:
             self.trio_potentials = construct_trio_potentials(
                 self.solutions, self.bspline_config)
@@ -166,6 +175,17 @@ class UFCalculator(ase_calc.Calculator):
             energy_contribution = np.sum(bspline_values)
             # energy contribution per distance
             energy += energy_contribution
+
+        # ZBL
+        if self.zbls:
+            for pair in pair_tuples:
+                zbl = self.zbls[pair]
+                distance_list = distances_map[pair]
+                mask = (distance_list < zbl.rc)
+                zbl_values = zbl(distance_list[mask])
+                zbl_contribution = np.sum(zbl_values)
+                energy += zbl_contribution / 2  # divide by 2 to avoid double counting
+
         return energy
 
     def energy_3b(self,
@@ -242,6 +262,19 @@ class UFCalculator(ase_calc.Calculator):
             # broadcast multiplication over atomic and cartesian axis dims
             component = np.sum(np.multiply(bspline_values, deltas), axis=-1)
             forces -= component
+
+        # ZBL
+        if self.zbls:
+            for pair in pair_tuples:
+                zbl = self.zbls[pair]
+                distance_list = distance_map[pair]
+                drij_dr = derivative_map[pair]
+                mask = (distance_list < zbl.rc)
+                zbl_values = zbl.d(distance_list[mask])
+                deltas = drij_dr[:, :, mask]
+                component = np.sum(np.multiply(zbl_values, deltas), axis=-1)
+                forces -= component
+
         return forces
 
     def forces_3b(self, atoms, supercell):

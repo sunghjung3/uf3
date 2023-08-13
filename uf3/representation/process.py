@@ -43,10 +43,7 @@ class BasisFeaturizer:
         if use_zbl:
             for pair in self.interactions_map[2]:
                 z1, z2 = (ase_data.atomic_numbers[el] for el in pair)
-                approximate_bond_length = \
-                    ase_data.covalent_radii[z1] + ase_data.covalent_radii[z2]
-                sigma = approximate_bond_length * 2**(-1/6)  # sigma from LJ
-                self.zbls[pair] = zbl.SwitchingZBL(z1, z2, 0.9*sigma, sigma)
+                self.zbls[pair] = zbl.LJSwitchingZBL(z1, z2)
 
         # generate column labels
         self.columns = self.bspline_config.get_column_names()
@@ -418,7 +415,8 @@ class BasisFeaturizer:
         if self.zbls:
             for pair in pair_tuples:
                 zbl = self.zbls[pair]
-                zbl_energy += np.sum(zbl(distances_map[pair])) / 2  # divide by 2 to remove double counting
+                mask = (distances_map[pair] < zbl.rc)
+                zbl_energy += np.sum(zbl(distances_map[pair][mask])) / 2  # divide by 2 to remove double counting
        
         return feature_vector, zbl_energy
 
