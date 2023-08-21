@@ -1,4 +1,5 @@
 from ase.atoms import Atoms
+import ase.data as ase_data
 from ase.io.trajectory import Trajectory
 import numpy as np
 import matplotlib.pyplot as plt 
@@ -7,6 +8,7 @@ from scipy import interpolate, optimize
 import functools
 
 from uf3.regression import least_squares
+from uf3.representation import zbl
 
 from libufmin_analysis import calc_pair_energy
 
@@ -38,9 +40,14 @@ def plot_single_model(model, training_data=None, nAtoms=None, label='',
     solutions = least_squares.arrange_coefficients(model.coefficients, model.bspline_config)
     element = model.bspline_config.element_list[0]
     pair = (element, element)
+    z1, z2 = (ase_data.atomic_numbers[el] for el in pair)
     coefficient_1b = solutions[element]
     coefficients_2b = solutions[pair]
     knot_sequence = model.bspline_config.knots_map[pair]
+    if hasattr(model, 'zbl') and model.zbl:
+        zbl_obj = zbl.LJSwitchingZBL(z1, z2)
+    else:
+        zbl_obj = None
 
     # calculate derivative and curvature of pair energy using central finite difference
     if calc_rlim is None:
@@ -53,16 +60,16 @@ def plot_single_model(model, training_data=None, nAtoms=None, label='',
     curvatures = []
     local_minima = {'r': [], 'E': [], 'E_prime': [], 'E_double_prime': []}
     for k, r in enumerate(rs):
-        pair_energy_plus = calc_pair_energy(r + epsilon, coefficient_1b, coefficients_2b, knot_sequence, nAtoms)
-        pair_energy_minus = calc_pair_energy(r - epsilon, coefficient_1b, coefficients_2b, knot_sequence, nAtoms)
+        pair_energy_plus = calc_pair_energy(r + epsilon, coefficient_1b, coefficients_2b, knot_sequence, nAtoms, zbl=zbl_obj)
+        pair_energy_minus = calc_pair_energy(r - epsilon, coefficient_1b, coefficients_2b, knot_sequence, nAtoms, zbl=zbl_obj)
         pair_energy_prime = (pair_energy_plus - pair_energy_minus) / (2 * epsilon)
         derivatives.append(pair_energy_prime)
 
-        pair_energy_center = calc_pair_energy(r, coefficient_1b, coefficients_2b, knot_sequence, nAtoms)
+        pair_energy_center = calc_pair_energy(r, coefficient_1b, coefficients_2b, knot_sequence, nAtoms, zbl=zbl_obj)
         energies.append(pair_energy_center)
 
-        pair_energy_plusplus = calc_pair_energy(r + 2*epsilon, coefficient_1b, coefficients_2b, knot_sequence, nAtoms)
-        pair_energy_minusminus = calc_pair_energy(r - 2*epsilon, coefficient_1b, coefficients_2b, knot_sequence, nAtoms)
+        pair_energy_plusplus = calc_pair_energy(r + 2*epsilon, coefficient_1b, coefficients_2b, knot_sequence, nAtoms, zbl=zbl_obj)
+        pair_energy_minusminus = calc_pair_energy(r - 2*epsilon, coefficient_1b, coefficients_2b, knot_sequence, nAtoms, zbl=zbl_obj)
         pair_energy_plus_prime = (pair_energy_plusplus - pair_energy_center) / (2*epsilon)
         pair_energy_minus_prime = (pair_energy_center - pair_energy_minusminus) / (2*epsilon)
         pair_energy_double_prime = (pair_energy_plus_prime - pair_energy_minus_prime) / (2*epsilon)
@@ -92,7 +99,7 @@ def plot_single_model(model, training_data=None, nAtoms=None, label='',
     if training_data is not None:
         residual = []
         for r, E in zip(training_data[0], training_data[1]):
-            residual.append(E - calc_pair_energy(r, coefficient_1b, coefficients_2b, knot_sequence, nAtoms))
+            residual.append(E - calc_pair_energy(r, coefficient_1b, coefficients_2b, knot_sequence, nAtoms, zbl=zbl_obj))
         axs[0].plot(training_data[0], residual, 'r.')
         axs[0].set_ylabel("true - fit (eV)")
         if reslim is not None:
@@ -125,41 +132,47 @@ def plot_single_model(model, training_data=None, nAtoms=None, label='',
     axs[3].set_xlim(plot_rlim)
     axs[0].set_title(label)
 
-    plt.show()
+    return fig, axs
 
 
 
 if __name__ == '__main__':
-    model_file = "model_1.json"
-    model_number = 1
-    opt_traj_file = "ufmin.traj"
-    calc_rlim = [1.4, 6]
-    rspacing = 0.01
-    epsilon = 0.0000001
-    #plot_rlim = 
-    E_lim = (-15, 25)
-    E_prime_lim = (-12, 12)
-    E_double_prime_lim = (-50, 50)
-    reslim = (-1, 1)
+    n_models = 7
+    for i in range(1, n_models+1):
+    #i = 7
+    #if True:
+        print(i)
+        model_file = "model_" + str(i) + ".json"
+        model_number = i
+        opt_traj_file = "ufmin.traj"
+        calc_rlim = [1.4, 6]
+        rspacing = 0.01
+        epsilon = 0.0000001
+        #plot_rlim = 
+        E_lim = (-1000, 1000)
+        E_prime_lim = (-12, 12)
+        E_double_prime_lim = (-50, 50)
+        reslim = (-1, 1)
 
-    r_min = 2.22
-    well_depth = 9
-    lj_p = functools.partial(lj, r_min, well_depth)  # the true radial potential
+        r_min = 2.22
+        well_depth = 9
+        lj_p = functools.partial(lj, r_min, well_depth)  # the true radial potential
 
-    #============================================
+        #============================================
 
 
-    model = least_squares.WeightedLinearModel.from_json(model_file)
+        model = least_squares.WeightedLinearModel.from_json(model_file)
 
-    if opt_traj_file is not None:
-        opt_traj = Trajectory(opt_traj_file, 'r')
-        training_traj = make_pair_energy_data(opt_traj[0:model_number+1], lj_p)
-        nAtoms = len(training_traj[0])
-        opt_traj.close()
-    else:
-        training_traj = None
-        nAtoms = None
+        if opt_traj_file is not None:
+            opt_traj = Trajectory(opt_traj_file, 'r')
+            training_traj = make_pair_energy_data(opt_traj[0:model_number+1], lj_p)
+            nAtoms = len(training_traj[0])
+            opt_traj.close()
+        else:
+            training_traj = None
+            nAtoms = None
 
-    plot_single_model(model, training_traj, nAtoms=nAtoms, label=model_file,
-                      calc_rlim=calc_rlim, rspacing=rspacing, epsilon=epsilon,
-                      E_lim=E_lim, E_prime_lim=E_prime_lim, E_double_prime_lim=E_double_prime_lim, reslim=reslim)
+        plot_single_model(model, training_traj, nAtoms=nAtoms, label=model_file,
+                          calc_rlim=calc_rlim, rspacing=rspacing, epsilon=epsilon,
+                          E_lim=E_lim, E_prime_lim=E_prime_lim, E_double_prime_lim=E_double_prime_lim, reslim=reslim)
+    plt.show()

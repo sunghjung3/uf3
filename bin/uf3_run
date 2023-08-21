@@ -259,7 +259,7 @@ def initialize(settings_file: str = "settings.yaml",
 def featurize(bspline_config: bspline.BSplineBasis,
               data: Atoms | List[Atoms] | str = None,
               features_file: str = None,
-              use_zbl: bool = False,
+              use_zbl: bool = None,
               settings_file: str = "settings.yaml",
               data_prefix: str = None,
               return_df_data: bool = False,
@@ -384,10 +384,10 @@ def train(features: pd.DataFrame | str | Tuple[np.ndarray, np.ndarray, np.ndarra
           learning_weight: float = 0.5,
           regularization_values: dict = None,
           sample_weights: dict = None,
-          normalize_forces: bool = True,
+          normalize_forces: bool = False,
           extra_data_e: list[np.ndarray] = None,
           extra_data_f: list[np.ndarray] = None,
-          use_zbl: bool = False,
+          use_zbl: bool = None,
           settings_file: str = "settings.yaml",
           override: bool = True,
           overwrite: bool = True,
@@ -451,10 +451,10 @@ def train(features: pd.DataFrame | str | Tuple[np.ndarray, np.ndarray, np.ndarra
             raise TypeError(f"Invalid data type of features. Please provide a features dataframe or file name.")
         n_elements = len(bspline_config.chemical_system.element_list)
         x_e, y_e, x_f, y_f = least_squares.dataframe_to_tuples(df_features,
-                                                            n_elements=n_elements,
-                                                            sample_weights=sample_weights,
-                                                            normalize_forces=normalize_forces,
-                                                            )  # x: input, y: prediction
+                                                               n_elements=n_elements,
+                                                               sample_weights=sample_weights,
+                                                               normalize_forces=normalize_forces,
+                                                               )  # x: input, y: prediction
     if extra_data_e is not None:
         x_e = np.concatenate((x_e, extra_data_e[0]))
         y_e = np.concatenate((y_e, extra_data_e[1]))
