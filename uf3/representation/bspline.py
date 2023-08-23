@@ -768,7 +768,7 @@ def featurize_force_2B(basis_functions,
         mask = (distances < zbl.rc)
         dzbl_dr = zbl.d(distances[mask])
         deltas = drij_dR[:, :, mask]
-        zbl_forces = np.sum(np.multiply(dzbl_dr, deltas), axis=-1)
+        zbl_forces = np.sum(np.multiply(dzbl_dr, deltas), axis=-1) / 2  # divide by 2 to remove double counting
     zbl_forces = -zbl_forces  # derivative to force
 
     return x, zbl_forces

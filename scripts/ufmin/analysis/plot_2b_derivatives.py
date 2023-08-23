@@ -145,9 +145,10 @@ if __name__ == '__main__':
         model_file = "model_" + str(i) + ".json"
         model_number = i
         opt_traj_file = "ufmin.traj"
-        calc_rlim = [1.4, 6]
         rspacing = 0.01
         epsilon = 0.0000001
+        calc_rlim = [1.4 + epsilon, 6 + epsilon]
+        plot_rlim = [1.4, 6]
         #plot_rlim = 
         E_lim = (-1000, 1000)
         E_prime_lim = (-12, 12)
@@ -173,6 +174,6 @@ if __name__ == '__main__':
             nAtoms = None
 
         plot_single_model(model, training_traj, nAtoms=nAtoms, label=model_file,
-                          calc_rlim=calc_rlim, rspacing=rspacing, epsilon=epsilon,
+                          calc_rlim=calc_rlim, rspacing=rspacing, epsilon=epsilon, plot_rlim=plot_rlim,
                           E_lim=E_lim, E_prime_lim=E_prime_lim, E_double_prime_lim=E_double_prime_lim, reslim=reslim)
     plt.show()
