@@ -77,8 +77,6 @@ def plot_pair_energy(coefficient_1b, coefficients_2b, knot_sequence, nAtoms, zbl
         s_max = np.max(y_total[~np.isnan(y_total)])
         ylim = [s_min, s_max]
 
-    y_total += zbl_energy
-
     # add 1 body offset
     nBonds = nAtoms * (nAtoms - 1) / 2
     y_plot = np.ones(np.shape(x_plot)) * nAtoms / nBonds * coefficient_1b
@@ -89,12 +87,18 @@ def plot_pair_energy(coefficient_1b, coefficients_2b, knot_sequence, nAtoms, zbl
                 color=colors[-1],
                 linewidth=1)
     y_total += y_plot
+    y_total_with_zbl = y_total + zbl_energy
 
     if show_total:
         ax.plot(x_plot,
                 y_total,
-                c='k',      
-                linewidth=2) 
+                'k--',      
+                linewidth=1) 
+        ax.plot(x_plot,
+                y_total_with_zbl,
+                'k',
+                linewidth=2)
+
     #ax.set_xlim(r_min, r_max)
     #ax.set_ylim(s_min, s_max)
     ax.set_xlim(xlim)
