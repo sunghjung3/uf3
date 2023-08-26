@@ -259,7 +259,7 @@ def initialize(settings_file: str = "settings.yaml",
 def featurize(bspline_config: bspline.BSplineBasis,
               data: Atoms | List[Atoms] | str = None,
               features_file: str = None,
-              use_zbl: bool = None,
+              zbl_scale: float = None,
               settings_file: str = "settings.yaml",
               data_prefix: str = None,
               return_df_data: bool = False,
@@ -280,7 +280,8 @@ def featurize(bspline_config: bspline.BSplineBasis,
             Atoms.get_forces() have been called before.
             Or instead, it may be possible to set both Atoms.calc = <calc> and Atoms.calc.atoms = <Atoms> (but not guaranteed to work).
         features_file (str): name of features file to store results from this function.
-        use_zbl (bool): augment the UF3 model with the ZBL potential for the 2-body repulsive core (default: False).
+        zbl_scale (float): augment the UF3 model with a scaled ZBL potential for the 2-body repulsive core (default: 0.0).
+            ZBL potential is scaled by this value.
         settings_file (str): name of the settings file (default: settings.yaml).
             For an example of the content, see "defaults_options.yaml" at `uf3.__file__` (execute this in Python to see path)
         data_prefix (str): prefix for data and features labeling.
@@ -313,10 +314,10 @@ def featurize(bspline_config: bspline.BSplineBasis,
         raise Exception("You must provide training data.")
     features_file = resolve_input_conflict(features_file, features_settings, "features_path", "features file name", override)
     model_settings = settings.get("model", dict())
-    use_zbl = resolve_input_conflict(use_zbl, model_settings, "use_zbl", "use_zbl", override)
+    zbl_scale = resolve_input_conflict(zbl_scale, model_settings, "zbl_scale", "zbl_scale", override)
     logger(f"* data: {data}", message_verbosity=2)
     logger(f"* features_file: {features_file}", message_verbosity=2)
-    logger(f"* use_zbl: {use_zbl}", message_verbosity=2)
+    logger(f"* zbl_scale: {zbl_scale}", message_verbosity=2)
 
     # read training data and create dataframe
     data_coordinator = io.DataCoordinator()
@@ -362,7 +363,7 @@ def featurize(bspline_config: bspline.BSplineBasis,
     representation = process.BasisFeaturizer(bspline_config=bspline_config,
                                             fit_forces=fit_forces,
                                             prefix=column_prefix,
-                                            use_zbl=use_zbl,) 
+                                            zbl_scale=zbl_scale,) 
     df_features = representation.evaluate_parallel(df_data, client, n_jobs=n_cores*50, progress="bar")
     logger(f"Number of features: {len(df_features)}", message_verbosity=2)
     logger(f"Features:\n{df_features.info}", message_verbosity=2)
@@ -387,7 +388,7 @@ def train(features: pd.DataFrame | str | Tuple[np.ndarray, np.ndarray, np.ndarra
           normalize_forces: bool = False,
           extra_data_e: list[np.ndarray] = None,
           extra_data_f: list[np.ndarray] = None,
-          use_zbl: bool = None,
+          zbl_scale: float = None,
           settings_file: str = "settings.yaml",
           override: bool = True,
           overwrite: bool = True,
@@ -414,7 +415,8 @@ def train(features: pd.DataFrame | str | Tuple[np.ndarray, np.ndarray, np.ndarra
             [x_e, y_e]
         extra_data_f (list[np.ndarray]): additional forces to include in the training set.
             [x_f, y_f]
-        use_zbl (bool): augment the UF3 model with the ZBL potential for the 2-body repulsive core (default: False).
+        zbl_scale (float): augment the UF3 model with a scaled ZBL potential for the 2-body repulsive core (default: 0.0).
+            ZBL potential is scaled by this value.
         settings_file (str): name of the settings file (default: settings.yaml).
             For an example of the content, see "defaults_options.yaml" at `uf3.__file__` (execute this in Python to see path)
         override (bool): these inputs override any conflicting values in the settings file in case of a conflict (default: True)
@@ -437,7 +439,7 @@ def train(features: pd.DataFrame | str | Tuple[np.ndarray, np.ndarray, np.ndarra
     features_settings = settings.get("features", dict())
     learning_settings = settings.get("learning", dict())
     model_file = resolve_input_conflict(model_file, model_settings, "model_path", "model file name", override)
-    use_zbl = resolve_input_conflict(use_zbl, model_settings, "use_zbl", "use_zbl", override)
+    zbl_scale = resolve_input_conflict(zbl_scale, model_settings, "zbl_scale", "zbl_scale", override)
     logger(f"* model_file: {model_file}", message_verbosity=2)
     if isinstance(features, tuple):
         x_e, y_e, x_f, y_f = features
@@ -474,7 +476,7 @@ def train(features: pd.DataFrame | str | Tuple[np.ndarray, np.ndarray, np.ndarra
 
     model = least_squares.WeightedLinearModel(bspline_config=bspline_config,
                                               regularizer=regularizer,
-                                              zbl=use_zbl,
+                                              zbl_scale=zbl_scale,
                                               )  # XXX: there is another arg called "data coverage", and I have no idea what it does
     normalize_residual = learning_settings["normalize_residual"]
     model.fit(x_e, y_e, x_f, y_f, weight=learning_weight, normalize_residual=normalize_residual)

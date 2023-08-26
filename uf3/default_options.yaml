@@ -41,8 +41,7 @@ features:
 
 model:
     model_path: model.json
-    use_zbl: no
-
+    zbl_scale: 0.0
 learning:
     features_path: features.h5
     splits_path: splits.json

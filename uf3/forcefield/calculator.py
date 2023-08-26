@@ -19,7 +19,7 @@ from uf3.data import geometry
 from uf3.representation import distances
 from uf3.representation import bspline
 from uf3.representation import angles
-from uf3.representation import zbl
+from uf3.forcefield import zbl
 from uf3.regression import regularize
 from uf3.regression import least_squares
 from uf3.forcefield.properties import elastic
@@ -57,10 +57,10 @@ class UFCalculator(ase_calc.Calculator):
                                                          self.bspline_config)
 
         self.zbls = dict()
-        if model.zbl:
+        if model.zbl_scale:
             for pair in self.bspline_config.interactions_map[2]:
                 z1, z2 = (ase_data.atomic_numbers[el] for el in pair)
-                self.zbls[pair] = zbl.LJSwitchingZBL(z1, z2)
+                self.zbls[pair] = zbl.LJSwitchingZBL(z1, z2, scale=model.zbl_scale)
 
         if self.degree > 2:
             self.trio_potentials = construct_trio_potentials(

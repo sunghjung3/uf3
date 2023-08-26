@@ -26,13 +26,13 @@ class BasisFeaturizer:
     -Arrange features into DataFrame
     -Process DataFrame into tuples of (x, y, weight)
     """
-    def __init__(self, bspline_config, fit_forces=True, prefix='x', use_zbl=False):
+    def __init__(self, bspline_config, fit_forces=True, prefix='x', zbl_scale=0.0):
         """
         Args:
             bspline_config (uf3.representation.bspline.BsplineConfig)
             fit_forces (bool): whether to generate force features.
             prefix (str): prefix for feature columns.
-            use_zbl (bool): subtract ZBL potential from 2-body features.
+            zbl_scale (scale): subtract scaled ZBL potential from 2-body features.
         """
         self.bspline_config = bspline_config
         self.fit_forces = fit_forces
@@ -40,10 +40,10 @@ class BasisFeaturizer:
 
         # ZBL
         self.zbls = dict()
-        if use_zbl:
+        if zbl_scale:
             for pair in self.interactions_map[2]:
                 z1, z2 = (ase_data.atomic_numbers[el] for el in pair)
-                self.zbls[pair] = zbl.LJSwitchingZBL(z1, z2)
+                self.zbls[pair] = zbl.LJSwitchingZBL(z1, z2, scale=zbl_scale)
 
         # generate column labels
         self.columns = self.bspline_config.get_column_names()

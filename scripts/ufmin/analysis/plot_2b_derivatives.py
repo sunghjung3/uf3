@@ -44,8 +44,8 @@ def plot_single_model(model, training_data=None, nAtoms=None, label='',
     coefficient_1b = solutions[element]
     coefficients_2b = solutions[pair]
     knot_sequence = model.bspline_config.knots_map[pair]
-    if hasattr(model, 'zbl') and model.zbl:
-        zbl_obj = zbl.LJSwitchingZBL(z1, z2)
+    if hasattr(model, 'zbl_scale') and model.zbl_scale:
+        zbl_obj = zbl.LJSwitchingZBL(z1, z2, scale=model.zbl_scale)
     else:
         zbl_obj = None
 

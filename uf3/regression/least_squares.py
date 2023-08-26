@@ -150,7 +150,7 @@ class WeightedLinearModel(BasicLinearModel):
                  bspline_config,
                  regularizer=None,
                  data_coverage=None,
-                 zbl=False,
+                 zbl_scale=0.0,
                  **params):
         super().__init__(regularizer)
         self.bspline_config = bspline_config
@@ -170,7 +170,7 @@ class WeightedLinearModel(BasicLinearModel):
             # initialize regularizer matrix if unspecified.
             self.set_params(**params)
         
-        self.zbl = zbl
+        self.zbl_scale = zbl_scale
 
     def set_params(self, **params):
         """Set parameters from keyword arguments. Initializes
@@ -194,11 +194,11 @@ class WeightedLinearModel(BasicLinearModel):
         bspline_config = bspline.BSplineBasis.from_dict(config)
         regularizer = config.get("regularizer", None)
         data_coverage = config.get("data_coverage", None)
-        zbl = config.get("zbl", False)
+        zbl_scale = config.get("zbl_scale", False)
         model = WeightedLinearModel(bspline_config,
                                     regularizer=regularizer,
                                     data_coverage=data_coverage,
-                                    zbl=zbl)
+                                    zbl_scale=zbl_scale)
         model.load(solution=config)
         return model
 
@@ -217,7 +217,7 @@ class WeightedLinearModel(BasicLinearModel):
         dump = dict(coefficients=solution,
                     knots=knots_map,
                     data_coverage=self.data_coverage,
-                    zbl=self.zbl,
+                    zbl_scale=self.zbl_scale,
                     **self.bspline_config.as_dict())
         return dump
 
