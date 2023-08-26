@@ -13,7 +13,7 @@ import ase.data as ase_data
 from uf3.representation import distances
 from uf3.representation import angles
 from uf3.representation import bspline
-from uf3.representation import zbl
+from uf3.forcefield import zbl
 from uf3.data import io
 from uf3.data import geometry
 from uf3.util import parallel

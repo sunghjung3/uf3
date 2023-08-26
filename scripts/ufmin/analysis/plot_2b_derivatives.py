@@ -8,7 +8,7 @@ from scipy import interpolate, optimize
 import functools
 
 from uf3.regression import least_squares
-from uf3.representation import zbl
+from uf3.forcefield import zbl
 
 from libufmin_analysis import calc_pair_energy
 

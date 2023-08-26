@@ -1,5 +1,8 @@
 import numpy as np
+
+import ase
 import ase.data as ase_data
+from ase.calculators import calculator as ase_calc
 
 
 class SwitchingFunction:
@@ -98,7 +101,7 @@ class ZBL:
     
 
 class SwitchingZBL:
-    def __init__(self, z1, z2, r1, rc):
+    def __init__(self, z1, z2, r1, rc, scale=1.0):
         self.r1 = r1
         self.rc = rc
         self.zbl = ZBL(z1, z2)
@@ -106,19 +109,20 @@ class SwitchingZBL:
                                         self.zbl(rc),
                                         self.zbl.d(rc),
                                         self.zbl.d2(rc))
+        self.scale = scale
         
     def __call__(self, r):
-        return (r < self.rc) * self.zbl(r) + self.switch(r)
+        return self.scale * ( (r < self.rc) * self.zbl(r) + self.switch(r) )
     
     def d(self, r):
-        return (r < self.rc) * self.zbl.d(r) + self.switch.d(r)
+        return self.scale * ( (r < self.rc) * self.zbl.d(r) + self.switch.d(r) )
 
     def d2(self, r):
-        return (r < self.rc) * self.zbl.d2(r) + self.switch.d2(r)
+        return self.scale * ( (r < self.rc) * self.zbl.d2(r) + self.switch.d2(r) )
 
 
 class LJSwitchingZBL(SwitchingZBL):
-    def __init__(self, z1, z2):
+    def __init__(self, z1, z2, scale=1.0):
         approximate_bond_length = \
             ase_data.covalent_radii[z1] + ase_data.covalent_radii[z2]
         sigma = approximate_bond_length * 2**(-1/6)  # sigma from LJ
@@ -126,8 +130,34 @@ class LJSwitchingZBL(SwitchingZBL):
         rc_factor = 0.333
         r1 = r1_factor * sigma
         rc = rc_factor * sigma
-        super().__init__(z1, z2, r1, rc)
+        super().__init__(z1, z2, r1, rc, scale=scale)
 
+
+class ZBLCalculator(ase_calc.Calculator):
+    """
+    ASE calculator for ZBL potential.
+    """
+    def __init__(self, ZBLClass, **kwargs):
+        super().__init__(**kwargs)
+        self.ZBLClass = ZBLClass
+
+    def __repr__(self):
+        return f"ASE Calculator for {self.ZBLClass}"
+
+    def __str__(self):
+        return self.__repr__()
+
+    def get_potential_energy(self,
+                             atoms: ase.Atoms = None,
+                             force_consistent: bool = None,
+                             ) -> float:
+        pass
+
+    def get_forces(self,
+                   atoms: ase.Atoms = None,
+                   ) -> np.ndarray:
+        pass
+    
 
 if __name__ == "__main__":
     # test ZBL
