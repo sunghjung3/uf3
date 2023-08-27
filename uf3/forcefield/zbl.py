@@ -2,7 +2,6 @@ import numpy as np
 
 import ase
 import ase.data as ase_data
-from ase.calculators import calculator as ase_calc
 
 
 class SwitchingFunction:
@@ -126,40 +125,10 @@ class LJSwitchingZBL(SwitchingZBL):
         approximate_bond_length = \
             ase_data.covalent_radii[z1] + ase_data.covalent_radii[z2]
         sigma = approximate_bond_length * 2**(-1/6)  # sigma from LJ
-        #r1_factor = 0.25
-        #rc_factor = 0.333
-        #r1 = r1_factor * sigma
-        #rc = rc_factor * sigma
-        r1 = 5.0
-        rc = 6.0
+        r1 = sigma
+        rc = approximate_bond_length
         super().__init__(z1, z2, r1, rc, scale=scale)
 
-
-class ZBLCalculator(ase_calc.Calculator):
-    """
-    ASE calculator for ZBL potential.
-    """
-    def __init__(self, ZBLClass, **kwargs):
-        super().__init__(**kwargs)
-        self.ZBLClass = ZBLClass
-
-    def __repr__(self):
-        return f"ASE Calculator for {self.ZBLClass}"
-
-    def __str__(self):
-        return self.__repr__()
-
-    def get_potential_energy(self,
-                             atoms: ase.Atoms = None,
-                             force_consistent: bool = None,
-                             ) -> float:
-        pass
-
-    def get_forces(self,
-                   atoms: ase.Atoms = None,
-                   ) -> np.ndarray:
-        pass
-    
 
 if __name__ == "__main__":
     # test ZBL

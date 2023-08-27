@@ -470,6 +470,114 @@ class UFCalculator(ase_calc.Calculator):
         return results
 
 
+class UFStylePairCalculator(ase_calc.Calculator):
+    """
+    A general ASE calculator class for potentials that can be decomposed
+    into a sum of 2-body interaction potentials.
+
+    The pairs are referenced following UF3 interactions map conventions.
+
+    All pair potentials must have the following attributes/methods:
+        * `r_cut`, `rc`, `r_c`, or `r_max` (attribute):
+            defines a finite cutoff radius of the interaction.
+        * `d` (method): derivative of the potential with respect to distance.
+
+    Args:
+        pair_potentials (Dict): map of pair tuple to potential function.
+    """
+    implemented_properties = ['energy', 'forces']
+
+    def __init__(self,
+                 pair_potentials: Dict,
+                 **kwargs
+                 ):
+        super().__init__(**kwargs)
+        self.pair_potentials = pair_potentials
+        self.pair_tuples = list(self.pair_potentials.keys())
+        self.r_min_map = {pair: 0.0 for pair in self.pair_tuples}
+
+        self.r_max_map = {}
+        for pair in self.pair_tuples:
+            potential = self.pair_potentials[pair]
+            if hasattr(potential, 'r_cut'):
+                self.r_max_map[pair] = potential.r_cut
+            elif hasattr(potential, 'rc'):
+                self.r_max_map[pair] = potential.rc
+            elif hasattr(potential, 'r_c'):
+                self.r_max_map[pair] = potential.r_c
+            elif hasattr(potential, 'r_max'):
+                self.r_max_map[pair] = potential.r_max
+            else:
+                raise ValueError("Pair potential must have r_cut, rc, r_c, or r_max")
+        self.r_cut = max(self.r_max_map.values())
+
+    def __repr__(self):
+        return f"ASE Calculator for UFStylePairCalculator: {self.pair_potentials}"
+
+    def __str__(self):
+        return self.__repr__()
+
+    def get_potential_energy(self,
+                             atoms: ase.Atoms = None,
+                             force_consistent: bool = None,
+                             ) -> float:
+        if any(atoms.pbc):
+            supercell = geometry.get_supercell(atoms, r_cut=self.r_cut)
+        else:
+            supercell = atoms
+        distances_map = distances.distances_by_interaction(atoms,
+                                                           self.pair_tuples,
+                                                           self.r_min_map,
+                                                           self.r_max_map,
+                                                           supercell)
+        energy = 0.0
+        for pair in self.pair_tuples:
+            pair_potential = self.pair_potentials[pair]
+            distance_list = distances_map[pair]
+            mask = (distance_list < self.r_max_map[pair])
+            potential_values = pair_potential(distance_list[mask])
+            potential_contribution = np.sum(potential_values)
+            energy += potential_contribution / 2  # divide by 2 to avoid double counting
+        return energy
+
+    def get_forces(self,
+                   atoms: ase.Atoms = None,
+                   ) -> np.ndarray:
+        n_atoms = len(atoms)
+        if any(atoms.pbc):
+            supercell = geometry.get_supercell(atoms, r_cut=self.r_cut)
+        else:
+            supercell = atoms
+        deriv_results = distances.derivatives_by_interaction(atoms,
+                                                             self.pair_tuples,
+                                                             self.r_cut,
+                                                             self.r_min_map,
+                                                             self.r_max_map,
+                                                             supercell)
+        distance_map, derivative_map = deriv_results
+
+        forces = np.zeros((n_atoms, 3))
+        for pair in self.pair_tuples:
+            pair_potential = self.pair_potentials[pair]
+            distance_list = distance_map[pair]
+            drij_dr = derivative_map[pair]
+            mask = (distance_list < self.r_max_map[pair])
+            potential_values = pair_potential.d(distance_list[mask])
+            deltas = drij_dr[:, :, mask]
+            component = np.sum(np.multiply(potential_values, deltas), axis=-1)
+            forces -= component
+
+        return forces
+
+    def calculation_required(self, atoms: ase.Atoms, quantities: List) -> bool:
+        """Check if a calculation is required."""
+        if 'energy' in quantities and 'energy' not in atoms.info:
+            return True
+        if 'force' in quantities and 'fx' not in atoms.arrays:
+            return True
+        return False
+
+
 def coefficients_by_interaction(element_list: List,
                                 interactions_map: Dict[int, List[Tuple[str]]],
                                 partition_sizes: Collection[int],
