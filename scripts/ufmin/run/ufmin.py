@@ -90,7 +90,7 @@ def ufmin(initial_structure = "POSCAR",
           preprocess_strength = 0.5,
           sample_weight_strength = 6,
           pretrained_models = None,
-          normalize_forces = True,
+          normalize_forces = False,
           resume = 0  # start from scratch if 0. Do `resume` additional forcecalls if non-zero. If non-zero, overrides `max_forcecalls` parameter.
           ):
     """
@@ -499,13 +499,14 @@ if __name__ == "__main__":
     status_update_file = "ufmin_status.out"
     ufmin_true_fmax = 0.05  # force tolerance for the actual optimization
     ufmin_uf3_fmax = 0.05  # force tolerance for the optimization on the uf3 surface
-    dr_trust = 0.64  # trust distance deviation for r-based UQ
+    dr_trust = 0.36875  # trust distance deviation for r-based UQ.  TODO: should be a function of knot intervals
     preprocess_strength = 0.5
     optimizer = FIRE
     max_forcecalls = 200
     max_uf3_calls = 1000
     verbose = 0
     pretrained_models = None
+    normalize_forces = False
     resume = 0
 
     r_min = 2.22
@@ -531,6 +532,7 @@ if __name__ == "__main__":
                 max_uf3_calls,
                 verbose,
                 true_calc,
+                normalize_forces=normalize_forces,
                 preprocess_strength=preprocess_strength,
                 dr_trust=dr_trust,
                 pretrained_models=pretrained_models,

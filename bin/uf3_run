@@ -477,7 +477,7 @@ def train(features: pd.DataFrame | str | Tuple[np.ndarray, np.ndarray, np.ndarra
     model = least_squares.WeightedLinearModel(bspline_config=bspline_config,
                                               regularizer=regularizer,
                                               zbl_scale=zbl_scale,
-                                              )  # XXX: there is another arg called "data coverage", and I have no idea what it does
+                                              )
     normalize_residual = learning_settings["normalize_residual"]
     model.fit(x_e, y_e, x_f, y_f, weight=learning_weight, normalize_residual=normalize_residual)
     if model_file is not None:

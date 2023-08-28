@@ -10,7 +10,7 @@ import functools
 from uf3.regression import least_squares
 from uf3.forcefield import zbl
 
-from libufmin_analysis import calc_pair_energy
+from libufmin_analysis import calc_pair_energy, plot_pair_energy
 
 
 def lj(r_min, depth, r):
@@ -36,7 +36,9 @@ def plot_single_model(model, training_data=None, nAtoms=None, label='',
                       # calculation parameters
                       calc_rlim=None, rspacing=0.01, epsilon=0.00000001,
                       # plot parameters
-                      plot_rlim=None, E_lim=None, E_prime_lim=None, E_double_prime_lim=None, reslim=None):
+                      plot_rlim=None, E_lim=None, E_prime_lim=None, E_double_prime_lim=None, reslim=None,
+                      plot_components=False
+                      ):
     solutions = least_squares.arrange_coefficients(model.coefficients, model.bspline_config)
     element = model.bspline_config.element_list[0]
     pair = (element, element)
@@ -48,6 +50,12 @@ def plot_single_model(model, training_data=None, nAtoms=None, label='',
         zbl_obj = zbl.LJSwitchingZBL(z1, z2, scale=model.zbl_scale)
     else:
         zbl_obj = None
+
+    if plot_components:
+        fig, ax = plot_pair_energy(coefficient_1b, coefficients_2b, knot_sequence,
+                                   nAtoms, zbl=zbl_obj,
+                                   show_components=True, show_total=True,
+                                   xlim=plot_rlim, ylim=E_lim)
 
     # calculate derivative and curvature of pair energy using central finite difference
     if calc_rlim is None:
@@ -150,10 +158,11 @@ if __name__ == '__main__':
         calc_rlim = [1.4 + epsilon, 6 + epsilon]
         plot_rlim = [1.4, 6]
         #plot_rlim = 
-        E_lim = (-1000, 1000)
+        E_lim = (-20, 50)
         E_prime_lim = (-12, 12)
         E_double_prime_lim = (-50, 50)
         reslim = (-1, 1)
+        plot_components = True
 
         r_min = 2.22
         well_depth = 9
@@ -175,5 +184,6 @@ if __name__ == '__main__':
 
         plot_single_model(model, training_traj, nAtoms=nAtoms, label=model_file,
                           calc_rlim=calc_rlim, rspacing=rspacing, epsilon=epsilon, plot_rlim=plot_rlim,
-                          E_lim=E_lim, E_prime_lim=E_prime_lim, E_double_prime_lim=E_double_prime_lim, reslim=reslim)
+                          E_lim=E_lim, E_prime_lim=E_prime_lim, E_double_prime_lim=E_double_prime_lim, reslim=reslim,
+                          plot_components=plot_components)
     plt.show()
