@@ -1,4 +1,4 @@
-from typing import Iterable, List
+from typing import Iterable, List, Tuple
 from collections import defaultdict, Counter
 import heapq
 
@@ -13,7 +13,6 @@ from uf3.representation import bspline
 from uf3.data import composition, geometry
 
 
-global_dr_trust = 0.64
 
 
 class R_UQ_NeighborList(PrimitiveNeighborList):
@@ -29,7 +28,7 @@ class R_UQ_NeighborList(PrimitiveNeighborList):
             2 atomic displacements exceed twice the skin depth.
     """ 
 
-    def __init__(self, cutoffs, skin=global_dr_trust/2, sorted=False,
+    def __init__(self, cutoffs, skin=0.32, sorted=False,
                  self_interaction=False, bothways=True,
                  use_scaled_positions=False):
         super().__init__(cutoffs, skin, sorted, self_interaction,
@@ -57,16 +56,21 @@ class R_UQ_NeighborList(PrimitiveNeighborList):
 
 class R_UQ:
     """
-    A class for the r-based UQ method to be used during UF3-accelerated
+    A superclass for the r-based UQ method to be used during UF3-accelerated
     geometry optimization.
-    
-    Intended to be instantiated only once for a single optimization job.
 
+    Intended to be instantiated only once for a single optimization job.
+    
     This assumes that the atomic order and composition as well as the following
     attributes of `bspline_config` will remain constant:
         * r_min_map
         * r_max_map
         * chemical_system
+
+    This superclass should be inherited as a general framework for body-order-specific subclasses.
+    The subclasses should implement the following methods:
+        * update_trained_rs()
+        * check_r()
 
     Attributes
     ----------
@@ -79,22 +83,18 @@ class R_UQ:
         Referenced in memory but not modified within the class.
     bspline_config : uf3.representation.bspline.BSplieBasis
         BSplineBasis object containing UF3 information, such as pair hashes and
-        cutoff distances.
-    dr_trust : float
-        Trust radius of how far a pair distance can be away from trained
-        distances before a "high uncertainty" is triggered.
-
-    Methods
-    -------
-    nl_cutoffs()
-        Creates a list of cutoffs for neighbor list construction
+        cutoff distances. The uncertainty trust radius is determined by the 
+        cutoff and resolution information in this object.
+    uq_tolerance : float
+        The uncertainty tolerance level. The trust radius (dr_trust) is given
+        by uq_tolerance * 
     """
 
-
     def __init__(self, atoms: Atoms,
-                       trained_traj: List[Atoms],
-                       bspline_config: bspline.BSplineBasis,
-                       dr_trust: float = global_dr_trust):
+                 trained_traj: List[Atoms],
+                 bspline_config: bspline.BSplineBasis,
+                 uq_tolerance: float = 1.0,
+                 ):
         """
         Parameters
         ----------
@@ -104,13 +104,11 @@ class R_UQ:
             See class description.
         bspline_config : uf3.representation.bspline.BSplineBasis
             See class description.
-        dr_trust : float
-            See class description (default = `global_dr_trust`).
         """
         self.atoms = atoms
         self.trained_traj = trained_traj
         self.bspline_config = bspline_config
-        self.dr_trust = dr_trust
+        self.dr_trust = self.determine_dr_trust(self.bspline_config)
         if Counter(set(atoms.get_chemical_symbols())) != Counter(self.bspline_config.element_list):
             raise Exception("Elements in atoms do not match those in bspline_config.")
 
@@ -126,53 +124,51 @@ class R_UQ:
                                )
 
         # Hash things
-        self.pair2hash2b = {pair: hashed_pair for pair, hashed_pair in 
-                            zip(self.bspline_config.chemical_system.interactions_map[2],
-                            self.bspline_config.chemical_system.interaction_hashes[2]
-                            )
-                           }
-        if self.bspline_config.degree > 2:
-            self.pair2hash3b = {pair: hashed_pair for pair, hashed_pair in 
-                                zip(self.bspline_config.chemical_system.interactions_map[3],
-                                self.bspline_config.chemical_system.interaction_hashes[3]
-                                )
-                               }
-        self.r_min_2b_hashed = {self.pair2hash2b[pair]: value for pair, value in self.bspline_config.r_min_map.items() if len(pair) == 2}  # e.g.: {("Pt", "Pt"): 0.1} --> {6240: 0.1}
-        self.r_max_2b_hashed = {self.pair2hash2b[pair]: value for pair, value in self.bspline_config.r_max_map.items() if len(pair) == 2}
-        self.pair_hash_array = self.build_pair_hash_array()
-        # TODO: implement similar "hash tensor" for 3 body
+        degree = self.bspline_config.degree
+        self.interaction2hash = {interaction: hashed_interaction for interaction, hashed_interaction in
+                                    zip(self.bspline_config.chemical_system.interactions_map[degree],
+                                    self.bspline_config.chemical_system.interaction_hashes[degree]
+                                    )
+                                    }
+        self.r_min_hashed = {self.interaction2hash[interaction]: value for interaction, value in self.bspline_config.r_min_map.items() if len(interaction) == degree}  # e.g.: {("Pt", "Pt"): 0.1} --> {6240: 0.1}
+        self.r_max_hashed = {self.interaction2hash[interaction]: value for interaction, value in self.bspline_config.r_max_map.items() if len(interaction) == degree}
 
+        self.trained_traj_len = 0  # how many images in self.trained_traj have been considered in update_trained_rs()
 
-        # Reference (trained) r's things
-        self.r2_gaps = dict()  # store gaps in r^2 space for 2 body
-        self.trained_triples = defaultdict(list)  # 3 body
-        self.trained_traj_len = 0  # how many images in self.trained_traj have I considered in update_trained_rs()?
-        self.no_more_gaps = defaultdict(bool)  # True when no gaps remaining; {pair_hash: bool}
+    def determine_dr_trust(self,
+                           bspline_config: bspline.BSplineBasis,
+                           ) -> float:
+        """
+        Determines the trust radius of how far a pair distance can be away from
+        trained distances before a "high uncertainty" is triggered.
 
+        Parameters
+        ----------
+        bspline_config : uf3.representation.bspline.BSplineBasis
+            BSplineBasis object containing UF3 information.
 
-    def build_pair_hash_array(self):
-        # Hash matrices of pairs between self.atoms and a supercell (nRows < nCols)
-        # NOTE: When working with ASE-style neighborlists, the leftmost (nRows x nRows) submatrix can be used.
-        nAtoms = len(self.atoms)
-        largest_r = max(self.r_max_2b_hashed.values())
-        if any(self.atoms.pbc):
-            tmp_supercell = geometry.get_supercell(self.atoms, r_cut=largest_r)
-        else:
-            tmp_supercell = self.atoms
-        nSupercell = len(tmp_supercell)
-        upper_tri_idx = np.triu_indices(nAtoms, k=1, m=nSupercell)
-        species_set = (self.atoms.get_atomic_numbers(),
-                       tmp_supercell.get_atomic_numbers())
-        symbols_set = (self.atoms.get_chemical_symbols(),
-                       tmp_supercell.get_chemical_symbols())
-        pair_hashes_by_idx = composition.get_pair_hashes(species_set, symbols_set, upper_tri_idx)
-        pair_hash_array = np.zeros((nAtoms, nSupercell))
-        pair_hash_array[upper_tri_idx] = pair_hashes_by_idx
-        lower_tri_idx = np.tril_indices(nAtoms, k=-1)
-        truncated_upper_tri_idx = (lower_tri_idx[1], lower_tri_idx[0])
-        pair_hash_array[lower_tri_idx] = pair_hash_array[truncated_upper_tri_idx]  # fill lower part
-        return pair_hash_array
-
+        Returns
+        -------
+        dr_trust : float
+            Trust radius of how far a pair distance can be away from trained
+            distances before a "high uncertainty" is triggered.
+        """
+        r_max_map = bspline_config.r_max_map
+        r_min_map = bspline_config.r_min_map
+        resolution_map = bspline_config.resolution_map
+        interactions = [t for i in range(2, bspline_config.degree+1) for t in bspline_config.interactions_map[i]]
+        smallest_interval = np.inf
+        for interaction in interactions:
+            if len(interaction) == 2:
+                interval = (r_max_map[interaction] - r_min_map[interaction]) / resolution_map[interaction]
+            else:
+                intervals = [
+                    (r_max_map[interaction][i] - r_min_map[interaction][i]) / resolution_map[interaction][i]
+                    for i in range(r_max_map[interaction])
+                             ]
+                interval = min(intervals)
+            smallest_interval = interval if interval < smallest_interval else smallest_interval
+        return smallest_interval 
 
     def nl_cutoffs(self) -> List:
         """
@@ -223,6 +219,82 @@ class R_UQ:
         cutoffs = [cutoffs_by_element[i] for i in atomic_numbers]
         return cutoffs
 
+    def update_trained_rs(self):
+        """
+        Updates the record of training data (distances) on file.
+        """
+        raise NotImplementedError("This should be implemented by the subclass.")
+        self.trained_train_len = len(self.trained_traj)  # should be updated by subclass
+
+    def check_r(self):
+        """
+        Checks if the current geometry is too epistemically uncertain based on
+        the r-based UQ method.
+        """
+        raise NotImplementedError("This should be implemented by the subclass.")
+    
+    def too_uncertain(self):
+        """
+        Updates neighbor lists, training data, and checks uncertainty.
+        """
+        # Check neighbor list
+        self.nl.update(self.atoms)  # build new neighbor list if needed
+
+        # If there is new training data
+        if len(self.trained_traj) != self.trained_traj_len:
+            self.update_trained_rs()
+        
+        # Check epistemic uncertainty
+        return self.check_r()
+
+
+class R_UQ_2B(R_UQ):
+    """
+    A class for the r-based UQ method up to 2-body interactions to be used
+    during UF3-accelerated geometry optimization. The trust radius is set to be
+    the smallest knot interval of all 2-body interactions.
+
+    See superclass `R_UQ` for more details.
+    """
+
+    def __init__(self, atoms: Atoms,
+                       trained_traj: List[Atoms],
+                       bspline_config: bspline.BSplineBasis,
+                       ):
+        degree = 2
+        if bspline_config.degree > degree:
+            raise Exception(f"This class only supports up to {degree}-body interactions.")
+        super().__init__(atoms, trained_traj, bspline_config,)
+
+        self.pair_hash_array = self.build_pair_hash_array()
+
+        # Reference (trained) r's things
+        self.r2_gaps = dict()  # store gaps in r^2 space for 2 body
+
+
+    def build_pair_hash_array(self):
+        # Hash matrices of pairs between self.atoms and a supercell (nRows < nCols)
+        # NOTE: When working with ASE-style neighborlists, the leftmost (nRows x nRows) submatrix can be used.
+        nAtoms = len(self.atoms)
+        largest_r = max(self.r_max_hashed.values())
+        if any(self.atoms.pbc):
+            tmp_supercell = geometry.get_supercell(self.atoms, r_cut=largest_r)
+        else:
+            tmp_supercell = self.atoms
+        nSupercell = len(tmp_supercell)
+        upper_tri_idx = np.triu_indices(nAtoms, k=1, m=nSupercell)
+        species_set = (self.atoms.get_atomic_numbers(),
+                       tmp_supercell.get_atomic_numbers())
+        symbols_set = (self.atoms.get_chemical_symbols(),
+                       tmp_supercell.get_chemical_symbols())
+        pair_hashes_by_idx = composition.get_pair_hashes(species_set, symbols_set, upper_tri_idx)
+        pair_hash_array = np.zeros((nAtoms, nSupercell))
+        pair_hash_array[upper_tri_idx] = pair_hashes_by_idx
+        lower_tri_idx = np.tril_indices(nAtoms, k=-1)
+        truncated_upper_tri_idx = (lower_tri_idx[1], lower_tri_idx[0])
+        pair_hash_array[lower_tri_idx] = pair_hash_array[truncated_upper_tri_idx]  # fill lower part
+        return pair_hash_array
+
 
     def distances_by_hash(self, geom):
         """ 
@@ -234,25 +306,22 @@ class R_UQ:
         Returns:
             distances_lists (dict): list of observed pair distances by pair hash
         """
-        smallest_r = min(self.r_min_2b_hashed.values())
-        largest_r = max(self.r_max_2b_hashed.values())
+        smallest_r = min(self.r_min_hashed.values())
+        largest_r = max(self.r_max_hashed.values())
 
         if any(geom.pbc):
             supercell = geometry.get_supercell(geom, r_cut=largest_r)
         else:
             supercell = geom
 
-        nAtoms = len(geom)
-        nSupercell = len(supercell)
-
         dist_matr = spatial.distance.cdist(geom.get_positions(),
                                             supercell.get_positions())  # distance of atoms in geom to atoms on supercell
 
         # apply r_min and r_max cut masks for each pair type
         ###
-        hash2r_min = np.vectorize(lambda key: self.r_min_2b_hashed.get(key, largest_r))  # default to largest_r so that it will get filtered out later
+        hash2r_min = np.vectorize(lambda key: self.r_min_hashed.get(key, largest_r))  # default to largest_r so that it will get filtered out later
         r_min_cut = hash2r_min(self.pair_hash_array)
-        hash2r_max = np.vectorize(lambda key: self.r_max_2b_hashed.get(key, smallest_r))  # default to smallest_r so that it will get filtered out later
+        hash2r_max = np.vectorize(lambda key: self.r_max_hashed.get(key, smallest_r))  # default to smallest_r so that it will get filtered out later
         r_max_cut = hash2r_max(self.pair_hash_array)
         filter = (dist_matr > r_min_cut) & (dist_matr <= r_max_cut)
         
@@ -262,15 +331,9 @@ class R_UQ:
 
         return distances_lists
 
-    
-    def triples_by_hash(self):
-        raise NotImplementedError("Not written yet.")
-
 
     def update_trained_rs(self):
         self.update_gaps()
-        #if self.bspline_config.degree > 2:  # 3 body
-        #    self.update_trained_rs_3b()
         self.trained_traj_len = len(self.trained_traj)
 
 
@@ -293,9 +356,9 @@ class R_UQ:
         num_tol = 0.000001  
 
         # use self.r_max_2b_hashed instead of trained_pairs because possibility of missing hash
-        for pair_hash in self.r_max_2b_hashed:
-            r_min = self.r_min_2b_hashed[pair_hash]
-            r_max = self.r_max_2b_hashed[pair_hash]
+        for pair_hash in self.r_max_hashed:
+            r_min = self.r_min_hashed[pair_hash]
+            r_max = self.r_max_hashed[pair_hash]
             rs = trained_pairs.get(pair_hash, list())
             assert not rs or rs[0] >= r_min-num_tol  # either empty or meet sanity check
             assert not rs or rs[-1] <= r_max+num_tol
@@ -334,15 +397,7 @@ class R_UQ:
             self.r2_gaps[pair_hash] = tmp_gaps
 
 
-    def update_trained_rs_3b(self):
-        raise NotImplementedError("Not written yet.")
-        for image in self.trained_traj[self.trained_traj_len:]:
-            for hash, triples in self.triples_by_hash(image):  # 2 body
-                pass
-                # 3b: bin the triples space into voxels with width self.dr_trust, and check the adjaent 8 voxels. Can I work in r^2 space?
-
-
-    def check_r_2b(self):
+    def check_r(self):
         # check based on r2_gaps
         for atom in range(len(self.atoms)):
             neighbors, offsets = self.nl.get_neighbors(atom)
@@ -366,26 +421,48 @@ class R_UQ:
         return False  # not uncertain
 
 
-    def check_r_3b(self):
+class R_UQ_3B(R_UQ):
+    """
+    A class for the r-based UQ method up to 3-body interactions to be used
+    during UF3-accelerated geometry optimization. The trust radius is set to be
+    the smallest knot interval of all 2- and 3-body interactions.
+
+    See superclass `R_UQ` for more details.
+    """
+
+    def __init__(self, atoms: Atoms,
+                       trained_traj: List[Atoms],
+                       bspline_config: bspline.BSplineBasis,
+                       ):
+        degree = 3
+        if bspline_config.degree > degree:
+            raise Exception(f"This class only supports up to {degree}-body interactions.")
+        super().__init__(atoms, trained_traj, bspline_config,)
+
+        self.pair_hash_array = self.build_pair_hash_array()
+        # TODO: implement similar "hash tensor" for 3 body
+
+        # Reference (trained) r's things
+        self.trained_triples = defaultdict(list)  # 3 body
+
+
+    def triples_by_hash(self):
+        raise NotImplementedError("Not written yet.")
+
+
+    def update_trained_rs(self):
+        raise NotImplementedError("Not written yet.")
+        for image in self.trained_traj[self.trained_traj_len:]:
+            for hash, triples in self.triples_by_hash(image):  # 2 body
+                pass
+                # 3b: bin the triples space into voxels with width self.dr_trust, and check the adjaent 8 voxels. Can I work in r^2 space?
+
+
+    def check_r(self):
         # check based on trained_triples
         raise NotImplementedError("Not written yet.")
         return False  # not uncertain
 
-    def too_uncertain(self):
-        # Check neighbor list
-        self.nl.update(self.atoms)  # build new neighbor list if needed
-
-        # If there is new training data
-        if len(self.trained_traj) != self.trained_traj_len:
-            self.update_trained_rs()
-
-        # Check epistemic uncertainty
-        if self.check_r_2b():
-            return True
-        #if self.bspline_config.degree > 2:
-        #    return self.check_r_3b()
-        return False
-        
 
 
 if __name__ == "__main__":

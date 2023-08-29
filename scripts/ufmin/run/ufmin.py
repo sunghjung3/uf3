@@ -21,7 +21,6 @@ from uf3.data import io
 from uf3.representation import process
 from uf3.data import geometry, composition
 import delta_uq, r_uq
-from r_uq import global_dr_trust
 from preprocess import preprocess
 
 import copy, sys, time, os, glob, pickle, gc, concurrent
@@ -86,7 +85,7 @@ def ufmin(initial_structure = "POSCAR",
           resolution_map = None,
           learning_weight = 0.5,
           regularization_values = None,
-          dr_trust = global_dr_trust,
+          uq_tolerance = 1.0,
           preprocess_strength = 0.5,
           sample_weight_strength = 6,
           pretrained_models = None,
@@ -121,7 +120,8 @@ def ufmin(initial_structure = "POSCAR",
         resolution_map (dict): Resolution map for features.
         learning_weight (float): Weight for learning term in loss function.
         regularization_values (list): ridge and curvature regularization values.
-        dr_trust (float): Trust distance deviation for r-based UQ.
+        uq_tolerance (float): How tolerable this workflow is to uncertainty.
+            See `r_uq.R_UQ` class for more details.
         preprocess_strength (float): Strength of preprocessing (0.0 to 1.0)
         sample_weight_strength (int): how strongly to weigh the most recent sample vs the oldest.
             See `generate_sample_weights` function for more details.
@@ -266,7 +266,13 @@ def ufmin(initial_structure = "POSCAR",
     preconditioner_f = None
 
     # initialize UQ object
-    r_uq_obj = r_uq.R_UQ(atoms, traj, bspline_config, dr_trust)
+    if bspline_config.degree == 2:
+        UQClass = r_uq.R_UQ_2B
+    elif bspline_config.degree == 3:
+        UQClass = r_uq.R_UQ_3B
+    else:
+        raise NotImplementedError("Only 2 and 3-body UQ is implemented")
+    r_uq_obj = UQClass(atoms, traj, bspline_config, uq_tolerance)
 
 
     ### Optimization Loop ###
@@ -499,7 +505,7 @@ if __name__ == "__main__":
     status_update_file = "ufmin_status.out"
     ufmin_true_fmax = 0.05  # force tolerance for the actual optimization
     ufmin_uf3_fmax = 0.05  # force tolerance for the optimization on the uf3 surface
-    dr_trust = 0.36875  # trust distance deviation for r-based UQ.  TODO: should be a function of knot intervals
+    uq_tolerance = 1.0  # how tolerable this workflow is to uncertainty
     preprocess_strength = 0.5
     optimizer = FIRE
     max_forcecalls = 200
@@ -534,7 +540,7 @@ if __name__ == "__main__":
                 true_calc,
                 normalize_forces=normalize_forces,
                 preprocess_strength=preprocess_strength,
-                dr_trust=dr_trust,
+                uq_tolerance=uq_tolerance,
                 pretrained_models=pretrained_models,
                 resume=resume,
                 )
