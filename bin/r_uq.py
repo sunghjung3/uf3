@@ -69,6 +69,7 @@ class R_UQ:
 
     This superclass should be inherited as a general framework for body-order-specific subclasses.
     The subclasses should implement the following methods:
+        * determine_dr_trust()
         * update_trained_rs()
         * check_r()
 
@@ -108,12 +109,17 @@ class R_UQ:
         self.atoms = atoms
         self.trained_traj = trained_traj
         self.bspline_config = bspline_config
-        self.dr_trust = self.determine_dr_trust(self.bspline_config)
-        if Counter(set(atoms.get_chemical_symbols())) != Counter(self.bspline_config.element_list):
-            raise Exception("Elements in atoms do not match those in bspline_config.")
+        if Counter(set(atoms.get_chemical_symbols())) > Counter(self.bspline_config.element_list):
+            raise Exception("There are more elements in atoms than bspline_config.")
 
         # Neighbor list things
-        ase_nl_skin = self.dr_trust / 2  # half because ASE-style neighbor list
+        dr_trust = self.determine_dr_trust(self.bspline_config, scale=uq_tolerance)
+        dr_trust_values = list(dr_trust.values())
+        if isinstance(dr_trust_values[0], Iterable):
+            max_value = max(max(lst) for lst in dr_trust_values)
+        else:
+            max_value = max(dr_trust_values)
+        ase_nl_skin = max_value / 2  # half because ASE-style neighbor list
                                          # no half with LAMMPS-style NL
         self.nl = NeighborList(cutoffs=self.nl_cutoffs(),
                                skin=ase_nl_skin,
@@ -132,43 +138,36 @@ class R_UQ:
                                     }
         self.r_min_hashed = {self.interaction2hash[interaction]: value for interaction, value in self.bspline_config.r_min_map.items() if len(interaction) == degree}  # e.g.: {("Pt", "Pt"): 0.1} --> {6240: 0.1}
         self.r_max_hashed = {self.interaction2hash[interaction]: value for interaction, value in self.bspline_config.r_max_map.items() if len(interaction) == degree}
+        self.dr_trust = {self.interaction2hash[interaction]: value for interaction, value in dr_trust.items() if len(interaction) == degree}
 
         self.trained_traj_len = 0  # how many images in self.trained_traj have been considered in update_trained_rs()
 
     def determine_dr_trust(self,
                            bspline_config: bspline.BSplineBasis,
-                           ) -> float:
+                           scale: float = 1.0,
+                           ) -> dict:
         """
         Determines the trust radius of how far a pair distance can be away from
         trained distances before a "high uncertainty" is triggered.
+
+        This method should be implemented by the subclass.
 
         Parameters
         ----------
         bspline_config : uf3.representation.bspline.BSplineBasis
             BSplineBasis object containing UF3 information.
 
+        scale : float
+            A scaling factor for the trust radius. The default value is 1.0.
+
         Returns
         -------
-        dr_trust : float
-            Trust radius of how far a pair distance can be away from trained
-            distances before a "high uncertainty" is triggered.
+        dr_trust : dict
+            Trust radius for each highest-degree interaction of how far a pair
+            distance can be away from trained distances before a
+            "high uncertainty" is triggered.
         """
-        r_max_map = bspline_config.r_max_map
-        r_min_map = bspline_config.r_min_map
-        resolution_map = bspline_config.resolution_map
-        interactions = [t for i in range(2, bspline_config.degree+1) for t in bspline_config.interactions_map[i]]
-        smallest_interval = np.inf
-        for interaction in interactions:
-            if len(interaction) == 2:
-                interval = (r_max_map[interaction] - r_min_map[interaction]) / resolution_map[interaction]
-            else:
-                intervals = [
-                    (r_max_map[interaction][i] - r_min_map[interaction][i]) / resolution_map[interaction][i]
-                    for i in range(r_max_map[interaction])
-                             ]
-                interval = min(intervals)
-            smallest_interval = interval if interval < smallest_interval else smallest_interval
-        return smallest_interval 
+        raise NotImplementedError("This should be implemented by the subclass.")
 
     def nl_cutoffs(self) -> List:
         """
@@ -260,16 +259,33 @@ class R_UQ_2B(R_UQ):
     def __init__(self, atoms: Atoms,
                        trained_traj: List[Atoms],
                        bspline_config: bspline.BSplineBasis,
+                       uq_tolerance: float = 1.0,
                        ):
-        degree = 2
-        if bspline_config.degree > degree:
-            raise Exception(f"This class only supports up to {degree}-body interactions.")
-        super().__init__(atoms, trained_traj, bspline_config,)
+        self.degree = 2
+        if bspline_config.degree > self.degree:
+            raise Exception(f"This class only supports up to {self.degree}-body interactions.")
+        super().__init__(atoms, trained_traj, bspline_config, uq_tolerance)
 
         self.pair_hash_array = self.build_pair_hash_array()
 
         # Reference (trained) r's things
         self.r2_gaps = dict()  # store gaps in r^2 space for 2 body
+
+
+    def determine_dr_trust(self,
+                           bspline_config: bspline.BSplineBasis,
+                           scale: float = 1.0,
+                           ) -> dict:
+        """
+        See superclass `R_UQ` for more details.
+        """
+        r_max_map = bspline_config.r_max_map
+        r_min_map = bspline_config.r_min_map
+        resolution_map = bspline_config.resolution_map
+        pairs = bspline_config.interactions_map[2]
+        dr_trust = {pair: scale * (r_max_map[pair] - r_min_map[pair]) / resolution_map[pair]
+                    for pair in pairs}
+        return dr_trust
 
 
     def build_pair_hash_array(self):
@@ -362,15 +378,15 @@ class R_UQ_2B(R_UQ):
             rs = trained_pairs.get(pair_hash, list())
             assert not rs or rs[0] >= r_min-num_tol  # either empty or meet sanity check
             assert not rs or rs[-1] <= r_max+num_tol
-            min_r_spacing = 2 * self.dr_trust
+            min_r_spacing = 2 * self.dr_trust[pair_hash]
             assert r_max - r_min >= min_r_spacing
 
             try:
                 tmp_gaps = self.r2_gaps[pair_hash]
                 # Temporarily bring it to r space and include buffer region
                 for gap in tmp_gaps:
-                    gap[0] = gap[0] ** 0.5 - self.dr_trust
-                    gap[1] = gap[1] ** 0.5 + self.dr_trust
+                    gap[0] = gap[0] ** 0.5 - self.dr_trust[pair_hash]
+                    gap[1] = gap[1] ** 0.5 + self.dr_trust[pair_hash]
             except KeyError:
                 tmp_gaps = [ [r_min, r_max] ]  # first time (buffers included)
             for r in rs:
@@ -391,8 +407,8 @@ class R_UQ_2B(R_UQ):
 
             # Remove buffers again and take it to r^2 space
             for gap in tmp_gaps:
-                gap[0] = (gap[0] + self.dr_trust) ** 2
-                gap[1] = (gap[1] - self.dr_trust) ** 2
+                gap[0] = (gap[0] + self.dr_trust[pair_hash]) ** 2
+                gap[1] = (gap[1] - self.dr_trust[pair_hash]) ** 2
         
             self.r2_gaps[pair_hash] = tmp_gaps
 
@@ -433,17 +449,96 @@ class R_UQ_3B(R_UQ):
     def __init__(self, atoms: Atoms,
                        trained_traj: List[Atoms],
                        bspline_config: bspline.BSplineBasis,
+                       uq_tolerance: float = 1.0,
                        ):
-        degree = 3
-        if bspline_config.degree > degree:
-            raise Exception(f"This class only supports up to {degree}-body interactions.")
-        super().__init__(atoms, trained_traj, bspline_config,)
+        self.degree = 3
+        if bspline_config.degree > self.degree or bspline_config.degree < 3:
+            raise Exception(f"This class only supports up to {self.degree}-body interactions"
+                            " and at least 3-body interactions."
+                            )
+        super().__init__(atoms, trained_traj, bspline_config, uq_tolerance)
 
-        self.pair_hash_array = self.build_pair_hash_array()
+        #self.pair_hash_array = self.build_pair_hash_array()
         # TODO: implement similar "hash tensor" for 3 body
 
         # Reference (trained) r's things
         self.trained_triples = defaultdict(list)  # 3 body
+
+
+    def determine_dr_trust(self,
+                           bspline_config: bspline.BSplineBasis,
+                           scale: float = 1.0,
+                           ) -> dict:
+        """
+        See superclass `R_UQ` for more details.
+        """
+        r_max_map = bspline_config.r_max_map
+        r_min_map = bspline_config.r_min_map
+        resolution_map = bspline_config.resolution_map
+        pairs = bspline_config.interactions_map[2]
+        higher_interactions = [t for i in range(3, self.degree) for t in bspline_config.interactions_map[i]]
+        highest_interactions = bspline_config.interactions_map[self.degree]
+
+        ## Find smallest knot interval for each pair type among all interaction orders
+        smallest_pair_interval = {pair: (r_max_map[pair] - r_min_map[pair]) / resolution_map[pair]
+                                  for pair in pairs
+                                  }  # start with 2 body
+        
+        for interaction in higher_interactions + highest_interactions:
+            # For higher order interactions, the flat list (i.e. r_max_map[interaction],
+            # r_min_map[interaction], resolution_map[interaction]) can be mapped to the
+            # strictly-upper-triangular part of a 2-dimensional array whose indices
+            # correspond to the 2 elements that make up the pair distance.
+            #
+            # Example: Given a 5-body interaction (A, B, C, D, E), there are 10 possible
+            # pair distances: AB, AC, AD, AE, BC, BD, BE, CD, CE, DE. The flat r_max_map
+            # for this interaction would be a list of 10 number with indices [0, 1, 2, 3,
+            # 4, 5, 6, 7, 8, 9]. We can pair each number in this flat list with the
+            # corresponding pair type by doing the following:
+            #
+            #     A | B | C | D | E
+            #   --------------------
+            # A | - | 0 | 1 | 2 | 3
+            # B | - | - | 4 | 5 | 6
+            # C | - | - | - | 7 | 8
+            # D | - | - | - | - | 9
+            # E | - | - | - | - | -
+            #
+            # So, index 5 of the flat list would map to row 1 column 3 of the 2D array,
+            # where row 1 represents 'B' and column 3 represents 'D', giving the pair
+            # type 'BD'.
+
+            # Calculate intervals as flat list for this interaction
+            intervals = [
+                (r_max_map[interaction][i] - r_min_map[interaction][i]) / resolution_map[interaction][i]
+                for i in range(len(r_max_map[interaction]))
+                         ]
+
+            # Find pair type that correspond to each element in intervals (note: there may be repeating pair tuples)
+            row_indices, col_indices = np.triu_indices(len(interaction), k=1)
+            mapped_pairs = [(interaction[row], interaction[col]) for row, col in zip(row_indices, col_indices)]
+
+            # Update smallest_pair_interval
+            for pair, interval in zip(mapped_pairs, intervals):
+                if pair not in pairs:
+                    pair = (pair[1], pair[0])
+                smallest_pair_interval[pair] = interval if interval < smallest_pair_interval[pair] \
+                                                        else smallest_pair_interval[pair]
+
+        ## Build dr_trust for all the highest-order interactions (with scaling)
+        dr_trust = dict()
+        for interaction in highest_interactions:
+            # Similar to above
+            row_indices, col_indices = np.triu_indices(len(interaction), k=1)
+            mapped_pairs = [(interaction[row], interaction[col]) for row, col in zip(row_indices, col_indices)]
+            tmp = list()
+            for pair in mapped_pairs:
+                if pair not in pairs:
+                    pair = (pair[1], pair[0])
+                tmp.append(scale * smallest_pair_interval[pair])
+            dr_trust[interaction] = tmp
+
+        return dr_trust
 
 
     def triples_by_hash(self):
