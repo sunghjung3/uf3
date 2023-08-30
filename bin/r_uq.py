@@ -331,7 +331,7 @@ class R_UQ_2B(R_UQ):
             supercell = geom
 
         dist_matr = spatial.distance.cdist(geom.get_positions(),
-                                            supercell.get_positions())  # distance of atoms in geom to atoms on supercell
+                                           supercell.get_positions())  # distance of atoms in geom to atoms on supercell
 
         # apply r_min and r_max cut masks for each pair type
         ###
