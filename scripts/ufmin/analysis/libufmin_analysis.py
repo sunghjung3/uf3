@@ -29,13 +29,17 @@ def bsplines_interpolate(xs, coefficients, knot_sequence, sum=True):
     else:
         return basis_components
 
-def calc_pair_energy(rs, coefficient_1b, coefficients_2b, knot_sequence, nAtoms):
+def calc_pair_energy(rs, coefficient_1b, coefficients_2b, knot_sequence, nAtoms, zbl=None):
     # includes 1 body offset energy
     nBonds = nAtoms * (nAtoms - 1) / 2
-    return bsplines_interpolate(rs, 2*coefficients_2b, knot_sequence) + np.ones(np.shape(rs)) * nAtoms / nBonds * coefficient_1b
+    uf3_energy =  bsplines_interpolate(rs, 2*coefficients_2b, knot_sequence) + np.ones(np.shape(rs)) * nAtoms / nBonds * coefficient_1b
+    zbl_energy = np.zeros(rs.shape)
+    if zbl is not None:
+        zbl_energy += zbl(rs)
+    return uf3_energy + zbl_energy
 
 # from uf3.util.plotting.visualize_splines()
-def plot_pair_energy(coefficient_1b, coefficients_2b, knot_sequence, nAtoms, ax=None, cmap=None, show_components=True, show_total=True, xlim=None, ylim=None):
+def plot_pair_energy(coefficient_1b, coefficients_2b, knot_sequence, nAtoms, zbl=None, ax=None, cmap=None, show_components=True, show_total=True, xlim=None, ylim=None):
     if xlim is None:
         r_min = knot_sequence[0]
         r_max = knot_sequence[-1]
@@ -46,16 +50,26 @@ def plot_pair_energy(coefficient_1b, coefficients_2b, knot_sequence, nAtoms, ax=
         fig = ax.get_figure()
     if cmap is None:
         cmap = cubehelix.c_rainbow                     
-    colors = cmap(np.linspace(0, 1, len(coefficients_2b + 1)))  # +1 for 1b coefficient
+    colors = cmap(np.linspace(0, 1, len(coefficients_2b)+2))  # +2 for 1b coefficient and zbl
     #x_plot = np.linspace(r_min, r_max, 1000)
     x_plot = np.linspace(*xlim, 200)
     basis_components = bsplines_interpolate(x_plot, 2*coefficients_2b, knot_sequence, sum=False)
+
+    # add ZBL
+    zbl_energy = np.zeros(x_plot.shape)
+    if zbl is not None:
+        zbl_energy += zbl(x_plot)
+
     if show_components:
         for i, basis_component in enumerate(basis_components):
             ax.plot(x_plot,
                     basis_component,
                     color=colors[i],
                     linewidth=1)
+        ax.plot(x_plot,
+                zbl_energy,
+                color=colors[-2],
+                linewidth=1)
 
     y_total = np.sum(basis_components, axis=0)
     if ylim is None:
@@ -73,12 +87,18 @@ def plot_pair_energy(coefficient_1b, coefficients_2b, knot_sequence, nAtoms, ax=
                 color=colors[-1],
                 linewidth=1)
     y_total += y_plot
+    y_total_with_zbl = y_total + zbl_energy
 
     if show_total:
         ax.plot(x_plot,
                 y_total,
-                c='k',      
-                linewidth=2) 
+                'k--',      
+                linewidth=1) 
+        ax.plot(x_plot,
+                y_total_with_zbl,
+                'k',
+                linewidth=2)
+
     #ax.set_xlim(r_min, r_max)
     #ax.set_ylim(s_min, s_max)
     ax.set_xlim(xlim)

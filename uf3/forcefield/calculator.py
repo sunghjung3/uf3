@@ -13,11 +13,13 @@ import ase
 from ase import optimize as ase_optim
 from ase import constraints as ase_constraints
 from ase.calculators import calculator as ase_calc
+from ase import data as ase_data
 
 from uf3.data import geometry
 from uf3.representation import distances
 from uf3.representation import bspline
 from uf3.representation import angles
+from uf3.forcefield import zbl
 from uf3.regression import regularize
 from uf3.regression import least_squares
 from uf3.forcefield.properties import elastic
@@ -53,6 +55,13 @@ class UFCalculator(ase_calc.Calculator):
                                                      model.coefficients)
         self.pair_potentials = construct_pair_potentials(self.solutions,
                                                          self.bspline_config)
+
+        self.zbls = dict()
+        if model.zbl_scale:
+            for pair in self.bspline_config.interactions_map[2]:
+                z1, z2 = (ase_data.atomic_numbers[el] for el in pair)
+                self.zbls[pair] = zbl.LJSwitchingZBL(z1, z2, scale=model.zbl_scale)
+
         if self.degree > 2:
             self.trio_potentials = construct_trio_potentials(
                 self.solutions, self.bspline_config)
@@ -166,6 +175,17 @@ class UFCalculator(ase_calc.Calculator):
             energy_contribution = np.sum(bspline_values)
             # energy contribution per distance
             energy += energy_contribution
+
+        # ZBL
+        if self.zbls:
+            for pair in pair_tuples:
+                zbl = self.zbls[pair]
+                distance_list = distances_map[pair]
+                mask = (distance_list < zbl.rc)
+                zbl_values = zbl(distance_list[mask])
+                zbl_contribution = np.sum(zbl_values)
+                energy += zbl_contribution / 2  # divide by 2 to avoid double counting
+
         return energy
 
     def energy_3b(self,
@@ -174,8 +194,10 @@ class UFCalculator(ase_calc.Calculator):
         energy = 0.0
 
         trio_list = self.bspline_config.interactions_map[3]
+        trio_numbers_list = [tuple(ase_data.atomic_numbers[elem] for elem in trio) for trio in trio_list]
         hashes = self.bspline_config.chemical_system.interaction_hashes[3]
-        n_interactions = len(hashes)
+        hash2interaction = {hash: interaction for hash, interaction in zip(hashes, trio_numbers_list)}
+        n_interactions = len(hash2interaction)
         knot_sets = [self.bspline_config.knots_map[trio] for trio in trio_list]
 
         sup_comp = supercell.get_atomic_numbers()
@@ -184,7 +206,7 @@ class UFCalculator(ase_calc.Calculator):
                                                            knot_sets,
                                                            supercell)
         triplet_generator = angles.generate_triplets(
-            i_where, j_where, sup_comp, hashes, dist_matrix, knot_sets)
+            i_where, j_where, sup_comp, hash2interaction, dist_matrix, knot_sets)
 
         for triplet_batch in triplet_generator:
             for interaction_idx in range(n_interactions):
@@ -242,6 +264,19 @@ class UFCalculator(ase_calc.Calculator):
             # broadcast multiplication over atomic and cartesian axis dims
             component = np.sum(np.multiply(bspline_values, deltas), axis=-1)
             forces -= component
+
+        # ZBL
+        if self.zbls:
+            for pair in pair_tuples:
+                zbl = self.zbls[pair]
+                distance_list = distance_map[pair]
+                drij_dr = derivative_map[pair]
+                mask = (distance_list < zbl.rc)
+                zbl_values = zbl.d(distance_list[mask])
+                deltas = drij_dr[:, :, mask]
+                component = np.sum(np.multiply(zbl_values, deltas), axis=-1)
+                forces -= component
+
         return forces
 
     def forces_3b(self, atoms, supercell):
@@ -249,8 +284,10 @@ class UFCalculator(ase_calc.Calculator):
         forces = np.zeros((n_atoms, 3))
 
         trio_list = self.bspline_config.interactions_map[3]
+        trio_numbers_list = [tuple(ase_data.atomic_numbers[elem] for elem in trio) for trio in trio_list]
         hashes = self.bspline_config.chemical_system.interaction_hashes[3]
-        n_interactions = len(hashes)
+        hash2interaction = {hash: interaction for hash, interaction in zip(hashes, trio_numbers_list)}
+        n_interactions = len(hash2interaction)
         knot_sets = [self.bspline_config.knots_map[trio] for trio in trio_list]
 
         sup_comp = supercell.get_atomic_numbers()
@@ -260,7 +297,7 @@ class UFCalculator(ase_calc.Calculator):
                                                               supercell,
                                                               square=True)
         triplet_generator = angles.generate_triplets(
-            x_where, y_where, sup_comp, hashes, matrix, knot_sets)
+            x_where, y_where, sup_comp, hash2interaction, matrix, knot_sets)
 
         for triplet_batch in triplet_generator:
             for interaction_idx in range(n_interactions):
@@ -435,6 +472,114 @@ class UFCalculator(ase_calc.Calculator):
                                              n_super=n_super,
                                              disp=disp)
         return results
+
+
+class UFStylePairCalculator(ase_calc.Calculator):
+    """
+    A general ASE calculator class for potentials that can be decomposed
+    into a sum of 2-body interaction potentials.
+
+    The pairs are referenced following UF3 interactions map conventions.
+
+    All pair potentials must have the following attributes/methods:
+        * `r_cut`, `rc`, `r_c`, or `r_max` (attribute):
+            defines a finite cutoff radius of the interaction.
+        * `d` (method): derivative of the potential with respect to distance.
+
+    Args:
+        pair_potentials (Dict): map of pair tuple to potential function.
+    """
+    implemented_properties = ['energy', 'forces']
+
+    def __init__(self,
+                 pair_potentials: Dict,
+                 **kwargs
+                 ):
+        super().__init__(**kwargs)
+        self.pair_potentials = pair_potentials
+        self.pair_tuples = list(self.pair_potentials.keys())
+        self.r_min_map = {pair: 0.0 for pair in self.pair_tuples}
+
+        self.r_max_map = {}
+        for pair in self.pair_tuples:
+            potential = self.pair_potentials[pair]
+            if hasattr(potential, 'r_cut'):
+                self.r_max_map[pair] = potential.r_cut
+            elif hasattr(potential, 'rc'):
+                self.r_max_map[pair] = potential.rc
+            elif hasattr(potential, 'r_c'):
+                self.r_max_map[pair] = potential.r_c
+            elif hasattr(potential, 'r_max'):
+                self.r_max_map[pair] = potential.r_max
+            else:
+                raise ValueError("Pair potential must have r_cut, rc, r_c, or r_max")
+        self.r_cut = max(self.r_max_map.values())
+
+    def __repr__(self):
+        return f"ASE Calculator for UFStylePairCalculator: {self.pair_potentials}"
+
+    def __str__(self):
+        return self.__repr__()
+
+    def get_potential_energy(self,
+                             atoms: ase.Atoms = None,
+                             force_consistent: bool = None,
+                             ) -> float:
+        if any(atoms.pbc):
+            supercell = geometry.get_supercell(atoms, r_cut=self.r_cut)
+        else:
+            supercell = atoms
+        distances_map = distances.distances_by_interaction(atoms,
+                                                           self.pair_tuples,
+                                                           self.r_min_map,
+                                                           self.r_max_map,
+                                                           supercell)
+        energy = 0.0
+        for pair in self.pair_tuples:
+            pair_potential = self.pair_potentials[pair]
+            distance_list = distances_map[pair]
+            mask = (distance_list < self.r_max_map[pair])
+            potential_values = pair_potential(distance_list[mask])
+            potential_contribution = np.sum(potential_values)
+            energy += potential_contribution / 2  # divide by 2 to avoid double counting
+        return energy
+
+    def get_forces(self,
+                   atoms: ase.Atoms = None,
+                   ) -> np.ndarray:
+        n_atoms = len(atoms)
+        if any(atoms.pbc):
+            supercell = geometry.get_supercell(atoms, r_cut=self.r_cut)
+        else:
+            supercell = atoms
+        deriv_results = distances.derivatives_by_interaction(atoms,
+                                                             self.pair_tuples,
+                                                             self.r_cut,
+                                                             self.r_min_map,
+                                                             self.r_max_map,
+                                                             supercell)
+        distance_map, derivative_map = deriv_results
+
+        forces = np.zeros((n_atoms, 3))
+        for pair in self.pair_tuples:
+            pair_potential = self.pair_potentials[pair]
+            distance_list = distance_map[pair]
+            drij_dr = derivative_map[pair]
+            mask = (distance_list < self.r_max_map[pair])
+            potential_values = pair_potential.d(distance_list[mask])
+            deltas = drij_dr[:, :, mask]
+            component = np.sum(np.multiply(potential_values, deltas), axis=-1)
+            forces -= component
+
+        return forces
+
+    def calculation_required(self, atoms: ase.Atoms, quantities: List) -> bool:
+        """Check if a calculation is required."""
+        if 'energy' in quantities and 'energy' not in atoms.info:
+            return True
+        if 'force' in quantities and 'fx' not in atoms.arrays:
+            return True
+        return False
 
 
 def coefficients_by_interaction(element_list: List,

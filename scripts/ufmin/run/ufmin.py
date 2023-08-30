@@ -6,7 +6,7 @@ from ase.optimize import FIRE
 #from myopts import GD, MGD
 from ase.io import trajectory
 from ase.atoms import Atoms
-from ase.data import covalent_radii, atomic_numbers
+import ase.data as ase_data
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -21,7 +21,7 @@ from uf3.data import io
 from uf3.representation import process
 from uf3.data import geometry, composition
 import delta_uq, r_uq
-from r_uq import global_dr_trust
+from preprocess import preprocess
 
 import copy, sys, time, os, glob, pickle, gc, concurrent
 
@@ -85,9 +85,11 @@ def ufmin(initial_structure = "POSCAR",
           resolution_map = None,
           learning_weight = 0.5,
           regularization_values = None,
-          dr_trust = global_dr_trust,
+          uq_tolerance = 1.0,
+          preprocess_strength = 0.5,
           sample_weight_strength = 6,
           pretrained_models = None,
+          normalize_forces = False,
           resume = 0  # start from scratch if 0. Do `resume` additional forcecalls if non-zero. If non-zero, overrides `max_forcecalls` parameter.
           ):
     """
@@ -118,11 +120,14 @@ def ufmin(initial_structure = "POSCAR",
         resolution_map (dict): Resolution map for features.
         learning_weight (float): Weight for learning term in loss function.
         regularization_values (list): ridge and curvature regularization values.
-        dr_trust (float): Trust distance deviation for r-based UQ.
+        uq_tolerance (float): How tolerable this workflow is to uncertainty.
+            See `r_uq.R_UQ` class for more details.
+        preprocess_strength (float): Strength of preprocessing (0.0 to 1.0)
         sample_weight_strength (int): how strongly to weigh the most recent sample vs the oldest.
             See `generate_sample_weights` function for more details.
         pretrained_models (dict): List of pretrained models to use for training. 
             forcecall number -> model file path
+        normalize_forces (bool): Whether or not to normalize features by max true force value.
         resume (int): Start from scratch if 0.
     """
 
@@ -175,6 +180,16 @@ def ufmin(initial_structure = "POSCAR",
 
 
     ### Set up ###
+
+    # one-time bspline configuration
+    bspline_config = uf3_run.initialize(settings_file, verbose=verbose, resolution_map=resolution_map)
+
+    settings = user_config.read_config(settings_file)
+    try:
+        n_cores = settings["features"]['n_cores']
+    except KeyError:
+        n_cores = 1
+
     if resume:
         atoms = copy.deepcopy(traj[-1])
         most_recent_E_eval = atoms.get_potential_energy()
@@ -187,6 +202,11 @@ def ufmin(initial_structure = "POSCAR",
         else:
             assert isinstance(initial_structure, Atoms)
             atoms = copy.deepcopy(initial_structure)
+
+        # preprocess
+        pair_tuples = bspline_config.interactions_map[2]
+        atoms = preprocess(atoms, pair_tuples, strength=preprocess_strength)
+
         #atoms = "emt_pt38.traj"
         #atoms = read(atoms, index="587")
         if true_calc is None:
@@ -209,23 +229,13 @@ def ufmin(initial_structure = "POSCAR",
         pickle.dump( (most_recent_E_eval, most_recent_F_eval), true_calc_file )
         traj.append(copy.deepcopy(atoms))
 
-
-    # one-time bspline configuration
-    bspline_config = uf3_run.initialize(settings_file, verbose=verbose, resolution_map=resolution_map)
-
-    settings = user_config.read_config(settings_file)
-    try:
-        n_cores = settings["features"]['n_cores']
-    except KeyError:
-        n_cores = 1
-
     '''
     # 2-body preconditioning
     preconditioner_traj = list()
     for pair in bspline_config.interactions_map[2]:
         composition = ''.join(pair)
         estimate_bond_length = \
-            covalent_radii[atomic_numbers[pair[0]]] + covalent_radii[atomic_numbers[pair[1]]]
+            ase_data.covalent_radii[ase_data.atomic_numbers[pair[0]]] + ase_data.covalent_radii[ase_data.atomic_numbers[pair[1]]]
         sigma = estimate_bond_length * 2**(-1/6)
         preconditioner_rcut = bspline_config.r_max_map[pair]
         preconditioner_sample_res = 12
@@ -256,7 +266,13 @@ def ufmin(initial_structure = "POSCAR",
     preconditioner_f = None
 
     # initialize UQ object
-    r_uq_obj = r_uq.R_UQ(atoms, traj, bspline_config, dr_trust)
+    if bspline_config.degree == 2:
+        UQClass = r_uq.R_UQ_2B
+    elif bspline_config.degree == 3:
+        UQClass = r_uq.R_UQ_3B
+    else:
+        raise NotImplementedError("Only 2 and 3-body UQ is implemented")
+    r_uq_obj = UQClass(atoms, traj, bspline_config, uq_tolerance)
 
 
     ### Optimization Loop ###
@@ -307,6 +323,7 @@ def ufmin(initial_structure = "POSCAR",
                                         learning_weight=learning_weight,
                                         regularization_values=regularization_values,
                                         sample_weights=sample_weights,
+                                        normalize_forces=normalize_forces,
                                         extra_data_f=preconditioner_f,
                                         ).result()
             #model = uf3_run.train(df_features, bspline_config, model_file=model_file, settings_file=settings_file, verbose=verbose,
@@ -488,12 +505,14 @@ if __name__ == "__main__":
     status_update_file = "ufmin_status.out"
     ufmin_true_fmax = 0.05  # force tolerance for the actual optimization
     ufmin_uf3_fmax = 0.05  # force tolerance for the optimization on the uf3 surface
-    dr_trust = 0.64  # trust distance deviation for r-based UQ
+    uq_tolerance = 1.0  # how tolerable this workflow is to uncertainty
+    preprocess_strength = 0.5
     optimizer = FIRE
     max_forcecalls = 200
     max_uf3_calls = 1000
     verbose = 0
     pretrained_models = None
+    normalize_forces = False
     resume = 0
 
     r_min = 2.22
@@ -519,7 +538,9 @@ if __name__ == "__main__":
                 max_uf3_calls,
                 verbose,
                 true_calc,
-                dr_trust=dr_trust,
+                normalize_forces=normalize_forces,
+                preprocess_strength=preprocess_strength,
+                uq_tolerance=uq_tolerance,
                 pretrained_models=pretrained_models,
                 resume=resume,
                 )

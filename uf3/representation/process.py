@@ -9,9 +9,11 @@ import warnings
 import sqlite3
 import numpy as np
 import pandas as pd
+import ase.data as ase_data
 from uf3.representation import distances
 from uf3.representation import angles
 from uf3.representation import bspline
+from uf3.forcefield import zbl
 from uf3.data import io
 from uf3.data import geometry
 from uf3.util import parallel
@@ -24,16 +26,24 @@ class BasisFeaturizer:
     -Arrange features into DataFrame
     -Process DataFrame into tuples of (x, y, weight)
     """
-    def __init__(self, bspline_config, fit_forces=True, prefix='x'):
+    def __init__(self, bspline_config, fit_forces=True, prefix='x', zbl_scale=0.0):
         """
         Args:
             bspline_config (uf3.representation.bspline.BsplineConfig)
             fit_forces (bool): whether to generate force features.
             prefix (str): prefix for feature columns.
+            zbl_scale (scale): subtract scaled ZBL potential from 2-body features.
         """
         self.bspline_config = bspline_config
         self.fit_forces = fit_forces
         self.prefix = prefix
+
+        # ZBL
+        self.zbls = dict()
+        if zbl_scale:
+            for pair in self.interactions_map[2]:
+                z1, z2 = (ase_data.atomic_numbers[el] for el in pair)
+                self.zbls[pair] = zbl.LJSwitchingZBL(z1, z2, scale=zbl_scale)
 
         # generate column labels
         self.columns = self.bspline_config.get_column_names()
@@ -308,7 +318,7 @@ class BasisFeaturizer:
                 {(name, 'e'), (name, 'fx'), ...{ instead of {'e', 'fx', ...}
             energy (float): energy of configuration (optional).
             forces (list, np.ndarray): array containing force components
-                fx, fy, fz for each atom. Expected shape is (n_atoms, 3).
+                fx, fy, fz for each atom. Expected shape is (3, natoms).
             energy_key (str): column name for energies, default "energy".
 
         Returns:
@@ -334,7 +344,7 @@ class BasisFeaturizer:
             supercell = geom
         if energy is not None:  # compute energy features
             vector_1B = self.chemical_system.get_composition_tuple(geom)
-            vector_2B = self.featurize_energy_2B(geom, supercell)
+            vector_2B, zbl_energy = self.featurize_energy_2B(geom, supercell)
             vector = np.concatenate([vector_1B, vector_2B])
             if self.degree > 2:
                 vector_3B = self.featurize_energy_3B(geom, supercell)
@@ -343,12 +353,13 @@ class BasisFeaturizer:
                 key = (name, energy_key)
             else:
                 key = energy_key
-            eval_map[key] = np.insert(vector, 0, energy)
+            remaining_energy = energy - zbl_energy
+            eval_map[key] = np.insert(vector, 0, remaining_energy)
         if forces is not None:  # compute force features
             vectors_1B = np.zeros((len(geom),
                                    3,
                                    len(self.element_list)))
-            vectors_2B = self.featurize_force_2B(geom, supercell)
+            vectors_2B, zbl_forces = self.featurize_force_2B(geom, supercell)
             vectors = np.concatenate([vectors_1B, vectors_2B],
                                      axis=2)
             if self.degree > 2:
@@ -357,7 +368,8 @@ class BasisFeaturizer:
             for j, component in enumerate(['fx', 'fy', 'fz']):
                 for i in range(n_atoms):
                     vector = vectors[i, j, :]
-                    vector = np.insert(vector, 0, forces[j][i])
+                    remaining_force = forces[j][i] - zbl_forces[i][j]
+                    vector = np.insert(vector, 0, remaining_force)
                     atom_index = component + '_' + str(i)
                     if name is not None:
                         key = (name, atom_index)
@@ -377,6 +389,7 @@ class BasisFeaturizer:
 
         Returns:
             vector (np.ndarray): vector of features.
+            zbl_energy (float): ZBL energy contribution (0.0 if not used).
         """
         if supercell is None:
             supercell = geom
@@ -397,7 +410,15 @@ class BasisFeaturizer:
             feature_map[pair] = features
         feature_vector = flatten_by_interactions(feature_map,
                                                  pair_tuples)
-        return feature_vector
+
+        zbl_energy = 0.0
+        if self.zbls:
+            for pair in pair_tuples:
+                zbl = self.zbls[pair]
+                mask = (distances_map[pair] < zbl.rc)
+                zbl_energy += np.sum(zbl(distances_map[pair][mask])) / 2  # divide by 2 to remove double counting
+       
+        return feature_vector, zbl_energy
 
     def featurize_force_2B(self, geom, supercell=None):
         """
@@ -410,6 +431,8 @@ class BasisFeaturizer:
         Returns:
             feature_array (np.ndarray): feature vectors arranged in
                 array of shape (n_atoms, n_force_components, n_features).
+            zbl_forces (np.ndarray): array of ZBL forces arranged in
+                array of shape (n_atoms, n_force_components).
         """
         if supercell is None:
             supercell = geom
@@ -422,20 +445,23 @@ class BasisFeaturizer:
                                                              supercell)
         distance_map, derivative_map = deriv_results
         feature_map = {}
+        zbl_forces = np.zeros((len(geom), 3))
         for pair in pair_tuples:
             basis_functions = self.basis_functions[pair]
             knot_sequence = self.knots_map[pair]
-            features = bspline.featurize_force_2B(
-                basis_functions,
-                distance_map[pair],
-                derivative_map[pair],
-                knot_sequence,
-                n_lead=self.leading_trim,
-                n_trail=self.trailing_trim)
+            features, zbl_f = bspline.featurize_force_2B(
+                                basis_functions,
+                                distance_map[pair],
+                                derivative_map[pair],
+                                knot_sequence,
+                                n_lead=self.leading_trim,
+                                n_trail=self.trailing_trim,
+                                zbl=self.zbls.get(pair, None))
             feature_map[pair] = features
+            zbl_forces += zbl_f
         feature_array = flatten_by_interactions(feature_map,
                                                 pair_tuples)
-        return feature_array
+        return feature_array, zbl_forces
 
     def featurize_energy_3B(self, geom, supercell=None):
         """
@@ -452,13 +478,14 @@ class BasisFeaturizer:
         if supercell is None:
             supercell = geom
         trio_list = self.interactions_map[3]
+        trio_numbers_list = [tuple(ase_data.atomic_numbers[elem] for elem in trio) for trio in trio_list]
         knot_sets = [self.knots_map[trio] for trio in trio_list]
         basis_functions = [self.basis_functions[trio] for trio in trio_list]
-        hashes = self.interaction_hashes[3]
+        hash2interaction = {hash: interaction for hash, interaction in zip(self.interaction_hashes[3], trio_numbers_list)}
         grids = angles.featurize_energy_3b(geom,
                                            knot_sets,
                                            basis_functions,
-                                           hashes,
+                                           hash2interaction,
                                            supercell=supercell,
                                            n_lead=self.leading_trim,
                                            n_trail=self.trailing_trim)
@@ -486,13 +513,14 @@ class BasisFeaturizer:
         if supercell is None:
             supercell = geom
         trio_list = self.interactions_map[3]
+        trio_numbers_list = [tuple(ase_data.atomic_numbers[elem] for elem in trio) for trio in trio_list]
         knot_sets = [self.knots_map[trio] for trio in trio_list]
         basis_functions = [self.basis_functions[trio] for trio in trio_list]
-        hashes = self.interaction_hashes[3]
+        hash2interaction = {hash: interaction for hash, interaction in zip(self.interaction_hashes[3], trio_numbers_list)}
         grids = angles.featurize_force_3b(geom,
                                           knot_sets,
                                           basis_functions,
-                                          hashes,
+                                          hash2interaction,
                                           supercell=supercell,
                                           n_lead=self.leading_trim,
                                           n_trail=self.trailing_trim)

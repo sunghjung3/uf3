@@ -16,8 +16,10 @@ class TensorModel(WeightedLinearModel):
                  seed=None,
                  prng_key=None,
                  initialize=True,
+                 zbl_scale=0.0,
                  **params):
         super().__init__(bspline_config, regularizer, data_coverage, **params)
+        self.zbl_scale = zbl_scale
         if prng_key is not None:
             self.prng_key = prng_key
         else:
@@ -48,6 +50,7 @@ class TensorModel(WeightedLinearModel):
                     nterms=self.nterms,
                     prng_key=self.prng_key,
                     data_coverage=self.data_coverage,
+                    zbl_scale=self.zbl_scale,
                     **self.bspline_config.as_dict())
         return dump
 
@@ -62,12 +65,14 @@ class TensorModel(WeightedLinearModel):
         data_coverage = config.get("data_coverage", None)
         nterms = config.get("nterms", None)
         prng_key = config.get("prng_key", None)
+        zbl_scale = config.get("zbl_scale", False)
         model = TensorModel(bspline_config,
                             regularizer=regularizer,
                             data_coverage=data_coverage,
                             nterms=nterms,
                             prng_key=prng_key,
-                            initialize=False)
+                            initialize=False,
+                            zbl_scale=zbl_scale,)
         model.load(singular_vectors=config['singular_vectors'], flatten=flatten)
         return model
 

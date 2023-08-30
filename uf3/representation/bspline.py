@@ -733,6 +733,7 @@ def featurize_force_2B(basis_functions,
                        knot_sequence,
                        n_lead=0,
                        n_trail=0,
+                       zbl=None,
                        ):
     """
     Args:
@@ -745,12 +746,14 @@ def featurize_force_2B(basis_functions,
         knot_sequence (np.ndarray): list of knot positions.
         trailing_trim (int): number of basis functions at trailing edge
             to suppress. Useful for ensuring smooth cutoffs.
+        zbl (uf3.representation.zbl.ZBL): ZBL object 
 
     Returns:
         x (np.ndarray): rotation-invariant representations generated
             using BSpline basis corresponding to force information.
             Array shape is (n_atoms, 3, n_basis_functions), where the
             second dimension corresponds to the three cartesian directions.
+        zbl_forces (np.ndarray): ZBL forces.
     """
     n_splines = len(basis_functions)
     n_atoms, _, n_distances = drij_dR.shape
@@ -770,7 +773,16 @@ def featurize_force_2B(basis_functions,
         x_splines = np.sum(x_splines, axis=-1)
         x[:, :, bspline_idx] = x_splines
     x = -x
-    return x
+
+    zbl_forces = np.zeros((n_atoms, 3))
+    if zbl is not None:
+        mask = (distances < zbl.rc)
+        dzbl_dr = zbl.d(distances[mask])
+        deltas = drij_dR[:, :, mask]
+        zbl_forces = np.sum(np.multiply(dzbl_dr, deltas), axis=-1) / 2  # divide by 2 to remove double counting
+    zbl_forces = -zbl_forces  # derivative to force
+
+    return x, zbl_forces
 
 
 def fit_spline_1d(x, y, knot_sequence):
