@@ -380,7 +380,7 @@ def test_force_bspline():
     sequence = uf3.representation.bspline.knot_sequence_from_points([2, 6])
     subintervals = uf3.representation.bspline.get_knot_subintervals(sequence)
     basis_functions = generate_basis_functions(subintervals)
-    x = featurize_force_2B(basis_functions, distances, drij_dR, sequence)
+    x, _ = featurize_force_2B(basis_functions, distances, drij_dR, sequence)
     assert x.shape == (3, 3, 4)
     assert np.ptp(x[:, 2, :]) == 0  # no z-direction component
     assert np.ptp(np.sum(x, axis=0)) < 1e-10  # forces cancel along atom axis
