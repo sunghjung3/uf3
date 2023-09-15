@@ -7,6 +7,7 @@ from typing import List, Dict, Tuple
 import numpy as np
 from numba import jit
 import ase
+from ase import symbols as ase_symbols
 from uf3.data import composition
 from uf3.representation import bspline
 from uf3.representation import distances
@@ -16,7 +17,7 @@ from scipy.spatial import distance
 def featurize_energy_3b(geom: ase.Atoms,
                         knot_sets: List[List[np.ndarray]],
                         basis_functions: List,
-                        hash2interaction: Dict,
+                        hashes: List,
                         supercell: ase.Atoms = None,
                         n_lead: int = 0,
                         n_trail: int = 0,
@@ -27,8 +28,7 @@ def featurize_energy_3b(geom: ase.Atoms,
         knot_sets (np.ndarray): list of lists of knot sequences per interaction
         basis_functions (list): list of lists of callable basis functions
             for each interaction
-        hash2interaction (dict): map of three-body hashes to three-body tuples (atomic numbers).
-            e.g. {38937678: (78, 78, 78), 37088178: (78, 78, 6), ...}
+        hashes (list): list of three-body hashes.
         supercell (ase.Atoms): optional supercell.
         n_trail (int): number of basis functions at trailing edge
             to suppress. Useful for ensuring smooth cutoffs.
@@ -38,7 +38,7 @@ def featurize_energy_3b(geom: ase.Atoms,
     """
     if supercell is None:
         supercell = geom
-    n_interactions = len(hash2interaction)
+    n_interactions = len(hashes)
     sup_comp = supercell.get_atomic_numbers()
 
     L, M, N = coefficient_counts_from_knots(knot_sets)
@@ -53,7 +53,7 @@ def featurize_energy_3b(geom: ase.Atoms,
         return grids
 
     triplet_generator = generate_triplets(
-        i_where, j_where, sup_comp, hash2interaction, dist_matrix, knot_sets)
+        i_where, j_where, sup_comp, hashes, dist_matrix, knot_sets)
 
     for triplet_batch in triplet_generator:
         for interaction_idx in range(n_interactions):
@@ -141,7 +141,7 @@ def arrange_3b(triangle_values: np.ndarray,
 def featurize_force_3b(geom: ase.Atoms,
                        knot_sets: List[List[np.ndarray]],
                        basis_functions: List[List],
-                       hash2interaction: Dict,
+                       trio_hashes: Dict[int, np.ndarray],
                        supercell: ase.Atoms = None,
                        n_lead: int = 0,
                        n_trail: int = 0,
@@ -154,8 +154,7 @@ def featurize_force_3b(geom: ase.Atoms,
         knot_sets (np.ndarray): list of lists of knot sequences per interaction
         basis_functions (list): list of lists of callable basis functions
             for each chemical interaction
-        hash2interaction (dict): map of three-body hashes to three-body tuples (atomic numbers).
-            e.g. {38937678: (78, 78, 78), 37088178: (78, 78, 6), ...}
+        trio_hashes (dict): map of interaction to integer hashes.
         supercell (ase.Atoms): optional supercell.
         n_trail (int): number of
 
@@ -166,7 +165,7 @@ def featurize_force_3b(geom: ase.Atoms,
     """
     if supercell is None:
         supercell = geom
-    n_interactions = len(hash2interaction)
+    n_interactions = len(trio_hashes)
     sup_comp = supercell.get_atomic_numbers()
 
     n_atoms = len(geom)
@@ -184,7 +183,7 @@ def featurize_force_3b(geom: ase.Atoms,
         return force_grids
     # process each atom's neighbors to limit memory requirement
     triplet_generator = generate_triplets(
-        x_where, y_where, sup_comp, hash2interaction, matrix, knot_sets)
+        x_where, y_where, sup_comp, trio_hashes, matrix, knot_sets)
 
     for triplet_batch in triplet_generator:
         for interaction_idx in range(n_interactions):
@@ -388,12 +387,12 @@ def legacy_generate_triplets(i_where:np.ndarray,
 def generate_triplets(i_where: np.ndarray,
                       j_where: np.ndarray,
                       sup_composition: np.ndarray,
-                      hash2interaction: Dict[int, Tuple],
+                      hashes: np.ndarray,
                       distance_matrix: np.ndarray,
                       knot_sets: List[List[np.ndarray]]
                       ) -> List[Tuple]:
     """
-    Identify unique "i-j-j'" tuples by combining provided i-j pairs, then
+    Identify unique "i-j-k" tuples by combining provided i-j pairs, then
     compute i-j, i-k, and j-k pair distances from i-j-k tuples,
         distance matrix, and knot sequence for cutoffs.
 
@@ -403,51 +402,58 @@ def generate_triplets(i_where: np.ndarray,
         i_where (np.ndarray): sorted "i" indices
         j_where (np.ndarray): sorted "j" indices
         sup_composition (np.ndarray): composition given by atomic numbers.
-        hash2interaction (Dict): map of three-body hashes to three-body tuples
-            e.g. {38937678: (78, 78, 78), 37088178: (78, 78, 6), ...}
+        hashes (np.ndarray): array of unique integer hashes for interactions.
         distance_matrix (np.ndarray): pair distance matrix.
         knot_sets (np.ndarray): list of lists of knot sequences per interaction
 
     Returns:
         tuples_idx (np.ndarray): array of shape (n_triangles, 3)
     """
-    n_hashes = len(hash2interaction)
+    n_hashes = len(hashes)
     # find unique values of i (sorted such that i < j)
     i_values, group_sizes = np.unique(i_where, return_counts=True)
     # group j by values of i
     i_groups = np.array_split(j_where, np.cumsum(group_sizes)[:-1])
     # generate j-k combinations
     for i in range(len(i_groups)):
-        tuples = np.array(np.meshgrid(i_groups[i],
-                                      i_groups[i])).T.reshape(-1, 2)
-        tuples = np.insert(tuples, 0, i_values[i], axis=1)  # each row: [i, j, k] by atom id
+        j_arr, k_arr = np.meshgrid(i_groups[i], i_groups[i])
 
-        comp_tuples = sup_composition[tuples]  # each row: [i, j, k] by element number
-        comp_tuples[:, 1:] = np.sort(comp_tuples[:, 1:], axis=1)  # sort j & k in each row
+        # Pick out unique neighbor pairs of central atom i
+        # ex: With center atom 0 and its neighbors [2, 1, 3],
+        # j_arr = [[2, 1, 3],
+        #          [2, 1, 3],
+        #          [2, 1, 3]]
+        # k_arr = [[2, 2, 2],
+        #          [1, 1, 1],
+        #          [3, 3, 3]]
+        # j_indices = [1, 2, 1]
+        # k_indices = [2, 3, 3]
+        # => unique pairs: (1, 2), (2, 3), (1, 3)
+        # The unique_pair_mask has filtered out pairs like (1, 1), (2, 1), (3, 2), etc.
+        unique_pair_mask = (j_arr < k_arr)
+        j_indices = j_arr[unique_pair_mask]
+        k_indices = k_arr[unique_pair_mask]
+        tuples = np.vstack((i_values[i] * np.ones(len(j_indices), dtype=int),
+                            j_indices, k_indices)).T  # array of unique triplets
+
+        comp_tuples = sup_composition[tuples]
+
+        sort_indices = np.argsort(comp_tuples[:, 1:],axis=1)  # to sort by atomic number
+        comp_tuples_slice = np.take_along_axis(comp_tuples[:, 1:],sort_indices,axis=1)
+        tuples_slice = np.take_along_axis(tuples[:, 1:],sort_indices,axis=1)
+
+        # sort comp_tuples and tuples the same way
+        comp_tuples = np.hstack((comp_tuples[:, [0]], comp_tuples_slice))
+        tuples = np.hstack((tuples[:, [0]], tuples_slice))
 
         ijk_hash = composition.get_szudzik_hash(comp_tuples)
 
         grouped_triplets = [None] * n_hashes
-        for j, hash_ in enumerate(hash2interaction.keys()):
+        for j, hash_ in enumerate(hashes):
             ituples = tuples[ijk_hash == hash_]
-
-            # atoms j and k are interchangable; filter
-            comparison_mask = (ituples[:, 1] < ituples[:, 2])
-            ituples = ituples[comparison_mask]
-
             if len(ituples) == 0:
                 grouped_triplets[j] = None
                 continue
-
-            # sort neighbor atoms according to order in interaction tuple
-            interaction_tuple = hash2interaction[hash_]
-            assert isinstance(interaction_tuple[1], int)
-            ituples = np.apply_along_axis(
-                lambda x: np.concatenate(
-                ([x[0]], x[1:] if sup_composition[x[1]] == interaction_tuple[1] else x[-1:0:-1])
-                ),
-                1, ituples
-                )  # swap atoms j and k if necessary according to order in interaction tuple
             # extract distance tuples
             r_l = distance_matrix[ituples[:, 0], ituples[:, 1]]
             r_m = distance_matrix[ituples[:, 0], ituples[:, 2]]

@@ -463,6 +463,7 @@ class BasisFeaturizer:
                                                 pair_tuples)
         return feature_array, zbl_forces
 
+
     def featurize_energy_3B(self, geom, supercell=None):
         """
         Generate 3B feature vector for learning energy of one configuration.
@@ -478,14 +479,13 @@ class BasisFeaturizer:
         if supercell is None:
             supercell = geom
         trio_list = self.interactions_map[3]
-        trio_numbers_list = [tuple(ase_data.atomic_numbers[elem] for elem in trio) for trio in trio_list]
         knot_sets = [self.knots_map[trio] for trio in trio_list]
         basis_functions = [self.basis_functions[trio] for trio in trio_list]
-        hash2interaction = {hash: interaction for hash, interaction in zip(self.interaction_hashes[3], trio_numbers_list)}
+        hashes = self.interaction_hashes[3]
         grids = angles.featurize_energy_3b(geom,
                                            knot_sets,
                                            basis_functions,
-                                           hash2interaction,
+                                           hashes,
                                            supercell=supercell,
                                            n_lead=self.leading_trim,
                                            n_trail=self.trailing_trim)
@@ -513,14 +513,13 @@ class BasisFeaturizer:
         if supercell is None:
             supercell = geom
         trio_list = self.interactions_map[3]
-        trio_numbers_list = [tuple(ase_data.atomic_numbers[elem] for elem in trio) for trio in trio_list]
         knot_sets = [self.knots_map[trio] for trio in trio_list]
         basis_functions = [self.basis_functions[trio] for trio in trio_list]
-        hash2interaction = {hash: interaction for hash, interaction in zip(self.interaction_hashes[3], trio_numbers_list)}
+        hashes = self.interaction_hashes[3]
         grids = angles.featurize_force_3b(geom,
                                           knot_sets,
                                           basis_functions,
-                                          hash2interaction,
+                                          hashes,
                                           supercell=supercell,
                                           n_lead=self.leading_trim,
                                           n_trail=self.trailing_trim)

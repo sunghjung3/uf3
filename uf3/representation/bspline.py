@@ -235,37 +235,12 @@ class BSplineBasis:
             self.r_max_map[trio] = self.r_max_map.get(trio, default_max)
             self.resolution_map[trio] = self.resolution_map.get(trio,
                                                                 default_res)
-            self.find_symmetry_3B(trio)
+            self.symmetry[trio] = find_symmetry_3B(trio,
+                                                   self.r_min_map[trio],
+                                                   self.r_max_map[trio],
+                                                   self.resolution_map[trio])
+            
         self.r_cut = self.get_cutoff()
-
-
-    def find_symmetry_3B(self, trio):
-        """
-        Sets self.symmetry[trio] based on r_min, r_max, and resolution_map
-
-        Args:
-            trio (tuple): tuple containing 3 elements
-        Updates:
-            self.symmetry[trio]
-        Returns:
-            None
-        """
-        elem_set = len(set(trio[1:]))
-
-        # 2 neighboring elements are different
-        if elem_set == 2:
-            self.symmetry[trio] = 1
-            return None
-        
-        # 2 neighboring elements are identical
-        configs = set(zip(
-            self.r_min_map[trio],
-            self.r_max_map[trio],
-            self.resolution_map[trio]
-        ))
-
-        # 1->3, 2->2, 3->1
-        self.symmetry[trio] = -1 * (len(configs) - 2) + 2
 
 
     def update_knots_from_dict(self, knots_map):
@@ -611,6 +586,7 @@ class BSplineBasis:
         vec = vec * redundancy
         return vec
 
+
     def decompress_3B(self, vec, interaction):
         """
 
@@ -630,17 +606,60 @@ class BSplineBasis:
         grid.flat[self.template_mask[interaction]] = vec
         if self.symmetry[interaction] == 2:
             grid = grid + grid.transpose(1, 0, 2)
-        if self.symmetry[interaction] == 3:
+        elif self.symmetry[interaction] == 3:
             grid = (grid
                     + grid.transpose(0, 2, 1)
                     + grid.transpose(1, 0, 2)
                     + grid.transpose(1, 2, 0)
                     + grid.transpose(2, 0, 1)
                     + grid.transpose(2, 1, 0))
-
         return grid
 
 
+    
+def find_symmetry_3B(trio: Tuple, 
+                     r_min: List,
+                     r_max: List, 
+                     resolution: List):
+
+    """
+    Calculates the symmetry of a 3-body interaction based on r_min, r_max, and
+    resolution map.
+
+    Args:
+        trio (tuple): Interaction (Si,Si,N)
+        r_min (list): minimum pair distance per interaction
+            e.g. [2.0, 3.0, 4.0]
+        r_max (list): maximum pair distance per interaction
+        resolution (list): resolution (number of knot intervals) per interaction.
+    Returns:
+        symmetry (int): Symmetry W.R.T the central atom
+
+    """ 
+    # 2 neighboring elements are different
+    if trio[1] != trio[2]:
+        return 1
+    else:  # 2 neighboring elements are identical
+
+        configs = list(zip(
+            r_min,
+            r_max,
+            resolution
+        ))
+
+        if configs[0] == configs[1] == configs[2]:
+            if trio[0] == trio[1]:
+                return 3
+            else:
+                return 2
+        elif configs[0] == configs[1]:
+            return 2
+        else:
+            # 3 legs all have different configurations
+            # OR the 2 central legs have different configurations
+            return 1
+    
+    
 def get_knot_spacer(knot_strategy):
     """
 
