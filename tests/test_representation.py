@@ -284,7 +284,7 @@ class TestBasis:
     def test_energy_features(self, unary_chemistry, simple_molecule):
         bspline_config = bspline.BSplineBasis(unary_chemistry)
         bspline_handler = BasisFeaturizer(bspline_config)
-        vector = bspline_handler.featurize_energy_2B(simple_molecule,
+        vector, _ = bspline_handler.featurize_energy_2B(simple_molecule,
                                                      simple_molecule)
         assert len(vector) == 18  # 23 features
 
@@ -295,7 +295,7 @@ class TestBasis:
         bspline_config = bspline.BSplineBasis(chemistry_config)
         bspline_handler = BasisFeaturizer(bspline_config)
         
-        features_2B = bspline_handler.featurize_energy_2B(strained_H2O_molecule)
+        features_2B, _ = bspline_handler.featurize_energy_2B(strained_H2O_molecule)
         features_3B = bspline_handler.featurize_energy_3B(strained_H2O_molecule)
         features_con = np.concatenate((features_2B,features_3B))
 
@@ -329,7 +329,7 @@ class TestBasis:
         bspline_config = bspline.BSplineBasis(methane_chem_config)
         bspline_handler = BasisFeaturizer(bspline_config)
 
-        features_2B = bspline_handler.featurize_energy_2B(methane_structure)
+        features_2B, _ = bspline_handler.featurize_energy_2B(methane_structure)
         features_3B = bspline_handler.featurize_energy_3B(methane_structure)
         features_con = np.concatenate((features_2B,features_3B))
 
@@ -361,7 +361,7 @@ class TestBasis:
     def test_force_features(self, unary_chemistry, simple_molecule):
         bspline_config = bspline.BSplineBasis(unary_chemistry)
         bspline_handler = BasisFeaturizer(bspline_config)
-        vector = bspline_handler.featurize_force_2B(simple_molecule,
+        vector, _ = bspline_handler.featurize_force_2B(simple_molecule,
                                                     simple_molecule)
         assert vector.shape == (3, 3, 18)  # 3 forces per atom
 
