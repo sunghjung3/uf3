@@ -313,8 +313,11 @@ class WeightedLinearModel(BasicLinearModel):
             energy_weight = 1 / len(y_e)
             force_weight = 1 / len(y_f)
             if normalize_residual:
-                force_weight /= np.std(y_f)
                 warnings.filterwarnings("error", append=True)  # to catch divide by zero warnings
+                try:
+                    force_weight /= np.std(y_f)
+                except (ZeroDivisionError, FloatingPointError, RuntimeWarning):
+                    force_weight = 1.0
                 try:
                     energy_weight /= np.std(y_e)
                 except (ZeroDivisionError, FloatingPointError, RuntimeWarning):
@@ -425,8 +428,11 @@ class WeightedLinearModel(BasicLinearModel):
         energy_weight = 1 / e_variance.n
         force_weight = 1 / f_variance.n
         if normalize_residual:
-            force_weight /= f_variance.std
             warnings.filterwarnings("error", append=True)  # to catch divide by zero warnings
+            try:
+                force_weight /= f_variance.std
+            except (ZeroDivisionError, FloatingPointError, RuntimeWarning):
+                force_weight = 1.0
             try:
                 energy_weight /= e_variance.std
             except (ZeroDivisionError, FloatingPointError, RuntimeWarning):
