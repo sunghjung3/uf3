@@ -18,6 +18,9 @@ def lj(r_min, depth, r):
     a = (sigma / r) ** 6
     return 4*depth * ( a*a - a )
 
+def morse(r_e, D_e, a, r):
+    return D_e * (1 - np.exp(-a * (r-r_e)))**2 - D_e
+
 
 def make_pair_energy_data(traj, radial_potential):
     # get list of all pair distances seen in trajectory and their corresponding pair energies
@@ -157,8 +160,7 @@ if __name__ == '__main__':
         epsilon = 0.0000001
         calc_rlim = [1.4 + epsilon, 6 + epsilon]
         plot_rlim = [1.4, 6]
-        #plot_rlim = 
-        E_lim = (-20, 50)
+        E_lim = (-2, 5)
         E_prime_lim = (-12, 12)
         E_double_prime_lim = (-50, 50)
         reslim = (-1, 1)
@@ -167,6 +169,12 @@ if __name__ == '__main__':
         r_min = 2.22
         well_depth = 9
         lj_p = functools.partial(lj, r_min, well_depth)  # the true radial potential
+
+        r_e = 2.897
+        D_e = 0.7102
+        exp_prefactor = 1.6047
+        rho0 = exp_prefactor * r_e
+        lj_p = functools.partial(morse, r_e, D_e, exp_prefactor)
 
         #============================================
 
