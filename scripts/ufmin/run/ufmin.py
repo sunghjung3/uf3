@@ -1,6 +1,7 @@
 from ase.io import read
 #from ase.calculators.emt import EMT
 from ase.calculators.lj import LennardJones
+from ase.calculators.morse import MorsePotential
 #from ase.optimize.sciopt import SciPyFminCG
 from ase.optimize import FIRE
 #from myopts import GD, MGD
@@ -503,8 +504,8 @@ if __name__ == "__main__":
     train_uq_file = "train_uq.pckl"  # store UQ from training data
     test_uq_file = "test_uq.pckl"  # store UQ from testing data (each structure in UF3 minimization steps)
     status_update_file = "ufmin_status.out"
-    ufmin_true_fmax = 0.05  # force tolerance for the actual optimization
-    ufmin_uf3_fmax = 0.05  # force tolerance for the optimization on the uf3 surface
+    ufmin_true_fmax = 0.01  # force tolerance for the actual optimization
+    ufmin_uf3_fmax = 0.0001  # force tolerance for the optimization on the uf3 surface
     uq_tolerance = 1.0  # how tolerable this workflow is to uncertainty
     preprocess_strength = 0.5
     optimizer = FIRE
@@ -519,6 +520,12 @@ if __name__ == "__main__":
     r_cut = 8 * r_min
     well_depth = 9
     true_calc = LennardJones(sigma=r_min*(2 ** (-1/6)), epsilon=well_depth, rc=r_cut)
+
+    #r_e = 2.897
+    #D_e = 0.7102
+    #exp_prefactor = 1.6047
+    #rho0 = exp_prefactor * r_e 
+    #true_calc = MorsePotential(epsilon=D_e, r0=r_e, rho0=rho0, rcut1=4.0, rcut2=7.0)
 
     tmp = ufmin(initial_structure,
                 live_features_file,

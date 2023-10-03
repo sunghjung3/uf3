@@ -494,6 +494,7 @@ def train(features: pd.DataFrame | str | Tuple[np.ndarray, np.ndarray, np.ndarra
 
 def calculate_errors(model: least_squares.WeightedLinearModel | str,
                      features: pd.DataFrame | str,
+                     plot_errors: bool = False,
                      ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, float, float, float]:
     """
     Wrapper for uf3.regression.least_squares.batched_prediction() and subset_prediction().
@@ -502,6 +503,7 @@ def calculate_errors(model: least_squares.WeightedLinearModel | str,
     Args:
         model (least_squares.WeightedLinearModel | str): UF3 model object or file name
         features (pd.DataFrame | str): featurization dataframe or file name
+        plot_errors (bool): plot error distributions if True (default: False)
 
     Returns:
         y_e (np.ndarray): true energies
@@ -530,6 +532,37 @@ def calculate_errors(model: least_squares.WeightedLinearModel | str,
     else:
         raise TypeError(f"Invalid format of features data. Pass in a dataframe or file name.")
     
+    # analyze error distribution
+    residual_e = y_e - p_e
+    residual_f = y_f - p_f
+    err_mean_e = np.mean(residual_e)
+    err_mean_f = np.mean(residual_f)
+    err_stddev_e = np.std(residual_e)
+    err_stddev_f = np.std(residual_f)
+    max_err_e = np.max(np.abs(residual_e))
+    max_err_f = np.max(np.abs(residual_f))
+    print(f"Energy Mean Error: {err_mean_e}")
+    print(f"Force Mean Error: {err_mean_f}")
+    print(f"Energy Stddev Error: {err_stddev_e}")
+    print(f"Force Stddev Error: {err_stddev_f}")
+    print(f"Energy Max Error: {max_err_e}")
+    print(f"Force Max Error: {max_err_f}")
+    print()
+
+    if plot_errors:
+        fig, ax = plt.subplots(2)
+        ax[0].hist(residual_e, bins=100)
+        Es = np.linspace(-1 * max_err_e, max_err_e, 100)
+        ax[0].twinx()
+        #ax[0].plot(Es, 1/(err_stddev_e * np.sqrt(2 * np.pi)) * np.exp(-1 * (Es-err_mean_e)**2 / (2 * err_stddev_e**2)))
+        ax[0].set_title("Energy error distribution")
+        ax[1].hist(residual_f, bins=100)
+        Fs = np.linspace(-1 * max_err_f, max_err_f, 100)
+        ax[1].twinx()
+        #ax[1].plot(Fs, 1/(err_stddev_f * np.sqrt(2 * np.pi)) * np.exp(-1 * (Fs-err_mean_f)**2 / (2 * err_stddev_f**2)))
+        ax[1].set_title("Force error distribution")
+        plt.show()
+   
     return y_e, p_e, y_f, p_f, rmse_e, rmse_f, mae_e, mae_f
 
 

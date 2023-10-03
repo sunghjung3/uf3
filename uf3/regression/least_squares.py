@@ -310,8 +310,8 @@ class WeightedLinearModel(BasicLinearModel):
         gram_e, ord_e = batched_moore_penrose(x_e, y_e, batch_size=batch_size)
 
         if x_f is not None and len(x_f) > 0:
-            energy_weight = 1 / len(y_e)
-            force_weight = 1 / len(y_f)
+            energy_weight = 1 / np.sqrt(len(y_e))
+            force_weight = 1 / np.sqrt(len(y_f))
             if normalize_residual:
                 warnings.filterwarnings("error", append=True)  # to catch divide by zero warnings
                 try:
@@ -338,7 +338,88 @@ class WeightedLinearModel(BasicLinearModel):
         else:
             gram = gram_e
             ordinate = ord_e
+
+        #x_constraint = np.zeros((1, 20))
+        #x_constraint[0, 7] = 1.0
+        #y_constraint = np.array([-5.5])
+        #x_constraint, y_constraint = freeze_columns(x_constraint,
+        #                                            y_constraint,
+        #                                            self.mask,
+        #                                            self.frozen_c,
+        #                                            self.col_idx)
+        #gram_constraint, ordinate_constraint = batched_moore_penrose(x_constraint,
+        #                                                              y_constraint,
+        #                                                              batch_size=batch_size)
+        #gram += gram_constraint
+        #ordinate += ordinate_constraint
+
         self.fit_with_gram(gram, ordinate)
+
+    def fit_with_pinv(self,
+                      x_e: np.ndarray,
+                      y_e: np.ndarray,
+                      x_f: np.ndarray = None,
+                      y_f: np.ndarray = None,
+                      weight: float = 0.5,
+                      normalize_residual: bool = True,
+                      ):
+        """
+        Direct solution from input-output pairs corresponding to
+        energies and forces, with option to weigh their respective
+        contributions.
+
+        Args:
+            x_e (np.ndarray): input matrix of shape (n_samples, n_features).
+            y_e (np.ndarray): output vector of length n_samples.
+            x_f (np.ndarray): input matrix corresponding to forces.
+            y_f (np.ndarray): output vector corresponding to forces.
+            weight (float): parameter balancing contribution from energies
+                vs. forces. Higher values favor energies; defaults to 0.5.
+            normalize_residual (bool): whether to normalize the residual
+                by the standard deviation of the training set.
+        """
+        x_e, y_e = freeze_columns(x_e,
+                                  y_e,
+                                  self.mask,
+                                  self.frozen_c,
+                                  self.col_idx)
+        if x_f is not None and len(x_f) > 0:
+            energy_weight = 1 / np.sqrt(len(y_e))
+            force_weight = 1 / np.sqrt(len(y_f))
+            if normalize_residual:
+                warnings.filterwarnings("error", append=True)  # to catch divide by zero warnings
+                try:
+                    force_weight /= np.std(y_f)
+                except (ZeroDivisionError, FloatingPointError, RuntimeWarning):
+                    force_weight = 1.0
+                try:
+                    energy_weight /= np.std(y_e)
+                except (ZeroDivisionError, FloatingPointError, RuntimeWarning):
+                    energy_weight = 1.0
+                warnings.filters.pop()  # undo the filter
+
+            x_f, y_f = freeze_columns(x_f,
+                                      y_f,
+                                      self.mask,
+                                      self.frozen_c,
+                                      self.col_idx)
+            energy_weight *= np.sqrt(weight)
+            force_weight *= np.sqrt(1 - weight)
+            x = np.vstack((energy_weight * x_e, force_weight * x_f))
+            y = np.concatenate((energy_weight * y_e, force_weight * y_f))
+        else:
+            x = x_e
+            y = y_e
+        regularizer = freeze_regularizer(self.regularizer, self.mask)
+        x = np.vstack((x, regularizer))
+        y = np.concatenate((y, np.zeros(len(regularizer))))
+        coefficients = np.dot(np.linalg.pinv(x, rcond=1e-14), y)
+        coefficients = revert_frozen_coefficients(coefficients,
+                                                  self.n_feats,
+                                                  self.mask,
+                                                  self.frozen_c,
+                                                  self.col_idx)
+        self.coefficients = coefficients
 
     def combine_weighted_gram(self,
                               gram_e: np.ndarray,
@@ -366,10 +447,10 @@ class WeightedLinearModel(BasicLinearModel):
             gram (np.ndarray): gram matrix (x^T x) for fitting.
             ordinate (np.ndarray): ordinate (x^T y) for fitting.
         """
-        gram = (((weight * energy_weight) ** 2 * gram_e)
-                + (((1 - weight) * force_weight) ** 2 * gram_f))
-        ordinate = (((weight * energy_weight) ** 2 * ord_e)
-                    + (((1 - weight) * force_weight) ** 2 * ord_f))
+        gram = ((weight * energy_weight**2 * gram_e)
+                + ((1 - weight) * force_weight**2 * gram_f))
+        ordinate = ((weight * energy_weight**2 * ord_e)
+                    + ((1 - weight) * force_weight**2 * ord_f))
         return gram, ordinate
 
     def fit_from_file(self,
@@ -425,8 +506,8 @@ class WeightedLinearModel(BasicLinearModel):
             gram_f += g_f
             ord_e += o_e
             ord_f += o_f
-        energy_weight = 1 / e_variance.n
-        force_weight = 1 / f_variance.n
+        energy_weight = 1 / np.sqrt(e_variance.n)
+        force_weight = 1 / np.sqrt(f_variance.n)
         if normalize_residual:
             warnings.filterwarnings("error", append=True)  # to catch divide by zero warnings
             try:

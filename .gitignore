@@ -61,3 +61,5 @@ lammps_plugin/ML-UF3/.vscode/
 */__pycache__
 
 */*/__pycache__
+
+*/*/*/__pycache__

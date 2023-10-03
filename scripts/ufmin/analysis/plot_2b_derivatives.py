@@ -107,7 +107,7 @@ def plot_single_model(model, training_data=None, nAtoms=None, label='',
     if training_data is not None:
         residual = []
         for r, E in zip(training_data[0], training_data[1]):
-            residual.append(E - calc_pair_energy(r, coefficient_1b, coefficients_2b, knot_sequence, nAtoms, zbl=zbl_obj))
+            residual.append((E - calc_pair_energy(r, coefficient_1b, coefficients_2b, knot_sequence, nAtoms, zbl=zbl_obj))/2)
         axs[0].plot(training_data[0], residual, 'r.')
         axs[0].set_ylabel("true - fit (eV)")
         if reslim is not None:
@@ -176,7 +176,7 @@ if __name__ == '__main__':
         if opt_traj_file is not None:
             opt_traj = Trajectory(opt_traj_file, 'r')
             training_traj = make_pair_energy_data(opt_traj[0:model_number+1], lj_p)
-            nAtoms = len(training_traj[0])
+            nAtoms = len(opt_traj[0])
             opt_traj.close()
         else:
             training_traj = None
