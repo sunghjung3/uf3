@@ -28,6 +28,7 @@ opt_plot_png = "opt_plot.png"
 opt_plot_detailed_png = "opt_plot_detailed.png"
 call_ratio_png = "call_ratio.png"
 error_plot_png = "error.png"
+model_diff_png = "model_diff.png"
 settings_file = "settings.yaml"
 
 #md_features_path = "entire_traj_training/features.h5"
@@ -146,6 +147,9 @@ rmse_f_md_list = list()
 spline_frames_2b = list()
 energy_rmse_parity_frames = list()
 force_rmse_parity_frames = list()
+previous_model_coeffs = None
+model_diffs = list()
+model_idx = list()
 
 for i in range(1, n_models+1):  # for each model
     print("model", i)
@@ -197,6 +201,22 @@ for i in range(1, n_models+1):  # for each model
     create_parity_plot_frame(y_f_i, p_f_i, rmse_f_i, y_f_all, p_f_all, rmse_f_all, y_f_md, p_f_md, rmse_f_md, units="eV/A", title=title, img_filename=temp_filename)
     force_rmse_parity_frames.append( imageio.v2.imread(temp_filename) )
     os.remove(temp_filename)
+
+    # model difference
+    if previous_model_coeffs is not None:
+        try:
+            valid_coeffs = model.coefficients[model.data_coverage]
+            valid_previous_model_coeffs = previous_model_coeffs[model.data_coverage]
+            not_zero = np.where(valid_coeffs != 0)
+            valid_coeffs = valid_coeffs[not_zero]
+            valid_previous_model_coeffs = valid_previous_model_coeffs[not_zero]
+            model_diff = np.max(np.abs(1  - valid_previous_model_coeffs / valid_coeffs))
+            model_diffs.append(model_diff)
+            model_idx.append(i)
+        except ValueError:  # shapes not compatible for subtraction
+            pass
+    previous_model_coeffs = model.coefficients
+
 
 # 2b pair potential gif
 spline_frames_2b = spline_frames_2b[::skip_frames]
@@ -338,6 +358,14 @@ call_ratio_ax.set_ylabel("Number of UF3 force calls")
 plt.savefig( os.path.join(results_dir, call_ratio_png) )
 
 #=================================================================================================
+
+# model difference plot
+model_diff_fig, model_diff_ax = plt.subplots()
+model_diff_ax.plot(model_idx, model_diffs)
+model_diff_ax.set_xlabel("Model number")
+model_diff_ax.set_ylabel("Model difference (max abs(1 - previous model / current model))")
+model_diff_ax.set_yscale("log")
+plt.savefig( os.path.join(results_dir, model_diff_png) )
 
 #plt.show()
 
