@@ -228,15 +228,11 @@ class R_UQ_NeighborList:
         self.ntuplets = dict()
         self.ntuplets['which_d'] = dict()
         self.ntuplets['type'] = dict()
-        cache = dict()  # used to generate higher-order tuplets from lower.
-                        # will store tuplets sorted by index (not atomic
-                        # number) for algorithmic efficiency.
 
         # Pairs first (n=2)
         pairs = np.vstack((self.pair_first, self.pair_second)).T
-        cache[2] = [pairs]
         unique_pair_mask = pairs[:, 0] < pairs[:, 1]
-        pairs = pairs[unique_pair_mask]  # rebinding. Does not change cache[2]
+        pairs = pairs[unique_pair_mask]
         if atomic_numbers is not None:
             sort_priority = atomic_numbers[pairs]
             sort_indices = np.argsort(sort_priority, axis=1)
@@ -258,24 +254,36 @@ class R_UQ_NeighborList:
         if max_n < 3:
             return
         if algo == 1:
-            n = 3
-            if True:
+            cache = dict()  # used to generate higher-order tuplets from lower.
+                            # will store tuplets neighbors sorted by index (not
+                            # atomic number) for algorithmic efficiency.
+                            # key: n (2 <= n <= max_n)
+                            # value: list of np.ndarray of shape (x, n-1)
+                            #   - array at index i belongs to atom i
+            cache[2] = [self.get_neighbors(i)[0][:, np.newaxis] for i in
+                        range(len(self.first_neigh) - 1)]
+
+            for n in range(3, max_n+1):
                 self.ntuplets['which_d'][n] = list()
                 if atomic_numbers is not None:
                     self.ntuplets['type'][n] = list()
                 cache[n] = list()
-                for i in range(len(self.first_neigh) - 1):
+                assert len(cache[n-1]) == len(self.first_neigh) - 1
+                for i, lower_tuplet_neighs in enumerate(cache[n-1]):
+                    if lower_tuplet_neighs is None or not len(lower_tuplet_neighs):
+                        cache[n].append(None)
+                        continue
                     neighbors, _, _, _ = self.get_neighbors(i)
                     if len(neighbors) < n-1:
                         cache[n].append(None)
                         continue
-                    duplicated_lower = np.repeat(neighbors,
+                    duplicated_lower = np.repeat(lower_tuplet_neighs,
                                                  len(neighbors),
                                                  axis=0)
                     tiled_neighbors = np.tile(neighbors,
-                                              len(neighbors))
+                                              len(lower_tuplet_neighs))
                     # by induction, the last column has the largest values
-                    unique_mask = tiled_neighbors > duplicated_lower
+                    unique_mask = tiled_neighbors > duplicated_lower[:, -1]
                     neighs = np.column_stack((duplicated_lower[unique_mask],
                                               tiled_neighbors[unique_mask]))
                     cache[n].append(neighs)
@@ -308,30 +316,7 @@ class R_UQ_NeighborList:
                                                 axis=1)  # insert center
                         ds = [list(combinations(r, 2)) for r in neighs.tolist()]
                         self.ntuplets['which_d'][n].extend(ds)
-            for n in range(4, max_n+1):
-                self.ntuplets['which_d'][n] = list()
-                if atomic_numbers is not None:
-                    self.ntuplets['type'][n] = list()
-                cache[n] = list()
-                assert len(cache[n-1]) == len(self.first_neigh) - 1
-                for i, lower_tuplet_neighs in enumerate(cache[n-1]):
-                    if lower_tuplet_neighs is None or not len(lower_tuplet_neighs):
-                        cache[n].append(None)
-                        continue
-                    neighbors, _, _, _ = self.get_neighbors(i)
-                    if len(neighbors) < n-1:
-                        cache[n].append(None)
-                        continue
-                    duplicated_lower = np.repeat(lower_tuplet_neighs,
-                                                 len(neighbors),
-                                                 axis=0)
-                    tiled_neighbors = np.tile(neighbors,
-                                              len(lower_tuplet_neighs))
-                    # by induction, the last column has the largest values
-                    unique_mask = tiled_neighbors > duplicated_lower[:, -1]
-                    neighs = np.column_stack((duplicated_lower[unique_mask],
-                                              tiled_neighbors[unique_mask]))
-                    cache[n].append(neighs)
+
         elif algo == 2:
             for n in range(3, max_n+1):
                 new_tuplets = list()
@@ -378,9 +363,6 @@ class R_UQ_NeighborList:
                     sorted_atomic_symbols = [tuple(row) for row in
                                             sorted_atomic_numbers.tolist()]
                     self.ntuplets['type'][n] = sorted_atomic_symbols
-
-
-
 
 
 class R_UQ:

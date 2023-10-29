@@ -25,7 +25,7 @@ def test_nl_ntuplets():
                            skin=0.0)
     #nl.update(atoms, max_n=3)
     nl.build(atoms)
-    nl.tabulate_ntuplets(max_n=3,
+    nl.tabulate_ntuplets(max_n=4,
                          atomic_numbers=atoms.get_atomic_numbers(),
                          algo=2
                          )
@@ -48,11 +48,27 @@ def test_nl_ntuplets():
               (8, 6, 6), (8, 1, 1), (8, 1, 6),
               (8, 1, 6), (1, 6, 8), (1, 6, 8),
               (6, 6, 8)]
+    which_d_4 = [[(0, 2), (0, 3), (0, 1), (2, 3), (2, 1), (3, 1)], [(0, 2), (0, 4), (0, 1), (2, 4), (2, 1), (4, 1)],
+                 [(0, 2), (0, 1), (0, 5), (2, 1), (2, 5), (1, 5)], [(0, 3), (0, 4), (0, 1), (3, 4), (3, 1), (4, 1)],
+                 [(0, 3), (0, 1), (0, 5), (3, 1), (3, 5), (1, 5)], [(0, 4), (0, 1), (0, 5), (4, 1), (4, 5), (1, 5)],
+                 [(0, 2), (0, 3), (0, 4), (2, 3), (2, 4), (3, 4)], [(0, 2), (0, 3), (0, 5), (2, 3), (2, 5), (3, 5)],
+                 [(0, 2), (0, 4), (0, 5), (2, 4), (2, 5), (4, 5)], [(0, 3), (0, 4), (0, 5), (3, 4), (3, 5), (4, 5)],
+                 [(1, 2), (1, 3), (1, 0), (2, 3), (2, 0), (3, 0)], [(1, 2), (1, 0), (1, 4), (2, 0), (2, 4), (0, 4)],
+                 [(1, 3), (1, 0), (1, 4), (3, 0), (3, 4), (0, 4)], [(1, 2), (1, 3), (1, 4), (2, 3), (2, 4), (3, 4)]]
+    type_4 = [(6, 1, 1, 8), (6, 1, 6, 8),
+              (6, 1, 8, 8), (6, 1, 6, 8),
+              (6, 1, 8, 8), (6, 6, 8, 8),
+              (6, 1, 1, 6), (6, 1, 1, 8),
+              (6, 1, 6, 8), (6, 1, 6, 8),
+              (8, 1, 1, 6), (8, 1, 6, 6),
+              (8, 1, 6, 6), (8, 1, 1, 6)]
     
     assert len(nl.ntuplets['which_d'][2]) == len(which_d_2)
     assert len(nl.ntuplets['type'][2]) == len(type_2)
     assert len(nl.ntuplets['which_d'][3]) == len(which_d_3)
     assert len(nl.ntuplets['type'][3]) == len(type_3)
+    assert len(nl.ntuplets['which_d'][4]) == len(which_d_4)
+    assert len(nl.ntuplets['type'][4]) == len(type_4)
 
     true_zip = list(zip(which_d_2, type_2))
     test_zip = list(zip(nl.ntuplets['which_d'][2], nl.ntuplets['type'][2]))
@@ -60,7 +76,10 @@ def test_nl_ntuplets():
         assert true in test_zip
     true_zip = list(zip(which_d_3, type_3))
     test_zip = list(zip(nl.ntuplets['which_d'][3], nl.ntuplets['type'][3]))
-    print(nl.ntuplets['which_d'][3])
+    for true in true_zip:
+        assert true in test_zip
+    true_zip = list(zip(which_d_4, type_4))
+    test_zip = list(zip(nl.ntuplets['which_d'][4], nl.ntuplets['type'][4]))
     for true in true_zip:
         assert true in test_zip
     
