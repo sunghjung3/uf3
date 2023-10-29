@@ -8,6 +8,7 @@ import heapq
 from typing import Iterable, List, Tuple
 from collections import defaultdict
 from itertools import combinations
+import math
 
 from uf3.representation import bspline
 
@@ -222,6 +223,10 @@ class R_UQ_NeighborList:
         algo : int
             Algorithm to use. (1, 2, or 3)
         """
+        nneighbors = np.diff(self.first_neigh)
+        max_n_ceil = max(nneighbors) + 1  # max_n cannot be larger than this
+        max_n = min(max_n, max_n_ceil)
+
         if max_n < 2:
             self.ntuplets = None
             return
@@ -250,9 +255,11 @@ class R_UQ_NeighborList:
         else:
             self.ntuplets['which_d'][2] = [tuple(row) for row in pairs.tolist()]
 
-        # Triplets (n=3)
+
+        # Higher-order (n > 2)
         if max_n < 3:
             return
+
         if algo == 1:
             cache = dict()  # used to generate higher-order tuplets from lower.
                             # will store tuplets neighbors sorted by index (not
@@ -320,22 +327,17 @@ class R_UQ_NeighborList:
         elif algo == 2:
             for n in range(3, max_n+1):
                 new_tuplets = list()
-                for i in range(len(self.first_neigh) - 1):
+                for i in np.where(nneighbors >= n-1)[0]:  # only i with enough
+                                                          # neighbors
                     neighbors, _, _, _ = self.get_neighbors(i)
-                    if len(neighbors) < n-1:
-                        continue
-                    new_tuplet_neighs = np.array(
+                    new_tuplet = np.empty((math.comb(len(neighbors), n-1), n),
+                                           dtype=int)
+                    new_tuplet[:, 1:] = np.array(
                         list(combinations(neighbors, n-1)), dtype=int
                         )
-                    new_tuplet = np.column_stack((
-                        i*np.ones((len(new_tuplet_neighs), 1), dtype=int),
-                        new_tuplet_neighs
-                        ))
+                    new_tuplet[:, 0] = i
                     new_tuplets.append(new_tuplet)
-                try:
-                    new_tuplets = np.concatenate(new_tuplets, axis=0)
-                except ValueError:  # no new tuplets
-                    break
+                new_tuplets = np.concatenate(new_tuplets, axis=0)
                 if atomic_numbers is None:
                     ds = [list(combinations(r, 2)) for r in
                                 new_tuplets.tolist()]
@@ -889,9 +891,9 @@ if __name__ == '__main__':
                            skin=0.0)
     #nl.update(atoms, max_n=3)
     nl.build(atoms)
-    nl.tabulate_ntuplets(max_n=3,
+    nl.tabulate_ntuplets(max_n=4,
                          atomic_numbers=atoms.get_atomic_numbers(),
-                         algo=3
+                         algo=2
                          )
     #print(len(nl.ntuplets['which_d'][2]))
     #print(len(nl.ntuplets['which_d'][3]))
