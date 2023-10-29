@@ -27,7 +27,6 @@ def test_nl_ntuplets():
     nl.build(atoms)
     nl.tabulate_ntuplets(max_n=4,
                          atomic_numbers=atoms.get_atomic_numbers(),
-                         algo=2
                          )
 
     which_d_2 = [(0, 1), (2, 0), (3, 0), (0, 4), (0, 5), (2, 1), (3, 1), (4, 1),

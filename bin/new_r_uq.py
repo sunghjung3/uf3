@@ -235,9 +235,9 @@ class R_UQ_NeighborList:
         self.ntuplets['type'] = dict()
 
         # Pairs first (n=2)
-        pairs = np.vstack((self.pair_first, self.pair_second)).T
-        unique_pair_mask = pairs[:, 0] < pairs[:, 1]
-        pairs = pairs[unique_pair_mask]
+        unfiltered_pairs = np.vstack((self.pair_first, self.pair_second)).T
+        unique_pair_mask = unfiltered_pairs[:, 0] < unfiltered_pairs[:, 1]
+        pairs = unfiltered_pairs[unique_pair_mask]
         if atomic_numbers is not None:
             sort_priority = atomic_numbers[pairs]
             sort_indices = np.argsort(sort_priority, axis=1)
@@ -323,6 +323,67 @@ class R_UQ_NeighborList:
                                                 axis=1)  # insert center
                         ds = [list(combinations(r, 2)) for r in neighs.tolist()]
                         self.ntuplets['which_d'][n].extend(ds)
+
+        if algo == 3:  # NOTE: in my opinion, this should be better than algo=1, but profiling suggests otherwise
+            cache = dict()  # used to generate higher-order tuplets from lower.
+                            # will store tuplets neighbors sorted by index (not
+                            # atomic number) for algorithmic efficiency.
+                            # key: n (2 <= n <= max_n)
+                            # value: list of np.ndarray of shape (x, n)
+            cache[2] = [
+                unfiltered_pairs[self.first_neigh[a]:self.first_neigh[a + 1], :]
+                for a in range(len(self.first_neigh) - 1)
+                ]
+
+            for n in range(3, max_n+1):
+                new_tuplets = list()
+                for lower_tuplet in cache[n-1]:
+                    if not len(lower_tuplet):
+                        continue
+                    i = lower_tuplet[0, 0]  # center atom
+                    if nneighbors[i] < n-1:
+                        continue
+                    neighbors, _, _, _ = self.get_neighbors(i)
+                    duplicated_lower = np.repeat(lower_tuplet,
+                                                 len(neighbors),
+                                                 axis=0)
+                    tiled_neighbors = np.tile(neighbors,
+                                              len(lower_tuplet))
+                    # by induction, the last column has the largest values
+                    unique_mask = tiled_neighbors > duplicated_lower[:, -1]
+                    new_tuplet = np.column_stack((duplicated_lower[unique_mask],
+                                                  tiled_neighbors[unique_mask]))
+                    new_tuplets.append(new_tuplet)
+                del cache[n-1]
+                cache[n] = new_tuplets
+                new_tuplets = np.concatenate(cache[n], axis=0)
+                if atomic_numbers is None:
+                    ds = [list(combinations(r, 2)) for r in
+                                new_tuplets.tolist()]
+                    self.ntuplets['which_d'][n] = ds
+                else:
+                    sort_priority = atomic_numbers[new_tuplets[:, 1:]]
+                    sort_indices = np.argsort(sort_priority, axis=1)
+                    new_tuplets[:, 1:] = \
+                        np.take_along_axis(new_tuplets[:, 1:],
+                                           sort_indices,
+                                           axis=1)
+                    # same lines as in if, but this must be done in the middle
+                    # of the else block to reduce data movement in/out of cache
+                    ds = [list(combinations(r, 2)) for r in
+                            new_tuplets.tolist()]
+                    self.ntuplets['which_d'][n] = ds
+                    sorted_atomic_numbers = np.zeros((len(new_tuplets), n),
+                                                        dtype=int)
+                    sorted_atomic_numbers[:, 1:] = \
+                        np.take_along_axis(sort_priority,
+                                           sort_indices,
+                                           axis=1)
+                    sorted_atomic_numbers[:, 0] = \
+                        atomic_numbers[new_tuplets[:, 0]]
+                    sorted_atomic_symbols = [tuple(row) for row in
+                                            sorted_atomic_numbers.tolist()]
+                    self.ntuplets['type'][n] = sorted_atomic_symbols
 
         elif algo == 2:
             for n in range(3, max_n+1):
@@ -891,7 +952,7 @@ if __name__ == '__main__':
                            skin=0.0)
     #nl.update(atoms, max_n=3)
     nl.build(atoms)
-    nl.tabulate_ntuplets(max_n=4,
+    nl.tabulate_ntuplets(max_n=3,
                          atomic_numbers=atoms.get_atomic_numbers(),
                          algo=2
                          )
