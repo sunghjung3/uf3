@@ -503,15 +503,17 @@ class R_UQ:
                                      for interaction in
                                      self.bspline_config.interactions_map[d]]
                                  for d in range(2, self.degree+1)}
-        self.r_min_map = {self.symbols2numbers[interaction]: value
+        self.r_min_map = {self.symbols2numbers(interaction): np.array(value)
                           for interaction, value in
                           self.bspline_config.r_min_map.items()}
-        self.r_max_map = {self.symbols2numbers[interaction]: value
+        self.r_max_map = {self.symbols2numbers(interaction): np.array(value)
                           for interaction, value in
                           self.bspline_config.r_max_map.items()}
-        self.resolution_map = {self.symbols2numbers[interaction]: value
+        self.resolution_map = {self.symbols2numbers(interaction): np.array(value)
                                for interaction, value in
                                self.bspline_config.resolution_map.items()}
+        self.symmetry_3b = {self.symbols2numbers(key): value for key, value in
+                            self.bspline_config.symmetry.items()}
 
         # Neighbor list things
         self.dr_trust = self.determine_dr_trust(scale=uq_tolerance)
@@ -529,8 +531,7 @@ class R_UQ:
                                     )
 
         # Training data things
-        self.r_gaps = self.initialize_r_gaps()  # 2 body: gaps in r space
-        self.data_voxels = self.initialize_data_voxels()  # higher body
+        self.data_voxels = self.initialize_data_voxels()
 
         self.trained_traj_len = 0  # how many images in self.trained_traj have
                                    # been considered in update_trained_rs()
@@ -588,34 +589,33 @@ class R_UQ:
                     ]
         return dr_trust
 
-    def initialize_r_gaps(self):
-        """
-        Initializes the r gaps for 2-body interactions.
-        """
-        r_gaps = dict()
-        pairs = self.interactions_map[2]
-        for pair in pairs:
-            lower_bound = self.r_min_map[pair]
-            upper_bound = self.r_max_map[pair]
-            r_gaps[pair] = [[lower_bound, upper_bound]]
-        return r_gaps
-
     def initialize_data_voxels(self):
         """
-        Initializes the data voxels for higher-body interactions.
+        Initializes the data voxels.
         The mapping of r to voxel index is given by `r_to_voxel_idx()`.
         """
         data_voxels = dict()
+
+        # 2-body
+        data_voxels[2] = dict()
+        for pair in self.interactions_map[2]:
+            r_min = self.r_min_map[pair]
+            r_max = self.r_max_map[pair]
+            spacing = self.dr_trust[pair]
+            data_voxels[2][pair] = np.zeros(self.r_to_voxel_idx(r_min, r_max,
+                                                                 spacing) + 1,
+                                            dtype=bool)
+
+        # higher-order
         for degree in range(3, self.degree+1):
             d = dict()
             interactions = self.interactions_map[degree]
             for interaction in interactions:
                 shape = list()
-                for r_min, r_max, spacing in zip(self.r_min_map[interaction],
-                                                 self.r_max_map[interaction],
-                                                 self.dr_trust[interaction]):
-                    shape.append(self.r_to_voxel_idx(r_min, r_max, spacing) + 1)
-                d[interaction] = np.zeros(shape, dtype=bool)
+                d[interaction] = np.zeros(self.r_to_voxel_idx(self.r_min_map[interaction],
+                                                              self.r_max_map[interaction],
+                                                              self.dr_trust[interaction]) + 1,
+                                             dtype=bool)
             data_voxels[degree] = d
         return data_voxels
 
@@ -655,84 +655,77 @@ class R_UQ:
                                    bothways=True,
                                    use_scaled_positions=False,
                                    )
-            nl.update(image)
-            ntuplets_generator = self.ntuplets_generator(self.degree,
-                                                         recalc_distances=False,
-                                                         return_type=True,
-                                                         )
-            for ntuplet, distances in ntuplets_generator:
-                if len(ntuplet) == 2:
-                    self.update_gaps(ntuplet, distances)
-                else:
-                    self.update_voxels(ntuplet, distances)   # XXX: take into account self.bspline_config.symmetry in voxel
-
+            nl.update(image, max_n=self.degree)
+            self.update_voxels(nl)
         self.trained_traj_len = len(self.trained_traj)
 
-    def update_gaps(self, nl: R_UQ_NeighborList):
+    def update_voxels(self,
+                      nl: R_UQ_NeighborList,
+                      ):
         """
-        Fill gaps with new r's (2-body data space).
-
-        Gaps in r space for `pair`:
-          |---------*===============*---------|
-              |--* are buffer regions of length `self.dr_trust[pair]`
-              *==* is the core region
-              A new r is uncertain if it is in the core region
+        Update data voxels with distances observed in the training data.
 
         Parameters
         ----------
         nl : R_UQ_NeighborList
-            Neighbor list object for the current geometry.
+            Neighbor list object from an image from the training data.
         """
-        lower_traj_idx = self.trained_traj_len
-        upper_traj_idx = len(self.trained_traj)
-        trained_pairs = defaultdict(list)
-        for image in self.trained_traj[lower_traj_idx:upper_traj_idx]:
-            for pair_hash, rs in self.distances_by_hash(image).items():
-                trained_pairs[pair_hash].extend(rs)
+        # 2-body
+        for pair_tuple, pair_type in zip(nl.ntuplets['which_d'][2],
+                                       nl.ntuplets['type'][2]):
+            d = nl.distance_mag[nl.pair2idx[pair_tuple]]
+            voxel_idx = self.r_to_voxel_idx(d, self.r_max_map[pair_type],
+                                            self.dr_trust[pair_type])
+            if np.all(voxel_idx >= 0) and \
+               np.all(voxel_idx < self.data_voxels[2][pair_type].shape):
+                self.data_voxels[2][pair_type][voxel_idx] = True
 
-        # Numerical error tolerance to mitigate error accumulation from repeated squaring and rooting
-        num_tol = 0.000001  
+        # higher-order
+        for degree in range(3, self.degree+1):
+            for n_tuple, n_type in zip(nl.ntuplets['which_d'][degree],
+                                       nl.ntuplets['type'][degree]):
+                ds = np.empty(len(n_tuple))
+                center_atom = n_tuple[0][0]
 
-        # use self.r_max_2b_hashed instead of trained_pairs because possibility of missing hash
-        for pair_hash in self.r_max_hashed:
-            r_min = self.r_min_hashed[pair_hash]
-            r_max = self.r_max_hashed[pair_hash]
-            rs = trained_pairs.get(pair_hash, list())
-            assert not rs or rs[0] >= r_min-num_tol  # either empty or meet sanity check
-            assert not rs or rs[-1] <= r_max+num_tol
-            min_r_spacing = 2 * self.dr_trust[pair_hash]
-            assert r_max - r_min >= min_r_spacing
+                # distances involving the center atom
+                for i, pair_tuple in enumerate(n_tuple[0:degree-1]):
+                    ds[i] = nl.distance_mag[nl.pair2idx[pair_tuple]]
+                
+                # distances not involving the center atom
+                for k, pair_tuple in enumerate(n_tuple[degree-1:]):
+                    v_ij = nl.distance_vec[nl.pair2idx[(center_atom,
+                                                        pair_tuple[0])
+                                                        ]]
+                    v_ik = nl.distance_vec[nl.pair2idx[(center_atom,
+                                                        pair_tuple[1])
+                                                        ]]
+                    v_jk = v_ik - v_ij
+                    ds[degree-1+k] = np.linalg.norm(v_jk)
 
-            try:
-                tmp_gaps = self.r2_gaps[pair_hash]
-                # Temporarily bring it to r space and include buffer region
-                for gap in tmp_gaps:
-                    gap[0] = gap[0] ** 0.5 - self.dr_trust[pair_hash]
-                    gap[1] = gap[1] ** 0.5 + self.dr_trust[pair_hash]
-            except KeyError:
-                tmp_gaps = [ [r_min, r_max] ]  # first time (buffers included)
-            for r in rs:
-                gap_idx_to_remove = list()
-                gaps_to_add = list()
-                for gap_idx, gap in enumerate(tmp_gaps):
-                    if r > gap[0] and r < gap[1]:  # time to split this gap
-                        gap_idx_to_remove.append(gap_idx)
-                        if r - gap[0] > min_r_spacing:
-                            gaps_to_add.append( [gap[0], r] )
-                        if gap[1] - r > min_r_spacing:
-                            gaps_to_add.append( [r, gap[1]] )
-                for gap_idx in gap_idx_to_remove:  # remove broken gaps
-                    del tmp_gaps[gap_idx][:]
-                    del tmp_gaps[gap_idx]
-                tmp_gaps.extend(gaps_to_add)  # add new gaps
-            del rs[:]
-
-            # Remove buffers again and take it to r^2 space
-            for gap in tmp_gaps:
-                gap[0] = (gap[0] + self.dr_trust[pair_hash]) ** 2
-                gap[1] = (gap[1] - self.dr_trust[pair_hash]) ** 2
-        
-            self.r2_gaps[pair_hash] = tmp_gaps
+                voxel_idx = self.r_to_voxel_idx(ds, self.r_max_map[n_type],
+                                                self.dr_trust[n_type])
+                if np.all(voxel_idx >= 0) and \
+                   np.all(voxel_idx < self.data_voxels[degree][n_type].shape):
+                    self.data_voxels[degree][n_type][tuple(voxel_idx)] = True
+                
+            # Take into account self.bspline_config.symmetry in voxel
+            for n_type, data_voxel in self.data_voxels[degree].items():
+                if self.symmetry_3b[n_type] == 2:
+                    self.data_voxels[degree][n_type] = \
+                        np.logical_or(data_voxel,
+                                      data_voxel.transpose(1, 0, 2))
+                elif self.symmetry_3b[n_type] == 3:
+                    self.data_voxels[degree][n_type] = \
+                        np.logical_or.reduce((data_voxel,
+                                              data_voxel.transpose(1, 0, 2),
+                                              data_voxel.transpose(2, 1, 0),
+                                              data_voxel.transpose(0, 2, 1),
+                                              data_voxel.transpose(2, 0, 1),
+                                              data_voxel.transpose(1, 2, 0),
+                                              ))
+                elif self.symmetry_3b[n_type] != 1:
+                    raise Exception("Symmetry of 3-body interaction not "
+                                    "recognized.")
 
     def check_r(self, updated):
         """
@@ -740,6 +733,7 @@ class R_UQ:
         the r-based UQ method.
         """
         raise NotImplementedError("This should be implemented by the subclass.")
+        #  recalc distances unless updated
     
     def too_uncertain(self):
         """
