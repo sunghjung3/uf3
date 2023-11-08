@@ -4,7 +4,7 @@ from ase.data import atomic_numbers as ase_atomic_numbers
 
 import numpy as np
 
-import heapq
+import heapq, copy
 from typing import Iterable, List, Tuple
 from collections import defaultdict
 from itertools import combinations
@@ -28,15 +28,8 @@ class R_UQ_NeighborList:
             - ASE-style: If the sphere around atom `i` with radius `cutoff`
                 and the sphere around atom `j` with radius `cutoff` overlap,
                 then atom `j` is a neighbor of atom `i`.
-        - The `self_interaction` parameter is False by default.
-        - The `bothways` parameters is True by default.
-        - `self.get_neighbors()` returns a tuple of 4 arrays:
-            - indices: indices of neighbors
-            - offsets: offsets of neighbors
-            - distance_mag: distance magnitudes of neighbors
-            - distance_vec: distance vectors of neighbors
-        - `self.pair2idx` attribute maps a pair (i, j) to to the index of
-            `self.pair_first` and `self.pair_second` where the pair is located.
+        - The `self_interaction` parameter is fixed to False.
+        - The `bothways` parameter is fixed to True.
         - `self.ntuplets` and `self.tabulate_ntuplets()` for optionally
             tabulating all n-tuplets of `self.atoms` for n between 2 and
             `max_n` (both ends inclusive).
@@ -60,16 +53,14 @@ class R_UQ_NeighborList:
         Sort neighbor list (default: False)
     self_interaction: bool
         Should an atom return itself as a neighbor? (default: False)
-    bothways: bool
-        Return all neighbors (default: True)
     """
-    def __init__(self, cutoffs, skin=0.6, sorted=False, self_interaction=False,
-                 bothways=True, use_scaled_positions=False):
+    def __init__(self, cutoffs, skin=0.6, sorted=False,
+                 use_scaled_positions=False):
         self.cutoffs = {pair: cutoff + skin for pair, cutoff in cutoffs.items()}
         self.skin = skin
         self.sorted = sorted
-        self.self_interaction = self_interaction
-        self.bothways = bothways
+        self.self_interaction = False
+        self.bothways = True
         self.nupdates = 0
         self.use_scaled_positions = use_scaled_positions
         self.nneighbors = 0
@@ -129,18 +120,12 @@ class R_UQ_NeighborList:
                 max_nbins=max_nbins)
 
         if len(positions) > 0 and not self.bothways:
-            offset_x, offset_y, offset_z = offset_vec.T
-
-            mask = offset_z > 0
-            mask &= offset_y == 0
-            mask |= offset_y > 0
-            mask &= offset_x == 0
-            mask |= offset_x > 0
-            mask |= (pair_first <= pair_second) & (offset_vec == 0).all(axis=1)
-
+            mask = self.pair_filter(pair_first, pair_second, offset_vec)
             pair_first = pair_first[mask]
             pair_second = pair_second[mask]
             offset_vec = offset_vec[mask]
+            distance_mag = distance_mag[mask]
+            distance_vec = distance_vec[mask]
 
         if len(positions) > 0 and self.sorted:
             mask = np.argsort(pair_first * len(pair_first) +
@@ -148,6 +133,8 @@ class R_UQ_NeighborList:
             pair_first = pair_first[mask]
             pair_second = pair_second[mask]
             offset_vec = offset_vec[mask]
+            distance_mag = distance_mag[mask]
+            distance_vec = distance_vec[mask]
 
         self.pair_first = pair_first
         self.pair_second = pair_second
@@ -156,14 +143,44 @@ class R_UQ_NeighborList:
         assert np.issubdtype(self.pair_first.dtype, np.integer)
         assert np.issubdtype(self.pair_second.dtype, np.integer)
         self.offset_vec = offset_vec
-        self.distance_mag = distance_mag  # values at build time
-        self.distance_vec = distance_vec  # values at build time
-        self.pair2idx = {pair: i for i, pair in enumerate(zip(pair_first, pair_second))}
 
         # Compute the index array point to the first neighbor
         self.first_neigh = first_neighbors(len(positions), pair_first)
 
         self.nupdates += 1
+
+    @staticmethod
+    def pair_filter(pair_first, pair_second, offset_vec):
+        """
+        Filter mask to remove double counting, considering ghost
+        atoms.
+        
+        Parameters
+        ----------
+        pair_first: np.ndarray
+            Atom numbers of center atoms. Refer to
+            `ase.neighborlist.primitive_neighbor_list()`.
+        pair_second: np.ndarray
+            Atom numbers of neighbor atoms. Refer to
+            `ase.neighborlist.primitive_neighbor_list()`.
+        offset_vec: np.ndarray
+            Offset vectors of neighbor atoms. Refer to
+            `ase.neighborlist.primitive_neighbor_list()`.
+
+        Returns
+        -------
+        mask: np.ndarray
+            Mask to remove double counting.
+        """
+        offset_x, offset_y, offset_z = offset_vec.T
+
+        mask = offset_z > 0
+        mask &= offset_y == 0
+        mask |= offset_y > 0
+        mask &= offset_x == 0
+        mask |= offset_x > 0
+        mask |= (pair_first <= pair_second) & (offset_vec == 0).all(axis=1)
+        return mask
 
     def get_neighbors(self, a):
         """Return neighbors of atom number a.
@@ -182,8 +199,7 @@ class R_UQ_NeighborList:
 
         return (self.pair_second[self.first_neigh[a]:self.first_neigh[a + 1]],
                 self.offset_vec[self.first_neigh[a]:self.first_neigh[a + 1]],
-                self.distance_mag[self.first_neigh[a]:self.first_neigh[a + 1]],
-                self.distance_vec[self.first_neigh[a]:self.first_neigh[a + 1]])
+                )
 
     def tabulate_ntuplets(self, max_n=0, atomic_numbers=None, algo=1):
         """
@@ -191,17 +207,19 @@ class R_UQ_NeighborList:
         for n between 2 and `max_n` (both ends inclusive).
 
         Updates `self.ntuplets` attribute:
-            - `self.ntuplets['which_d']`
+            - `self.ntuplets['atoms']`
                 - key: n (2 <= n <= max_n)
-                - value: list of lists of pair indices (i, j) for each side
-                    of the n-tuplet
+                - value: row-wise array of n-tuplets.
                     - e.g. For triplets (0, 1, 2) and (2, 1, 3):
-                        [[(0, 1), (0, 2), (1, 2)], [(2, 1), (2, 3), (1, 3)]]
-                    - For n=2, just a tuple of pair indices (i, j)
-                    - The length of the outer tuple is n*(n-1)/2
+                        np.array([[0, 1, 2], [2, 1, 3]])
+            - `self.ntuplets['offsets']`
+                - key: n (2 <= n <= max_n)
+                - value: array of neighbor's periodic offsets given by each
+                    n-tuplet in `self.ntuplets['atoms']`
             - `self.ntuplets['type']`
                 - key: n (2 <= n <= max_n)
-                - value: list of tuple of n-tuplet types
+                - value: list of tuple of n-tuplet types, where each tuple is
+                    sorted by atomic number.
                     - e.g. For triplets (0, 1, 2) and (2, 1, 3) where the
                         atomic numbers are given by
                         {0: 1, 1: 6, 2: 6, 3: 8}:
@@ -231,29 +249,37 @@ class R_UQ_NeighborList:
             self.ntuplets = None
             return
         self.ntuplets = dict()
-        self.ntuplets['which_d'] = dict()
+        self.ntuplets['atoms'] = dict()
+        self.ntuplets['offsets'] = dict()
         self.ntuplets['type'] = dict()
 
         # Pairs first (n=2)
         unfiltered_pairs = np.vstack((self.pair_first, self.pair_second)).T
-        unique_pair_mask = unfiltered_pairs[:, 0] < unfiltered_pairs[:, 1]
-        pairs = unfiltered_pairs[unique_pair_mask]
+        unfiltered_offsets = self.offset_vec
+        pair_mask = \
+            self.pair_filter(self.pair_first,
+                             self.pair_second,
+                             self.offset_vec)
+        pairs = unfiltered_pairs[pair_mask]
+        offsets = unfiltered_offsets[pair_mask]
         if atomic_numbers is not None:
             sort_priority = atomic_numbers[pairs]
             sort_indices = np.argsort(sort_priority, axis=1)
-            sorted_pairs = np.take_along_axis(pairs,
-                                              sort_indices,
-                                              axis=1)  # sorted by atomic number
             sorted_atomic_numbers = np.take_along_axis(sort_priority,
                                                        sort_indices,
                                                        axis=1)
-            sorted_atomic_symbols = [tuple(row) for row in
-                                     sorted_atomic_numbers.tolist()]
-            self.ntuplets['type'][2] = sorted_atomic_symbols
-            self.ntuplets['which_d'][2] = [tuple(row) for row in
-                                           sorted_pairs.tolist()]
+            self.ntuplets['type'][2] = [tuple(row) for row in
+                                        sorted_atomic_numbers.tolist()]
+            sorted_pairs = np.take_along_axis(pairs,
+                                              sort_indices,
+                                              axis=1)  # sorted by atomic number
+            self.ntuplets['atoms'][2] = sorted_pairs
+            offsets_to_negate = (sort_indices == [1, 0]).all(axis=1)
+            offsets[offsets_to_negate] *= -1  # if pair is reversed, negate offset
+            self.ntuplets['offsets'][2] = offsets[:, np.newaxis, :]
         else:
-            self.ntuplets['which_d'][2] = [tuple(row) for row in pairs.tolist()]
+            self.ntuplets['atoms'][2] = pairs
+            self.ntuplets['offsets'][2] = offsets
 
 
         # Higher-order (n > 2)
@@ -261,26 +287,40 @@ class R_UQ_NeighborList:
             return
 
         if algo == 1:
+            # As the neighbor atom may appear more than once in a given neighbor
+            # list with a sufficiently large cutoff, use encoded neighbor atoms
+            # to build higher-order tuplets and convert back.
+            # The simplest encoding is to use the index of the neighbor atom in
+            # `self.pair_second` as the encoded neighbor atom.
+            encoded_neighbors = \
+                np.split(np.arange(self.first_neigh[-1]), self.first_neigh[1:-1])
+                # encoded_neighbors[i] belongs to center atom i
+
             cache = dict()  # used to generate higher-order tuplets from lower.
-                            # will store tuplets neighbors sorted by index (not
-                            # atomic number) for algorithmic efficiency.
+                            # will store tuplets neighbors sorted by encoded
+                            # index (not atomic number) for algorithmic
+                            # efficiency.
                             # key: n (2 <= n <= max_n)
                             # value: list of np.ndarray of shape (x, n-1)
-                            #   - array at index i belongs to atom i
-            cache[2] = [self.get_neighbors(i)[0][:, np.newaxis] for i in
-                        range(len(self.first_neigh) - 1)]
+                            #   - cache[i] belongs to center atom i
+            cache[2] = [subarray.reshape(-1, 1) for subarray in
+                        encoded_neighbors]
 
             for n in range(3, max_n+1):
-                self.ntuplets['which_d'][n] = list()
+                # arrays in these lists will be concatenated at the end
+                self.ntuplets['atoms'][n] = list()
+                self.ntuplets['offsets'][n] = list()
+
                 if atomic_numbers is not None:
                     self.ntuplets['type'][n] = list()
                 cache[n] = list()
                 assert len(cache[n-1]) == len(self.first_neigh) - 1
+
                 for i, lower_tuplet_neighs in enumerate(cache[n-1]):
                     if lower_tuplet_neighs is None or not len(lower_tuplet_neighs):
                         cache[n].append(None)
                         continue
-                    neighbors, _, _, _ = self.get_neighbors(i)
+                    neighbors = encoded_neighbors[i]
                     if len(neighbors) < n-1:
                         cache[n].append(None)
                         continue
@@ -293,36 +333,55 @@ class R_UQ_NeighborList:
                     unique_mask = tiled_neighbors > duplicated_lower[:, -1]
                     neighs = np.column_stack((duplicated_lower[unique_mask],
                                               tiled_neighbors[unique_mask]))
-                    cache[n].append(neighs)
+                    cache[n].append(neighs)  # still encoded
+
+                    # unencode
+                    offsets = self.offset_vec[neighs]
+                    neighs = self.pair_second[neighs]
+
                     if atomic_numbers is not None:
+                        # indices for sorting
                         sort_priority = atomic_numbers[neighs]
                         sort_indices = np.argsort(sort_priority, axis=1)
+
+                        # sort atoms
                         sorted_neighs = np.take_along_axis(neighs,
-                                                        sort_indices,
-                                                        axis=1)
+                                                           sort_indices,
+                                                           axis=1)
                         new_tuplets = np.concatenate((i*np.ones((len(neighs), 1), dtype=int),
-                                                    sorted_neighs),
-                                                    axis=1)  # insert center
-                        ds = [list(combinations(r, 2))
-                                    for r in new_tuplets.tolist()]
-                        self.ntuplets['which_d'][n].extend(ds)
+                                                     sorted_neighs),
+                                                     axis=1)  # insert center
+                        self.ntuplets['atoms'][n].append(new_tuplets)
+
+                        # sort atomic numbers
                         sorted_atomic_numbers = np.take_along_axis(sort_priority,
-                                                                sort_indices,
-                                                                axis=1)
+                                                                   sort_indices,
+                                                                   axis=1)
                         _i = atomic_numbers[i]
                         sorted_atomic_numbers = \
                             np.concatenate((_i*np.ones((len(sorted_neighs), 1), dtype=int),
                                                 sorted_atomic_numbers),
                                                 axis=1)  # insert center
-                        sorted_atomic_symbols = [tuple(row) for row in
-                                                sorted_atomic_numbers.tolist()]
-                        self.ntuplets['type'][n].extend(sorted_atomic_symbols)
+                        sorted_atomic_numbers = [tuple(row) for row in
+                                                 sorted_atomic_numbers.tolist()]
+                        self.ntuplets['type'][n].extend(sorted_atomic_numbers)
+
+                        # sort offsets
+                        sorted_offsets = np.take_along_axis(offsets,
+                                                            sort_indices[:, :, np.newaxis],
+                                                            axis=1)
+                        self.ntuplets['offsets'][n].append(sorted_offsets)
                     else:
-                        neighs = np.concatenate((i*np.ones((len(neighs), 1), dtype=int),
-                                                neighs),
-                                                axis=1)  # insert center
-                        ds = [list(combinations(r, 2)) for r in neighs.tolist()]
-                        self.ntuplets['which_d'][n].extend(ds)
+                        new_tuplets = np.concatenate((i*np.ones((len(neighs), 1), dtype=int),
+                                                     neighs),
+                                                     axis=1)  # insert center
+                        self.ntuplets['atoms'][n].extend(new_tuplets)
+                        self.ntuplets['offsets'][n].extend(offsets)
+
+                self.ntuplets['atoms'][n] = \
+                    np.concatenate(self.ntuplets['atoms'][n], axis=0)
+                self.ntuplets['offsets'][n] = \
+                    np.concatenate(self.ntuplets['offsets'][n], axis=0)
 
         if algo == 3:  # NOTE: in my opinion, this should be better than algo=1, but profiling suggests otherwise
             cache = dict()  # used to generate higher-order tuplets from lower.
@@ -673,7 +732,7 @@ class R_UQ:
         # 2-body
         for pair_tuple, pair_type in zip(nl.ntuplets['which_d'][2],
                                        nl.ntuplets['type'][2]):
-            d = nl.distance_mag[nl.pair2idx[pair_tuple]]
+            d = nl.pair_dist_mag[pair_tuple]
             voxel_idx = self.r_to_voxel_idx(d, self.r_max_map[pair_type],
                                             self.dr_trust[pair_type])
             if np.all(voxel_idx >= 0) and \
@@ -689,16 +748,12 @@ class R_UQ:
 
                 # distances involving the center atom
                 for i, pair_tuple in enumerate(n_tuple[0:degree-1]):
-                    ds[i] = nl.distance_mag[nl.pair2idx[pair_tuple]]
+                    ds[i] = nl.pair_dist_mag[pair_tuple]
                 
                 # distances not involving the center atom
                 for k, pair_tuple in enumerate(n_tuple[degree-1:]):
-                    v_ij = nl.distance_vec[nl.pair2idx[(center_atom,
-                                                        pair_tuple[0])
-                                                        ]]
-                    v_ik = nl.distance_vec[nl.pair2idx[(center_atom,
-                                                        pair_tuple[1])
-                                                        ]]
+                    v_ij = nl.pair_dist_vec[(center_atom, pair_tuple[0])]
+                    v_ik = nl.pair_dist_vec[(center_atom, pair_tuple[1])]
                     v_jk = v_ik - v_ij
                     ds[degree-1+k] = np.linalg.norm(v_jk)
 
@@ -727,13 +782,88 @@ class R_UQ:
                     raise Exception("Symmetry of 3-body interaction not "
                                     "recognized.")
 
-    def check_r(self, updated):
+    def check_r(self,
+                use_cached_distances: bool = False,
+                ):
         """
         Checks if the current geometry is too epistemically uncertain based on
         the r-based UQ method.
+
+        Parameters
+        ----------
+        use_cached_distances : bool
+            Whether to use the cached distances from the update of `self.nl`.
         """
-        raise NotImplementedError("This should be implemented by the subclass.")
-        #  recalc distances unless updated
+        # 2-body
+        if use_cached_distances:
+            dist_mag_cache = self.nl.pair_dist_mag
+            dist_vec_cache = self.nl.pair_dist_vec
+            for pair_tuple, pair_type in zip(self.nl.ntuplets['which_d'][2],
+                                             self.nl.ntuplets['type'][2]):
+                d = dist_mag_cache[pair_tuple]
+                voxel_idx = self.r_to_voxel_idx(d, self.r_max_map[pair_type],
+                                                self.dr_trust[pair_type])
+                if np.all(voxel_idx >= 0) and \
+                np.all(voxel_idx < self.data_voxels[2][pair_type].shape):
+                    if self.data_voxels[2][pair_type][voxel_idx]:
+                        return True
+        else:
+            dist_mag_cache = dict()
+            dist_vec_cache = dict()
+            for pair_tuple, pair_type in zip(self.nl.ntuplets['which_d'][2],
+                                             self.nl.ntuplets['type'][2]):
+                #v_ij = 
+                voxel_idx = self.r_to_voxel_idx(d, self.r_max_map[pair_type],
+                                                self.dr_trust[pair_type])
+                if np.all(voxel_idx >= 0) and \
+                np.all(voxel_idx < self.data_voxels[2][pair_type].shape):
+                    if self.data_voxels[2][pair_type][voxel_idx]:
+                        return True
+
+            for atom in range(len(self.atoms)):
+                neighbors, offsets = self.nl.get_neighbors(atom)
+                # XXX: use these for vectorized but not filtered version
+                #diff = atoms.positions[neighbors] + offsets@atoms.cell - atoms.positions[atom]
+                #r2s = (diff**2).sum(1)  # array of r^2 for all neighbors
+                # Filter to avoid double counting of pairs
+                for i, neighbor in enumerate(neighbors):
+                    offset = offsets[i]
+                    if neighbor <= atom and (not any(offset)):
+                        continue
+                    diff = self.atoms.positions[neighbor] +  offset@self.atoms.cell - self.atoms.positions[atom]
+                    dist_vec_cache[(atom, neighbor)] = diff
+                    
+                    r2 = (diff**2).sum()  # r^2
+                    pair_hash = self.pair_hash_array[atom, neighbor]
+                    for gap in self.r2_gaps[pair_hash]:
+                        if r2 > gap[0] and r2 < gap[1]:  # in the gap
+                            return True  # uncertain 
+
+
+        # higher-order
+        for degree in range(3, self.degree+1):
+            for n_tuple, n_type in zip(nl.ntuplets['which_d'][degree],
+                                       nl.ntuplets['type'][degree]):
+                ds = np.empty(len(n_tuple))
+                center_atom = n_tuple[0][0]
+
+                # distances involving the center atom
+                for i, pair_tuple in enumerate(n_tuple[0:degree-1]):
+                    ds[i] = nl.pair_dist_mag[pair_tuple]
+                
+                # distances not involving the center atom
+                for k, pair_tuple in enumerate(n_tuple[degree-1:]):
+                    v_ij = nl.pair_dist_vec[(center_atom, pair_tuple[0])]
+                    v_ik = nl.pair_dist_vec[(center_atom, pair_tuple[1])]
+                    v_jk = v_ik - v_ij
+                    ds[degree-1+k] = np.linalg.norm(v_jk)
+
+                voxel_idx = self.r_to_voxel_idx(ds, self.r_max_map[n_type],
+                                                self.dr_trust[n_type])
+                if np.all(voxel_idx >= 0) and \
+                   np.all(voxel_idx < self.data_voxels[degree][n_type].shape):
+                    self.data_voxels[degree][n_type][tuple(voxel_idx)] = True
+ 
     
     def too_uncertain(self):
         """
@@ -750,135 +880,11 @@ class R_UQ:
         return self.check_r(updated)
 
 
-def old_ntuplets_generator(nl: R_UQ_NeighborList,
-                       max_n: int,
-                       positions: np.ndarray = None,
-                       ) -> Iterable[List[Tuple]]:
-    """
-    Generates n-tuplets of neighbors for each atom in `atoms` for n between
-    2 and `max_n` (both ends inclusive).
-
-    Parameters
-    ----------
-    nl: R_UQ_NeighborList
-        Neighbor list object.
-    max_n : int
-        The maximum number of neighbors in the higher-order n-tuplet.
-    positions : np.ndarray
-        If provided, then this is used to recalculate the distances and
-        distance vectors of the neighbor list.
-
-    Yields
-    ------
-    ntuplet : List[Tuple[Tuple[int, ...], Tuple[int, ...]]]
-        A list of n-tuplet of neighbor indices and distances for each n.
-    """
-    # Make list of distance magnitudes and vectors from positions if needed
-    if positions is None:
-        dist_mag = nl.distance_mag
-        dist_vec = nl.distance_vec
-    else:
-        dist_vec = positions[nl.pair_second] + \
-                    np.dot(nl.offset_vec, nl.cell) - \
-                    positions[nl.pair_first]
-        dist_mag = np.linalg.norm(dist_vec, axis=1)
-    
-    # Yield all pairs first
-    dist_cache = dict()
-    vec_cache = dict()
-    ntuplet = list()
-    for i, j, d, v in zip(nl.pair_first, nl.pair_second,
-                        dist_mag, dist_vec):
-        dist_cache[(i, j)] = d
-        vec_cache[(i, j)] = v
-        if i > j:  # avoid double counting (self.nl.bothways=True)
-            continue
-        ntuplet.append( ((i, j), (d,)) )
-    
-    # Generate triplets
-    if max_n > 2:
-        for i, j in zip(nl.pair_first, nl.pair_second):
-            for k in nl.get_neighbors(i)[0]:
-                if j >= k:  # avoid self and double counting neighbors
-                    continue
-                v_jk = vec_cache[(i, k)] - vec_cache[(i, j)]
-                d_jk = np.linalg.norm(v_jk)
-                d_ij = dist_cache[(i, j)]
-                d_ik = dist_cache[(i, k)]
-                yield (i, j, k), (d_ij, d_ik, d_jk)
-
-    # Generate higher-body interactions
-    for n in range(4, max_n+1):
-        raise NotImplementedError("max_n>3 is not supported yet.")
-
-
-def ntuplets_generator(nl: R_UQ_NeighborList,
-                       max_n: int,
-                       positions: np.ndarray = None,
-                       ) -> Iterable[List[Tuple]]:
-    """
-    Generates n-tuplets of neighbors for each atom in `atoms` for n between
-    2 and `max_n` (both ends inclusive).
-
-    Parameters
-    ----------
-    nl: R_UQ_NeighborList
-        Neighbor list object.
-    max_n : int
-        The maximum number of neighbors in the higher-order n-tuplet.
-    positions : np.ndarray
-        If provided, then this is used to recalculate the distances and
-        distance vectors of the neighbor list.
-
-    Yields
-    ------
-    ntuplet : List[Tuple[Tuple[int, ...], Tuple[int, ...]]]
-        A list of n-tuplet of neighbor indices and distances for each n.
-    """
-    # Make list of distance magnitudes and vectors from positions if needed
-    if positions is None:
-        dist_mag = nl.distance_mag
-        dist_vec = nl.distance_vec
-    else:
-        dist_vec = positions[nl.pair_second] + \
-                    np.dot(nl.offset_vec, nl.cell) - \
-                    positions[nl.pair_first]
-        dist_mag = np.linalg.norm(dist_vec, axis=1)
-    
-    # Create distance and vector caches
-    dist_cache = dict()
-    vec_cache = dict()
-    for i, j, d, v in zip(nl.pair_first, nl.pair_second,
-                        dist_mag, dist_vec):
-        dist_cache[(i, j)] = d
-        vec_cache[(i, j)] = v
-
-    # Yield all pairs first 
-    #pairs = np.
-    
-    # Generate triplets
-    if max_n > 2:
-        for i, j in zip(nl.pair_first, nl.pair_second):
-            for k in nl.get_neighbors(i)[0]:
-                if j >= k:  # avoid self and double counting neighbors
-                    continue
-                v_jk = vec_cache[(i, k)] - vec_cache[(i, j)]
-                d_jk = np.linalg.norm(v_jk)
-                d_ij = dist_cache[(i, j)]
-                d_ik = dist_cache[(i, k)]
-                yield (i, j, k), (d_ij, d_ik, d_jk)
-
-    # Generate higher-body interactions
-    for n in range(4, max_n+1):
-        raise NotImplementedError("max_n>3 is not supported yet.")
-
-
 if __name__ == '__main__':
     from ase.atoms import Atoms
     from uf3.data import composition
     from uf3.representation import bspline
 
-    '''
     atoms = Atoms('HOH', positions=[[0, 0, 0], [0, 1, 0], [14, 0, 0]],
                   cell=[15, 15, 15], pbc=True)
     cutoffs = {("O", "O"): 5.0, ("O", "H"): 0.82, ("H", "H"): 5.0}
@@ -889,10 +895,7 @@ if __name__ == '__main__':
     print(f"nl.pair_first = \n{nl.pair_first}")
     print(f"nl.pair_second = \n{nl.pair_second}")
     print(f"nl.first_neigh = \n{nl.first_neigh}")
-    print(f"nl.pair2idx = \n{nl.pair2idx}")
     print(f"nl.offset_vec = \n{nl.offset_vec}")
-    print(f"nl.distance_mag = \n{nl.distance_mag}")
-    print(f"nl.distance_vec = \n{nl.distance_vec}")
     print(f"nl.get_neighbors(1) = \n{nl.get_neighbors(1)}")
     print(f"nl.ntuplets = \n{nl.ntuplets}")
     print("===")
@@ -921,15 +924,11 @@ if __name__ == '__main__':
     nl.build(atoms)
     nl.tabulate_ntuplets(max_n=3,
                          atomic_numbers=atoms.get_atomic_numbers(),
-                         algo=3
+                         algo=1
                          )
-    #print(len(nl.ntuplets['which_d'][2]))
-    #print(len(nl.ntuplets['which_d'][3]))
-    #print(f"nl.pair_first = \n{nl.pair_first}")
-    #print(f"nl.pair_second = \n{nl.pair_second}")
-    for t, s in zip(nl.ntuplets['which_d'][2], nl.ntuplets['type'][2]):
+    for t, s in zip(nl.ntuplets['atoms'][2], nl.ntuplets['type'][2]):
         print(f"{t}, {s}")
-    for t, s in zip(nl.ntuplets['which_d'][3], nl.ntuplets['type'][3]):
+    for t, s in zip(nl.ntuplets['atoms'][3], nl.ntuplets['type'][3]):
         print(f"{t}, {s}")
     print("===")
     '''
@@ -957,4 +956,4 @@ if __name__ == '__main__':
     #    print(f"{t}")
     #for t in nl.ntuplets['which_d'][3]:
     #    print(f"{t}")
-    #'''
+    '''
