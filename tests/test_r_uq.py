@@ -1,4 +1,4 @@
-from new_r_uq import R_UQ_NeighborList, R_UQ
+from r_uq import R_UQ_NeighborList, R_UQ
 from ase.atoms import Atoms
 from uf3.data import composition
 from uf3.representation import bspline
@@ -52,10 +52,10 @@ def _nl_tuplets_combo_tester(nl: R_UQ_NeighborList,
         assert len(nl.ntuplets['type'][2]) == len(type_2)
 
         atoms_2 = [tuple(row) for row in atoms_2]
-        offsets_2 = [tuple([tuple(offset) for offset in row]) for row in offsets_2]
+        offsets_2 = [tuple(offset) for offset in offsets_2]
         true_zip = list(zip(atoms_2, offsets_2, type_2))
         ntuplets_atoms_2 = [tuple(row) for row in nl.ntuplets['atoms'][2]]
-        ntuplets_offsets_2 = [tuple([tuple(offset) for offset in row]) for row in nl.ntuplets['offsets'][2]]
+        ntuplets_offsets_2 = [tuple(offset) for offset in nl.ntuplets['offsets'][2]]
         test_zip = list(zip(ntuplets_atoms_2, ntuplets_offsets_2, nl.ntuplets['type'][2]))
         for true in true_zip:
             try:
@@ -176,8 +176,8 @@ def test_nl_ntuplets():
 
     atoms_2 = np.array([(0, 1), (2, 0), (3, 0), (0, 4), (0, 5), (2, 1), (3, 1), (4, 1),
                         (8, 6)])
-    offsets_2 = np.array([[[0, 0, 0]], [[0, 0, 0]], [[0, 0, 0]], [[0, 0, 0]], [[-1, 0, 0]],
-                          [[0, 0, 0]], [[0, 0, 0]], [[0, 0 ,0]], [[0, 0, 0]]])
+    offsets_2 = np.array([[0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0], [-1, 0, 0],
+                          [0, 0, 0], [0, 0, 0], [0, 0 ,0], [0, 0, 0]])
     type_2 = [(6, 8), (1, 6), (1, 6), (6, 6), (6, 8), (1, 8), (1, 8), (6, 8),
               (1, 8)]
     atoms_3 = np.array([[0, 2, 1], [0, 3, 1], [0, 4, 1], [0, 5, 1], [0, 2, 3], [0, 2, 4],
@@ -260,7 +260,7 @@ def test_nl_ntuplets_double_neighbors():
                          )
 
     atoms_2 = np.array([(1, 0), (2, 0), (2, 0), (1, 2)])
-    offsets_2 = np.array([[[0, 0, 0]], [[0, 0, 0]], [[1, 0, 0]], [[0, 0, 0]]])
+    offsets_2 = np.array([[0, 0, 0], [0, 0, 0], [1, 0, 0], [0, 0, 0]])
     type_2 = [(1, 8), (1, 8), (1, 8), (1, 1)]
     atoms_3 = np.array([(0, 1, 2), (0, 1, 2), (0, 2, 2), (1, 2, 0), (2, 1, 0), (2, 0, 0),
                         (2, 1, 0)])
@@ -431,8 +431,3 @@ def test_voxel_update():
                                       [0, 0, 0, 0, 0, 0, 0, 0],
                                       [0, 0, 0, 0, 0, 0, 0, 0]],
                            ])))
- 
-if __name__ == "__main__":
-    test_nl_ntuplets()
-    test_nl_ntuplets_double_neighbors()
-    #test_voxel_update()

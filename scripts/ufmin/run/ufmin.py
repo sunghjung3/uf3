@@ -267,13 +267,7 @@ def ufmin(initial_structure = "POSCAR",
     preconditioner_f = None
 
     # initialize UQ object
-    if bspline_config.degree == 2:
-        UQClass = r_uq.R_UQ_2B
-    elif bspline_config.degree == 3:
-        UQClass = r_uq.R_UQ_3B
-    else:
-        raise NotImplementedError("Only 2 and 3-body UQ is implemented")
-    r_uq_obj = UQClass(atoms, traj, bspline_config, uq_tolerance)
+    r_uq_obj = r_uq.R_UQ(atoms, traj, bspline_config, uq_tolerance)
 
 
     ### Optimization Loop ###
@@ -413,7 +407,10 @@ def ufmin(initial_structure = "POSCAR",
 
             
             #if too_uncertain(traj[-1], atoms) or uf3_fmax_squared < ufmin_uf3_fmax_squared or ufmin_counter > max_uf3_calls:
-            if r_uq_obj.too_uncertain() or uf3_fmax_squared < ufmin_uf3_fmax_squared or ufmin_counter > max_uf3_calls:
+            high_uncertainty = r_uq_obj.too_uncertain()
+            if high_uncertainty:
+                print("HIGH UNCERTAINTY")
+            if high_uncertainty or uf3_fmax_squared < ufmin_uf3_fmax_squared or ufmin_counter > max_uf3_calls:
                 pickle.dump(step_traj, model_traj_file)
                 break
         
