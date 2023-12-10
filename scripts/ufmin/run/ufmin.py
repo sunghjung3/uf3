@@ -586,8 +586,12 @@ if __name__ == "__main__":
     #true_calc = MorsePotential(epsilon=D_e, r0=r_e, rho0=rho0, rcut1=4.0, rcut2=7.0)
     #true_calc_type = "morse"
 
+    # EMT
+    #true_calc = EMT()
+    #true_calc_type = "emt"
+
     # UF3
-    #true_model = least_squares.WeightedLinearModel.from_json("/home/sung/UFMin/sung/representability_test/fit_3b/true_model_3b.json")
+    #true_model = least_squares.WeightedLinearModel.from_json("/home/sung/UFMin/sung/representability_test/fit_3b/trimer_fit/true_model_3b.json")
     #true_calc = calculator.UFCalculator(true_model)
     #true_calc_type = "uf3"
 

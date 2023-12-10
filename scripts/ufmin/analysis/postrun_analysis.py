@@ -276,7 +276,7 @@ true_F_ax.plot(forcecalls, true_fmax_list, 'm')
 true_F_ax.set_ylabel("Max force (eV/A)", color = 'm')
 true_F_ax.tick_params(axis ='y', labelcolor = 'm', which = 'minor')
 true_F_ax.set_yscale("log")
-true_F_ax.axhline(y=0.05, color='r', linestyle='--')
+true_F_ax.axhline(y=0.01, color='r', linestyle='--')
 
 true_calc_fig.suptitle("UF3-accelerated Optimization")
 plt.savefig( os.path.join(results_dir, opt_plot_png) )
@@ -335,7 +335,7 @@ for true_call_step in range(1, n_images+1):
     model_calc_E_ax.plot(call_numbers[-1], e[-1, 0], 'b.', markersize=5)
     model_calc_E_ax.plot(call_numbers[-1], e[-1, 1], 'c.', markersize=5)
 
-model_calc_fmax_ax.axhline(y=0.05, color='r', linestyle='--')   # horizontal line at force convergence
+model_calc_fmax_ax.axhline(y=0.01, color='r', linestyle='--')   # horizontal line at force convergence
 ps = p1 + p2 + p3 + p4
 labs = [l.get_label() for l in ps]
 model_calc_fmax_ax.legend(ps, labs, loc='upper right')

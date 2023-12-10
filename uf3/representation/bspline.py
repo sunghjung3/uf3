@@ -173,7 +173,8 @@ class BSplineBasis:
         values = []
         for interaction in self.r_max_map:
             r_max = self.r_max_map[interaction]
-            if isinstance(r_max, (float, np.floating, int)):
+            print(type(r_max))
+            if isinstance(r_max, (float, np.floating, int, np.integer)):
                 values.append(r_max)
             else:
                 # higher body interactions: get max r involving central atom
