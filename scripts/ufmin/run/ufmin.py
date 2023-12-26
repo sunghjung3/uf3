@@ -94,8 +94,6 @@ def ufmin(initial_structure = "POSCAR",
           opt_traj_file = "ufmin.traj",  # array of images at all real force evaluations
           model_traj_file = "ufmin_model.traj",  # array of images at each UF3 minimization
           model_calc_file = "model_calc.pckl",  # store energy and forces from UF3 calls
-          train_uq_file = "train_uq.pckl",  # store UQ from training data
-          test_uq_file = "test_uq.pckl",  # store UQ from testing data (each structure in UF3 minimization steps)
           status_update_file = "ufmin_status.out",
           ufmin_true_fmax = 0.05,  # force tolerance for the actual optimization
           ufmin_uf3_fmax = 0.05,  # force tolerance for the optimization on the uf3 surface
@@ -130,8 +128,6 @@ def ufmin(initial_structure = "POSCAR",
         opt_traj_file (str): Path to ASE trajectory file to store optimization trajectory at all real force evaluations.
         model_traj_file (str): Path to ASE trajectory file to store optimization trajectory at each UF3 minimization for all real force evaluations.
         model_calc_file (str): Path to pickle file to store energy and forces from UF3 calls (real and MLFF).
-        train_uq_file (str): Path to pickle file to store UQ from training data (only for delta_uq).
-        test_uq_file (str): Path to pickle file to store UQ from testing data (each structure in UF3 minimization steps) (only for delta_uq).
         status_update_file (str): Path to file to store status updates.
         ufmin_true_fmax (float): Force tolerance for the actual optimization.
         ufmin_uf3_fmax (float): Force tolerance for the optimization on the uf3 surface.
@@ -200,10 +196,6 @@ def ufmin(initial_structure = "POSCAR",
         opt_traj = trajectory.Trajectory(opt_traj_file, mode='w')  # to save optimization traj
         model_traj_file = open(model_traj_file, 'wb')
         model_calc_file = open(model_calc_file, 'wb')
-        #uq_e_train_list = list()
-        #uq_f_train_list = list()
-        #uq_e_test_list = list()
-        #uq_f_test_list = list()
 
 
     ### Set up ###
@@ -400,8 +392,6 @@ def ufmin(initial_structure = "POSCAR",
         dyn = optimizer(atoms)
         step_model_calc_E = list()  # store model calc values for this UF3 minimization step. Will eventually be appended to model_calc_E
         step_model_calc_F = list()
-        #step_uq_e_list = list()
-        #step_uq_f_list = list()
         step_traj = list()
         tmp_atoms = copy.deepcopy(atoms)
         del tmp_atoms.calc
@@ -462,8 +452,6 @@ def ufmin(initial_structure = "POSCAR",
                 break
         
         pickle.dump( (step_model_calc_E, step_model_calc_F), model_calc_file )
-        #uq_e_test_list.append(step_uq_e_list)
-        #uq_f_test_list.append(step_uq_f_list)
 
         # evaluate true energy
         forcecall_counter += 1
@@ -483,13 +471,9 @@ def ufmin(initial_structure = "POSCAR",
         # explicit garbage collection
         del step_model_calc_E[:]
         del step_model_calc_F[:]
-        #del step_uq_e_list[:]
-        #del step_uq_f_list[:]
         del step_traj[:]
         del step_model_calc_E
         del step_model_calc_F
-        #del step_uq_e_list 
-        #del step_uq_f_list 
         del step_traj
 
         
@@ -506,25 +490,10 @@ def ufmin(initial_structure = "POSCAR",
     model_calc_file.close()
     opt_traj.close()
 
-    '''
-    # save delta UQ data
-    with open(train_uq_file, 'wb') as f:
-        pickle.dump([uq_e_train_list, uq_f_train_list], f)
-    with open(test_uq_file, 'wb') as f:
-        pickle.dump([uq_e_test_list, uq_f_test_list], f)
-    '''
 
     # explicit garbage collection
     del traj[:]
-    #del uq_e_train_list[:]
-    #del uq_f_train_list[:]
-    #del uq_e_test_list[:]
-    #del uq_f_test_list[:]
     del traj
-    #del uq_e_train_list
-    #del uq_f_train_list
-    #del uq_e_test_list 
-    #del uq_f_test_list 
 
     del atoms[:]
     del atoms
@@ -544,8 +513,6 @@ if __name__ == "__main__":
     opt_traj_file = "ufmin.traj"  # array of images at all real force evaluations
     model_traj_file = "ufmin_model.traj"  # array of images at each UF3 minimization
     model_calc_file = "model_calc.pckl"  # store energy and forces from UF3 calls
-    train_uq_file = "train_uq.pckl"  # store UQ from training data
-    test_uq_file = "test_uq.pckl"  # store UQ from testing data (each structure in UF3 minimization steps)
     status_update_file = "ufmin_status.out"
     ufmin_true_fmax = 0.01  # force tolerance for the actual optimization
     ufmin_uf3_fmax = 0.0001  # force tolerance for the optimization on the uf3 surface
@@ -629,8 +596,6 @@ if __name__ == "__main__":
                 opt_traj_file,
                 model_traj_file,
                 model_calc_file,
-                train_uq_file,
-                test_uq_file,
                 status_update_file,
                 ufmin_true_fmax,
                 ufmin_uf3_fmax,
