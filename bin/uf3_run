@@ -221,7 +221,7 @@ def initialize(settings_file: str = "settings.yaml",
     trailing_trim = basis_settings.get("trailing_trim", 3)  # default value: 3 (continuous upto 2nd derivative at r=r_max)
     load_knots = basis_settings.get("load_knots", False)
     dump_knots = basis_settings.get("dump_knots", False)
-    leading_trim = 0  # discontinuous at r=r_min (repulsive region)
+    leading_trim = basis_settings.get("leading_trim", 0)  # discontinuous at r=r_min (repulsive region)
     if load_knots:
         try:
             logger(f"Loading knots...", message_verbosity=2)

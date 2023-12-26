@@ -165,11 +165,12 @@ def ufmin(initial_structure = "POSCAR",
 
     if resume:
         # load existing files to resume process
-
+        print("RESUMING")
         try:
             opt_traj = trajectory.Trajectory(opt_traj_file, mode='r')
             traj = [image for image in opt_traj]
             opt_traj.close()
+            opt_traj = trajectory.Trajectory(opt_traj_file, mode='a')  # open in append mode to add on
         except FileNotFoundError:
             sys.exit(f"Optimization trajectory file {opt_traj_file} does not exist. Cannot resume.")
         
@@ -199,6 +200,7 @@ def ufmin(initial_structure = "POSCAR",
         if os.path.isfile(status_update_file):
             os.remove(status_update_file)
         traj = list()  # will be training data
+        opt_traj = trajectory.Trajectory(opt_traj_file, mode='w')  # to save optimization traj
         model_traj_file = open(model_traj_file, 'wb')
         true_calc_file = open(true_calc_file, 'wb')
         model_calc_file = open(model_calc_file, 'wb')
@@ -254,8 +256,9 @@ def ufmin(initial_structure = "POSCAR",
         if true_calc_type == "vasp":
             check_vasp_convergence()
         pickle.dump( (most_recent_E_eval, most_recent_F_eval), true_calc_file )
-        #traj.append(copy.deepcopy(atoms))
-        traj.append(strip_calc(atoms, most_recent_E_eval, most_recent_F_eval))
+        stripped_calc_atoms = strip_calc(atoms, most_recent_E_eval, most_recent_F_eval)
+        traj.append(stripped_calc_atoms)
+        opt_traj.write(stripped_calc_atoms)
 
         # UF3 cannot train with a single structure (look at loss function). So take 1 real optimization step to gain another image
         #dyn = SciPyFminCG(atoms)
@@ -266,8 +269,9 @@ def ufmin(initial_structure = "POSCAR",
         if true_calc_type == "vasp":
             check_vasp_convergence()
         pickle.dump( (most_recent_E_eval, most_recent_F_eval), true_calc_file )
-        #traj.append(copy.deepcopy(atoms))
-        traj.append(strip_calc(atoms, most_recent_E_eval, most_recent_F_eval))
+        stripped_calc_atoms = strip_calc(atoms, most_recent_E_eval, most_recent_F_eval)
+        traj.append(stripped_calc_atoms)
+        opt_traj.write(stripped_calc_atoms)
 
     '''
     # 2-body preconditioning
@@ -479,8 +483,9 @@ def ufmin(initial_structure = "POSCAR",
         true_forces_squared = np.sum( np.square(most_recent_F_eval), axis=1 )
         true_fmax_squared = np.max(true_forces_squared)
         print(forcecall_counter, " ; true F =", np.sqrt(true_fmax_squared))
-        #traj.append(copy.deepcopy(atoms))
-        traj.append(strip_calc(atoms, most_recent_E_eval, most_recent_F_eval))
+        stripped_calc_atoms = strip_calc(atoms, most_recent_E_eval, most_recent_F_eval)
+        traj.append(stripped_calc_atoms)
+        opt_traj.write(stripped_calc_atoms)
 
         # explicit garbage collection
         del step_model_calc_E[:]
@@ -507,11 +512,6 @@ def ufmin(initial_structure = "POSCAR",
     model_traj_file.close()
     true_calc_file.close()
     model_calc_file.close()
-
-    # save optimization traj
-    opt_traj = trajectory.Trajectory(opt_traj_file, mode='w')
-    for image in traj:
-        opt_traj.write(image)
     opt_traj.close()
 
     '''

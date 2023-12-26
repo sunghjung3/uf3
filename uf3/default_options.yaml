@@ -25,6 +25,7 @@ basis:
     resolution:
     fit_offsets: yes
     trailing_trim: 3
+    leading_trim: 0
     mask_trim: yes
     knot_strategy: linear
     knots_path: knots.json
