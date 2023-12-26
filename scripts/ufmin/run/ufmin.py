@@ -93,7 +93,6 @@ def ufmin(initial_structure = "POSCAR",
           settings_file = "settings.yaml",
           opt_traj_file = "ufmin.traj",  # array of images at all real force evaluations
           model_traj_file = "ufmin_model.traj",  # array of images at each UF3 minimization
-          true_calc_file = "true_calc.pckl",  # store energy and forces from each true force call
           model_calc_file = "model_calc.pckl",  # store energy and forces from UF3 calls
           train_uq_file = "train_uq.pckl",  # store UQ from training data
           test_uq_file = "test_uq.pckl",  # store UQ from testing data (each structure in UF3 minimization steps)
@@ -130,7 +129,6 @@ def ufmin(initial_structure = "POSCAR",
         settings_file (str): Path to settings file.
         opt_traj_file (str): Path to ASE trajectory file to store optimization trajectory at all real force evaluations.
         model_traj_file (str): Path to ASE trajectory file to store optimization trajectory at each UF3 minimization for all real force evaluations.
-        true_calc_file (str): Path to pickle file to store energy and forces from each true force call.
         model_calc_file (str): Path to pickle file to store energy and forces from UF3 calls (real and MLFF).
         train_uq_file (str): Path to pickle file to store UQ from training data (only for delta_uq).
         test_uq_file (str): Path to pickle file to store UQ from testing data (each structure in UF3 minimization steps) (only for delta_uq).
@@ -178,9 +176,8 @@ def ufmin(initial_structure = "POSCAR",
             sys.exit(f"Model trajectory file {model_traj_file} does not exist. Cannot resume.")
         model_traj_file = open(model_traj_file, 'ab')
 
-        if not (os.path.isfile(true_calc_file) and os.path.isfile(model_calc_file)) :
+        if not (os.path.isfile(model_calc_file)) :
             sys.exit(f"Calculation pickle files do not exist. Cannot resume.")
-        true_calc_file = open(true_calc_file, 'ab')
         model_calc_file = open(model_calc_file, 'ab')
 
         if not os.path.isfile(live_features_file):
@@ -195,14 +192,13 @@ def ufmin(initial_structure = "POSCAR",
                 sys.exit("Remove model files before running this script.")
         if os.path.isfile(opt_traj_file) or os.path.isfile(model_traj_file):
             sys.exit("Remove the minimization traj files before running this script.")
-        if os.path.isfile(true_calc_file) or os.path.isfile(model_calc_file):
+        if os.path.isfile(model_calc_file):
             sys.exit("Remove the calculation pickle files before running this script.")
         if os.path.isfile(status_update_file):
             os.remove(status_update_file)
         traj = list()  # will be training data
         opt_traj = trajectory.Trajectory(opt_traj_file, mode='w')  # to save optimization traj
         model_traj_file = open(model_traj_file, 'wb')
-        true_calc_file = open(true_calc_file, 'wb')
         model_calc_file = open(model_calc_file, 'wb')
         #uq_e_train_list = list()
         #uq_f_train_list = list()
@@ -255,7 +251,6 @@ def ufmin(initial_structure = "POSCAR",
         most_recent_F_eval = atoms.get_forces()
         if true_calc_type == "vasp":
             check_vasp_convergence()
-        pickle.dump( (most_recent_E_eval, most_recent_F_eval), true_calc_file )
         stripped_calc_atoms = strip_calc(atoms, most_recent_E_eval, most_recent_F_eval)
         traj.append(stripped_calc_atoms)
         opt_traj.write(stripped_calc_atoms)
@@ -268,7 +263,6 @@ def ufmin(initial_structure = "POSCAR",
         most_recent_F_eval = atoms.get_forces()
         if true_calc_type == "vasp":
             check_vasp_convergence()
-        pickle.dump( (most_recent_E_eval, most_recent_F_eval), true_calc_file )
         stripped_calc_atoms = strip_calc(atoms, most_recent_E_eval, most_recent_F_eval)
         traj.append(stripped_calc_atoms)
         opt_traj.write(stripped_calc_atoms)
@@ -478,7 +472,6 @@ def ufmin(initial_structure = "POSCAR",
         most_recent_F_eval = atoms.get_forces()
         if true_calc_type == "vasp":
             check_vasp_convergence()
-        pickle.dump( (most_recent_E_eval, most_recent_F_eval), true_calc_file )
         print(forcecall_counter, " ; true E =", most_recent_E_eval)
         true_forces_squared = np.sum( np.square(most_recent_F_eval), axis=1 )
         true_fmax_squared = np.max(true_forces_squared)
@@ -510,7 +503,6 @@ def ufmin(initial_structure = "POSCAR",
 
     # close open files
     model_traj_file.close()
-    true_calc_file.close()
     model_calc_file.close()
     opt_traj.close()
 
@@ -551,7 +543,6 @@ if __name__ == "__main__":
     settings_file = "settings.yaml"
     opt_traj_file = "ufmin.traj"  # array of images at all real force evaluations
     model_traj_file = "ufmin_model.traj"  # array of images at each UF3 minimization
-    true_calc_file = "true_calc.pckl"  # store energy and forces from each true force call
     model_calc_file = "model_calc.pckl"  # store energy and forces from UF3 calls
     train_uq_file = "train_uq.pckl"  # store UQ from training data
     test_uq_file = "test_uq.pckl"  # store UQ from testing data (each structure in UF3 minimization steps)
@@ -637,7 +628,6 @@ if __name__ == "__main__":
                 settings_file,
                 opt_traj_file,
                 model_traj_file,
-                true_calc_file,
                 model_calc_file,
                 train_uq_file,
                 test_uq_file,

@@ -19,7 +19,6 @@ live_features_file = "live_features.h5"
 model_file_prefix = "model"
 opt_traj_file = "ufmin.traj"
 model_traj_file = "ufmin_model.traj"
-true_calc_file = "true_calc.pckl"
 model_calc_file = "model_calc.pckl"
 spline_2b_gif = "spline_2b.gif"   # will write at results_dir/spline_2b_gif
 parity_E_gif = "parity_E.gif"  # will write at results_dir/parity_E_gif
@@ -78,17 +77,14 @@ def create_parity_plot_frame(y_i, p_i, rmse_i, y_all, p_all, rmse_all, y_md=None
     plt.close()
 
 
-with open( os.path.join(results_dir, true_calc_file), 'rb' ) as f:
-    true_energies = list()
-    true_forces = list()
-    while True:
-        try:
-            true_energy, true_force = pickle.load(f)
-        except EOFError:
-            break
-        true_energies.append(true_energy)
-        true_forces.append(true_force)
-print(len(true_energies))
+opt_traj = trajectory.Trajectory( os.path.join(results_dir, opt_traj_file), 'r' )
+print(len(opt_traj))
+
+true_energies = list()
+true_forces = list()
+for image in opt_traj:
+    true_energies.append(image.get_potential_energy())
+    true_forces.append(image.get_forces())
 
 with open( os.path.join(results_dir, model_calc_file), 'rb' ) as f:
     model_calc_E = list()
@@ -101,9 +97,6 @@ with open( os.path.join(results_dir, model_calc_file), 'rb' ) as f:
         model_calc_E.append(Es)
         model_calc_F.append(Fs)    
 print(len(model_calc_E))
-
-opt_traj = trajectory.Trajectory( os.path.join(results_dir, opt_traj_file), 'r' )
-print(len(opt_traj))
 
 n_images = len(true_energies)  # also the number of true force calls
 n_models = n_images - 2
