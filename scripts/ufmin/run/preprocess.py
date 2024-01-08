@@ -156,6 +156,7 @@ def preprocess(atoms: Atoms,
             print("Preprocessing failed to complete.")
             break
 
+    atoms.calc = None  # remove the fictitious calculator
     return atoms
 
 
