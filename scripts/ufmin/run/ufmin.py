@@ -1,4 +1,7 @@
 from ase.io import read
+from ase.io import trajectory
+from ase.atoms import Atoms
+import ase.data as ase_data
 
 from ase.calculators.emt import EMT
 from ase.calculators.singlepoint import SinglePointCalculator
@@ -13,9 +16,6 @@ except ImportError:
 #from ase.optimize.sciopt import SciPyFminCG
 from ase.optimize import FIRE
 #from myopts import GD, MGD
-from ase.io import trajectory
-from ase.atoms import Atoms
-import ase.data as ase_data
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -29,7 +29,7 @@ from uf3.forcefield import calculator
 from uf3.data import io
 from uf3.representation import process
 from uf3.data import geometry, composition
-import delta_uq, r_uq
+import r_uq
 from preprocess import preprocess
 
 import copy, sys, time, os, glob, pickle, gc, concurrent
@@ -37,12 +37,12 @@ import copy, sys, time, os, glob, pickle, gc, concurrent
 #from memory_profiler import profile
 
 
-def generate_sample_weights(current_forcecall, strength):
+def generate_sample_weights(current_image_prefix, strength, nimages_start=1):
     """
     Generate sample weights for training data.
 
     Args:
-        current_forcecall (int): Current forcecall number.
+        current_image_prefix (int): Current image prefix.
         strength (int): How strongly to weigh the most recent sample vs the oldest.
             The most recent datapoint will be weighted by 2**(strength).
             Each previous datapoint will be weighted half as much until a weight of 1.0 is reached.
@@ -52,10 +52,14 @@ def generate_sample_weights(current_forcecall, strength):
         sample_weights (dict): Sample weights for training data.
     """
     sample_weights = dict()
-    for i in range(current_forcecall, 0, -1):
+    for i in range(current_image_prefix, -2, -1):
         key = str(i) + "_" + '0'  # the '0' is assuming that UF3 names each configuration by its index in the trajetory and that we only have one new configuration per forcecall
-        sample_weights[key] = 2 ** max(strength - (current_forcecall - i), 0)
-    sample_weights["1_1"] = sample_weights["1_0"]  # we start with 2 forcecalls
+        sample_weights[key] = 2 ** max(strength - (current_image_prefix - i), 0)
+
+    for i in range(1, nimages_start):
+        key = '-1_' + str(i)
+        sample_weights[key] = sample_weights["-1_0"]
+
     return sample_weights
 
 
@@ -71,13 +75,16 @@ class Pseudodict(dict):
     def get(self, key, default=None):
         return self.value
 
-def strip_calc(atoms, e_val, f_val):
+def strip_calc(atoms, e_val, f_val, inplace=False):
     """
     Given an atoms object and energy and force values, strip the calculator
     and replace it with a single point calculator with the same energy and force
     values.
     """
-    ret_atoms = copy.deepcopy(atoms)
+    if inplace:
+        ret_atoms = atoms
+    else:
+        ret_atoms = copy.deepcopy(atoms)
     ret_atoms.calc = SinglePointCalculator(ret_atoms, energy=e_val, forces=f_val)
     return ret_atoms
 
@@ -86,8 +93,82 @@ def check_vasp_convergence(vasprun_file="vasprun.xml") -> bool:
         return True
     raise ValueError("VASP calculation did not converge. Terminating UFMin.")
 
+def initial_data_prep(structure_input,
+                      nimages_start,
+                      bspline_config,
+                      true_calc,
+                      true_calc_type,
+                      conv_fmax,
+                      ):
+    '''
+    Read in initial data/structure and calculate energy and forces (if necessary).
+    '''
+    if isinstance(structure_input, str):
+        # structure file or trajectory file
+        try:
+            structure_input = trajectory.Trajectory(structure_input, mode='r')
+        except:
+            atoms = read(structure_input)
+            structure_input = [atoms]
+    else:
+        # ase.Atoms object or List[ase.Atoms] or trajectory.Trajectory
+        if isinstance(structure_input, Atoms):
+            structure_input = [copy.deepcopy(structure_input)]
+        elif isinstance(structure_input, trajectory.TrajectoryReader):
+            structure_input = copy.deepcopy(structure_input)
+        else:
+            assert isinstance(structure_input, list)
+            tmp = list()
+            for atoms in structure_input:
+                assert isinstance(atoms, Atoms)
+                tmp.append(copy.deepcopy(atoms))
+            structure_input = tmp
+
+    # preprocess all image in traj
+    pair_tuples = bspline_config.interactions_map[2]
+    traj = list()
+    for i, atoms in enumerate(structure_input):
+        print("Preprocessing image", i)
+        preprocessed_atoms = preprocess(atoms, pair_tuples, strength=preprocess_strength)
+        traj.append(preprocessed_atoms)
+
+    # calculate energy and forces for all images in traj
+    for i, atoms in enumerate(traj):
+        try:
+            most_recent_E_eval = atoms.get_potential_energy()
+            most_recent_F_eval = atoms.get_forces()
+            print("Using provided energy and forces for image", i)
+        except RuntimeError:
+            atoms.calc = true_calc
+            most_recent_E_eval = atoms.get_potential_energy()
+            most_recent_F_eval = atoms.get_forces()
+            if true_calc_type == "vasp":
+                check_vasp_convergence()
+            print("Calculated energy and forces for image", i)
+        strip_calc(atoms, most_recent_E_eval, most_recent_F_eval, inplace=True)
+
+    # generate additional images if necessary
+    n = len(traj)
+    for i in range(n, nimages_start):
+        print("Generating image", i)
+        atoms = copy.deepcopy(traj[-1])
+        atoms.calc = true_calc
+        dyn = optimizer(atoms)
+        dyn.run(steps=1, fmax=conv_fmax)
+        most_recent_E_eval = atoms.get_potential_energy()
+        most_recent_F_eval = atoms.get_forces()
+        if true_calc_type == "vasp":
+            check_vasp_convergence()
+        strip_calc(atoms, most_recent_E_eval, most_recent_F_eval, inplace=True)
+        traj.append(atoms)
+
+    return traj
+
+
 #@profile
-def ufmin(initial_structure = "POSCAR",
+def ufmin(structure_input = "POSCAR",
+          nimages_start = 1,  # number of images to start with
+          initial_data_output_file = "initial_data.traj",
           live_features_file = "live_features.h5",
           model_file_prefix = "model",  # store model from each step
           settings_file = "settings.yaml",
@@ -117,10 +198,28 @@ def ufmin(initial_structure = "POSCAR",
     """
     Energy minimization using UF3 surrogate model.
 
+    Intended trajectory and iteration numbering system:
+        * `initial_data_output_file` file: trajectory of initial data, including the starting point of optimization
+            * These are data points that are used to train the first surrogate UF3 model (model 0)
+            * These will have the image prefix of -1.
+        * `opt_traj_file` file: trajectory of all images at all real force evaluations, excluding the starting point of optimization and initial data.
+            * With the zero-indexing system, the i-th image is the resulting structure from minimizing upon model i
+        * `traj` variable: union of images in `initial_data_output_file` and `opt_traj_file`
+
     Args:
-        initial_structure (str | ase.Atoms): Initial structure to start optimization from.
-            If str, then it is a path to a structure file.
-            If ase.Atoms, then it is the structure itself.
+        structure_input (str | ase.Atoms | List[ase.Atoms] | ase.io.trajectory.Trajectory): Initial dataset to start optimization from. Will be ignored if `resume` is non-zero.
+            If str, then it is a path to a structure file or a trajectory file.
+                If a structure file, then it is the initial structure. Optimization will start here.
+                If a trajectory file, then it is a trajectory object. Optimization will start from the last structure in the trajectory.
+            If ase.Atoms, then it is the structure itself. Optimization will start here.
+            If List[ase.Atoms], then it is a list of structures. Optimization will start from the last structure in the list.
+                If energy and forces are provided, then they will be used. Otherwise, they will be calculated.
+            If ase.io.trajectory.Trajectory, then it is a trajectory object. Optimization will start from the last structure in the trajectory.
+                If energy and forces are provided, then they will be used. Otherwise, they will be calculated.
+        nimages_start (int): Minimum number of images to start with. Used only if `resume` is zero.
+            If `structure_input` contains less than `nimages_start` images, then the remaining images will be generated by performing a single optimization step on the true energy surface.
+            If `structure_input` contains more than `nimages_start` images, then all provided images will be used.
+        initial_data_output_file (str): Path to ASE trajectory file to store images used to train the first surrogate UF3 model.
         live_features_file (str): Path to HDF5 file to store live features during optimization.
         model_file_prefix (str): Prefix for model files.
             Each model will be saved as `model_file_prefix`_`forcecall_counter`.json
@@ -151,7 +250,7 @@ def ufmin(initial_structure = "POSCAR",
         normalize_forces (bool): Whether or not to normalize features by max true force value.
         true_forcecall_always (bool): If true, evaluates the true calculator even during sub-optimization on the UF3 surface.
             For analysis purposes.
-        resume (int): Start from scratch if 0.
+        resume (int): Start from scratch if 0. If non-zero, then `structure_input` is ignored.
     """
 
     ufmin_true_fmax_squared = ufmin_true_fmax ** 2
@@ -159,10 +258,20 @@ def ufmin(initial_structure = "POSCAR",
 
     if resume:
         # load existing files to resume process
-        print("RESUMING")
+        print(f"***RESUMING***\n`structure_input` = {structure_input} will be ignored.")
+
+        try:
+            init_traj = trajectory.Trajectory(initial_data_output_file, mode='r')
+            nimages_start = len(init_traj)
+            traj = [image for image in init_traj]
+            init_traj.close()
+        except FileNotFoundError:
+            sys.exit(f"Initial data file {initial_data_output_file} does not exist. Cannot resume.")
+
         try:
             opt_traj = trajectory.Trajectory(opt_traj_file, mode='r')
-            traj = [image for image in opt_traj]
+            for image in opt_traj:
+                traj.append(image)
             opt_traj.close()
             opt_traj = trajectory.Trajectory(opt_traj_file, mode='a')  # open in append mode to add on
         except FileNotFoundError:
@@ -192,7 +301,6 @@ def ufmin(initial_structure = "POSCAR",
             sys.exit("Remove the calculation pickle files before running this script.")
         if os.path.isfile(status_update_file):
             os.remove(status_update_file)
-        traj = list()  # will be training data
         opt_traj = trajectory.Trajectory(opt_traj_file, mode='w')  # to save optimization traj
         model_traj_file = open(model_traj_file, 'wb')
         model_calc_file = open(model_calc_file, 'wb')
@@ -209,55 +317,51 @@ def ufmin(initial_structure = "POSCAR",
     except KeyError:
         n_cores = 1
 
-    if resume:
-        atoms = copy.deepcopy(traj[-1])
-        most_recent_E_eval = atoms.get_potential_energy()
-        most_recent_F_eval = atoms.get_forces()
-    else:
+    if true_calc is None:
+        r_min = 2.22
+        r_cut = 8 * r_min
+        well_depth = 9
+        true_calc = LennardJones(sigma=r_min*(2 ** (-1/6)), epsilon=well_depth, rc=r_cut)
+        true_calc_type = 'lj'
+    print("True calc:", true_calc_type)
+    if true_calc_type == "vasp" and structure_input == "POSCAR":
+        tmp_poscar_name = "POSCAR_" + str(time.time_ns())
+        os.rename("POSCAR", tmp_poscar_name)
 
-        # initial structure
-        if isinstance(initial_structure, str):
-            atoms = read(initial_structure)
-        else:
-            assert isinstance(initial_structure, Atoms)
-            atoms = copy.deepcopy(initial_structure)
+    if not resume:
+        traj = initial_data_prep(structure_input,
+                                 nimages_start,
+                                 bspline_config,
+                                 true_calc,
+                                 true_calc_type,
+                                 ufmin_true_fmax,
+                                 )
+        nimages_start = len(traj)
+        init_traj = trajectory.Trajectory(initial_data_output_file, mode='w')
+        for atoms in traj:
+            init_traj.write(atoms)
+        init_traj.close()
 
-        # preprocess
-        pair_tuples = bspline_config.interactions_map[2]
-        atoms = preprocess(atoms, pair_tuples, strength=preprocess_strength)
+        # featurize all but the last image in traj
+        #if len(traj) > 1:
+        #    with concurrent.futures.ProcessPoolExecutor(max_workers=n_cores) as executor:
+        #        df_features = executor.submit(uf3_run.featurize,
+        #                                    bspline_config,
+        #                                    traj[:-1],
+        #                                    settings_file=settings_file,
+        #                                    data_prefix='-1',  # match the initial image_prefix
+        #                                    verbose=verbose
+        #                                    ).result()
+        #    process.save_feature_db(dataframe=df_features, filename=live_features_file)
+        #    del df_features
+        #    combine_features = True
+        #else:
+        #    combine_features = False
 
-        #atoms = "emt_pt38.traj"
-        #atoms = read(atoms, index="587")
-        if true_calc is None:
-            r_min = 2.22
-            r_cut = 8 * r_min
-            well_depth = 9
-            true_calc = LennardJones(sigma=r_min*(2 ** (-1/6)), epsilon=well_depth, rc=r_cut)
-            true_calc_type = 'lj'
-        print("True calc:", true_calc_type)
-        if true_calc_type == "vasp" and initial_structure == "POSCAR":
-            tmp_poscar_name = "POSCAR_" + str(time.time_ns())
-            os.rename("POSCAR", tmp_poscar_name)
-        atoms.calc = true_calc
-        most_recent_E_eval = atoms.get_potential_energy()
-        most_recent_F_eval = atoms.get_forces()
-        if true_calc_type == "vasp":
-            check_vasp_convergence()
-        stripped_calc_atoms = strip_calc(atoms, most_recent_E_eval, most_recent_F_eval)
-        traj.append(stripped_calc_atoms)
-        opt_traj.write(stripped_calc_atoms)
+    atoms = copy.deepcopy(traj[-1])
+    most_recent_E_eval = atoms.get_potential_energy()
+    most_recent_F_eval = atoms.get_forces()
 
-        # UF3 cannot train with a single structure (look at loss function). So take 1 real optimization step to gain another image
-        #dyn = SciPyFminCG(atoms)
-        dyn = optimizer(atoms)
-        dyn.run(steps=1)
-        most_recent_E_eval = atoms.get_potential_energy()
-        most_recent_F_eval = atoms.get_forces()
-        if true_calc_type == "vasp":
-            check_vasp_convergence()
-        stripped_calc_atoms = strip_calc(atoms, most_recent_E_eval, most_recent_F_eval)
-        traj.append(stripped_calc_atoms)
-        opt_traj.write(stripped_calc_atoms)
 
     '''
     # 2-body preconditioning
@@ -301,42 +405,48 @@ def ufmin(initial_structure = "POSCAR",
 
     ### Optimization Loop ###
     if resume:
-        forcecall_counter = len(traj) - 1
-        max_forcecalls = forcecall_counter + resume - 1  # -1 because of the way the outer while loop termination was written
+        forcecall_counter = len(traj) - nimages_start + 1
+        max_forcecalls = forcecall_counter + resume - 1
+        combine_features = True
     else:
-        forcecall_counter = 1  # already have forcecalls 0 and 1 from the setup stage
+        forcecall_counter = 1
+        combine_features = False
+    image_prefix = forcecall_counter - 2
+    model_number = forcecall_counter - 1
+
 
     while True:  # minimization on true energy surface
         # train UF3
-        if forcecall_counter > 1:
+        if combine_features:
             atoms_to_featurize = traj[-1]  # only featurize the newest image to save computation on previously computed images
-            combine_features = True
-        else:  # 1st iteration of this loop
+        else:
             atoms_to_featurize = traj
-            combine_features = False
         with concurrent.futures.ProcessPoolExecutor(max_workers=n_cores) as executor:
             df_features = executor.submit(uf3_run.featurize,
                                           bspline_config,
                                           atoms_to_featurize,
                                           settings_file=settings_file,
-                                          data_prefix=str(forcecall_counter),
+                                          data_prefix=str(image_prefix),
                                           verbose=verbose
                                           ).result()
         #df_features = uf3_run.featurize(bspline_config, atoms_to_featurize, settings_file=settings_file, data_prefix=str(forcecall_counter), verbose=verbose)
+
+        # load previously generated features file and combine with new features
         if combine_features:
-            # load previously generated features file and combine with new features
             prev_features = uf3_run.load_all_features(live_features_file)
             df_features = pd.concat( [prev_features, df_features] )
             os.remove(live_features_file)
             del prev_features
+        else:
+            combine_features = True
         process.save_feature_db(dataframe=df_features, filename=live_features_file)
 
-        if pretrained_models is None or pretrained_models.get(forcecall_counter, None) is None:
-            sample_weights = generate_sample_weights(forcecall_counter, sample_weight_strength)
+        if pretrained_models is None or pretrained_models.get(model_number, None) is None:
+            sample_weights = generate_sample_weights(image_prefix, sample_weight_strength, nimages_start=nimages_start)
             if model_file_prefix is None:
                 model_file = None
             else:
-                model_file = model_file_prefix + "_" + str(forcecall_counter) + ".json"
+                model_file = model_file_prefix + "_" + str(model_number) + ".json"
             with concurrent.futures.ProcessPoolExecutor(max_workers=n_cores) as executor:
                 model = executor.submit(uf3_run.train,
                                         df_features,
@@ -354,25 +464,12 @@ def ufmin(initial_structure = "POSCAR",
             #                      learning_weight=learning_weight,
             #                      regularization_values=regularization_values)
         else:
-            model_file = pretrained_models[forcecall_counter]
+            model_file = pretrained_models[model_number]
             model = least_squares.WeightedLinearModel.from_json(model_file)
         del df_features
         #model = "entire_traj_training/model.json"
         #model = least_squares.WeightedLinearModel.from_json(model)
         #y_e, p_e, y_f, p_f, rmse_e, rmse_f, mae_e, mae_f = uf3_run.calculate_errors(model, df_features)
-
-        '''
-        # preprocessing for delta method UQ
-        x_e_train, y_e_train, x_f_train, y_f_train = delta_uq.get_energy_force(df_features)
-        p_e_train = model.predict(x_e_train)
-        p_f_train = model.predict(x_f_train)
-        mae_e = least_squares.mae_metric(p_e_train, y_e_train)
-        mae_f = least_squares.mae_metric(p_f_train, y_f_train)
-        p = delta_uq.get_hessian_inv(model.coefficients, np.vstack((x_e_train,x_f_train)), np.concatenate((y_e_train,y_f_train)))
-        uq_e_train = delta_uq.get_uncertainty(x_e_train, model.coefficients, p, scale=mae_e)
-        uq_f_train = delta_uq.get_uncertainty(x_f_train, model.coefficients, p, scale=mae_f)
-        uq_e_train_list.append(uq_e_train)
-        uq_f_train_list.append(uq_f_train)'''
 
 
         ### Minimize on UF3 surface ###
@@ -433,15 +530,6 @@ def ufmin(initial_structure = "POSCAR",
                 status = str(forcecall_counter) + ", " + str(ufmin_counter) + ", " + str(step_model_calc_E[-1]) + ", " + str(most_recent_E_eval) + ", " + str(np.sqrt(uf3_fmax_squared)) + "\n"
                 f.write(status)
 
-            '''
-            # delta UQ method
-            uq_features = uf3_run.featurize(bspline_config, true_atoms, settings_file=settings_file, verbose=verbose)  # using true atoms instead of atoms so that forces will also be featurized
-            x_e_test, y_e_test, x_f_test, y_f_test = delta_uq.get_energy_force(uq_features)
-            uq_e_test = delta_uq.get_uncertainty(x_e_test, model.coefficients, p, scale=mae_e)
-            step_uq_e_list.append(uq_e_test)
-            uq_f_test = delta_uq.get_uncertainty(x_f_test, model.coefficients, p, scale=mae_f)
-            step_uq_f_list.append(uq_f_test)
-            '''
             
             #if too_uncertain(traj[-1], atoms) or uf3_fmax_squared < ufmin_uf3_fmax_squared or ufmin_counter > max_uf3_calls:
             high_uncertainty = r_uq_obj.too_uncertain()
@@ -454,7 +542,6 @@ def ufmin(initial_structure = "POSCAR",
         pickle.dump( (step_model_calc_E, step_model_calc_F), model_calc_file )
 
         # evaluate true energy
-        forcecall_counter += 1
         atoms.calc = true_calc
         most_recent_E_eval = atoms.get_potential_energy()
         most_recent_F_eval = atoms.get_forces()
@@ -468,6 +555,10 @@ def ufmin(initial_structure = "POSCAR",
         traj.append(stripped_calc_atoms)
         opt_traj.write(stripped_calc_atoms)
 
+        forcecall_counter += 1
+        image_prefix += 1
+        model_number += 1
+
         # explicit garbage collection
         del step_model_calc_E[:]
         del step_model_calc_F[:]
@@ -479,11 +570,11 @@ def ufmin(initial_structure = "POSCAR",
         
         gc.collect()
 
-        if true_fmax_squared < ufmin_true_fmax_squared or forcecall_counter > max_forcecalls:  # should be a >=, but whatever...
+        if true_fmax_squared < ufmin_true_fmax_squared or forcecall_counter > max_forcecalls:
             break
 
 
-    print("True force calls:", forcecall_counter)
+    print("True force calls:", forcecall_counter-1)
 
     # close open files
     model_traj_file.close()
@@ -500,13 +591,15 @@ def ufmin(initial_structure = "POSCAR",
 
     gc.collect()
 
-    if true_calc_type == "vasp" and initial_structure == "POSCAR":
+    if true_calc_type == "vasp" and structure_input == "POSCAR":
         os.rename(tmp_poscar_name, "POSCAR")
 
 
 if __name__ == "__main__":
     ### VARIABLES ###
-    initial_structure = "POSCAR"
+    structure_input = "POSCAR"
+    nimages_start = 1  # number of images to start with
+    initial_data_output_file = "initial_data.traj"
     live_features_file = "live_features.h5"
     model_file_prefix = "model"  # store model from each step
     settings_file = "settings.yaml"
@@ -589,7 +682,9 @@ if __name__ == "__main__":
 
     ### ==================== ###
 
-    tmp = ufmin(initial_structure,
+    tmp = ufmin(structure_input,
+                nimages_start,
+                initial_data_output_file,
                 live_features_file,
                 model_file_prefix,
                 settings_file,
