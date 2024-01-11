@@ -17,6 +17,7 @@ import numpy as np
 results_dir = "."
 live_features_file = "live_features.h5"
 model_file_prefix = "model"
+init_traj_file = "initial_data.traj"
 opt_traj_file = "ufmin.traj"
 model_traj_file = "ufmin_model.traj"
 model_calc_file = "model_calc.pckl"
@@ -34,7 +35,7 @@ settings_file = "settings.yaml"
 md_features_path = None
 truemin_traj_path = "1/truemin.traj"
 
-plot_2b_xlim = [1.0, 5.3]  # for 2 body potential plotting
+plot_2b_xlim = [1.5, 6.0]  # for 2 body potential plotting
 plot_2b_ylim = [-6, 11]  # for 2 body potential plotting
 plotting_pair = ("Pt", "Pt")
 gif_fps = 0.2  # framerate of gif
@@ -76,9 +77,19 @@ def create_parity_plot_frame(y_i, p_i, rmse_i, y_all, p_all, rmse_all, y_md=None
     plt.savefig(img_filename, transparent=False, facecolor='white')
     plt.close()
 
+init_traj = trajectory.Trajectory( os.path.join(results_dir, init_traj_file), 'r' )
+nimages_start = len(init_traj)
+print(f"{nimages_start} images to start")
+
+init_energies = list()
+init_forces = list()
+for image in init_traj:
+    init_energies.append(image.get_potential_energy())
+    init_forces.append(image.get_forces())
 
 opt_traj = trajectory.Trajectory( os.path.join(results_dir, opt_traj_file), 'r' )
-print(len(opt_traj))
+nimages = len(opt_traj)
+print(f"{nimages} forcecalls")
 
 true_energies = list()
 true_forces = list()
@@ -98,12 +109,11 @@ with open( os.path.join(results_dir, model_calc_file), 'rb' ) as f:
         model_calc_F.append(Fs)    
 print(len(model_calc_E))
 
-n_images = len(true_energies)  # also the number of true force calls
-n_models = n_images - 2
+nmodels = nimages
 
-skip_frames = n_models // 1000 + 1  # skip frames for gif if too many
+skip_frames = nmodels // 1000 + 1  # skip frames for gif if too many
 
-forcecalls = np.arange(0, n_images)  # for plotting
+forcecalls = np.arange(0, nimages)  # for plotting
 
 
 bspline_config = uf3_run.initialize( os.path.join(results_dir, settings_file) )
@@ -144,7 +154,7 @@ previous_model_coeffs = None
 model_diffs = list()
 model_idx = list()
 
-for i in range(1, n_models+1):  # for each model
+for i in range(0, nmodels):  # for each model
     print("model", i)
 
     # load model
@@ -154,10 +164,11 @@ for i in range(1, n_models+1):  # for each model
     model = least_squares.WeightedLinearModel.from_json(model_path)
     
     # load live features dataframe for this model
-    if i == 1:  # 1st model (2 data points)
-        live_features = pd.concat( [live_features, all_features.loc[["1_0", "1_1"]]] )
+    if i == 0:  # 1st model (`nimages_start` data points)
+        init_keys = [str(i-1) + "_" + str(j) for j in range(nimages_start)]  # "-1_0", "-1_1", ...
+        live_features = pd.concat( [live_features, all_features.loc[init_keys]] )
     else:  # not 1st model (new data point)
-        live_features = pd.concat( [live_features, all_features.loc[[str(i) + "_0"]]] )
+        live_features = pd.concat( [live_features, all_features.loc[[str(i-1) + "_0"]]] )  # model i takes in data point i-1
 
     # calculate training error at each stage i
     y_e_i, p_e_i, y_f_i, p_f_i, rmse_e_i, rmse_f_i, mae_e_i, mae_f_i = uf3_run.calculate_errors(model, live_features)
@@ -179,13 +190,13 @@ for i in range(1, n_models+1):  # for each model
 
     # append to frame list to make gif of interaction potentials
     temp_filename = str(time.time_ns()) + ".png"
-    create_2b_potential_frame(model, bspline_config, plotting_pair, i+1, temp_filename)  # label is true force call number
+    create_2b_potential_frame(model, bspline_config, plotting_pair, i, temp_filename)  # label is true force call number
     spline_frames_2b.append( imageio.v2.imread(temp_filename) )
     os.remove(temp_filename)
 
     # append to frame list to make gif of parity plots
     temp_filename = str(time.time_ns()) + ".png"
-    title = "Energy at true force call step " + str(i+1)
+    title = "Energy at true force call step " + str(i)
     create_parity_plot_frame(y_e_i, p_e_i, rmse_e_i, y_e_all, p_e_all, rmse_e_all, y_e_md, p_e_md, rmse_e_md, units="eV", title=title, img_filename=temp_filename)
     energy_rmse_parity_frames.append( imageio.v2.imread(temp_filename) )
     os.remove(temp_filename)
@@ -223,19 +234,19 @@ imageio.mimsave( os.path.join(results_dir, parity_F_gif), force_rmse_parity_fram
 
 # RMSE plot
 rmse_fig, (rmse_e_ax, rmse_f_ax) = plt.subplots(2)
-rmse_e_ax.plot(forcecalls[2:], rmse_e_i_list, color='b', label="Training error")
-rmse_e_ax.plot(forcecalls[2:], rmse_e_all_list, 'r', label="Error wrt full ufmin traj")
+rmse_e_ax.plot(forcecalls, rmse_e_i_list, color='b', label="Training error")
+rmse_e_ax.plot(forcecalls, rmse_e_all_list, 'r', label="Error wrt full ufmin traj")
 if md_features is not None:
-    rmse_e_ax.plot(forcecalls[2:], rmse_e_md_list, 'g', label="Error wrt separate MD traj")
+    rmse_e_ax.plot(forcecalls, rmse_e_md_list, 'g', label="Error wrt separate MD traj")
 #rmse_e_ax.set_xlabel("True force call step")
 rmse_e_ax.set_ylabel("Energy RMSE (eV)")
 rmse_e_ax.tick_params(axis ='y', which = 'minor')
 rmse_e_ax.set_yscale("log")
 #rmse_e_ax.legend(loc="upper right")
-rmse_f_ax.plot(forcecalls[2:], rmse_f_i_list, color='b', label="Training error")
-rmse_f_ax.plot(forcecalls[2:], rmse_f_all_list, 'r', label="Error wrt full ufmin traj")
+rmse_f_ax.plot(forcecalls, rmse_f_i_list, color='b', label="Training error")
+rmse_f_ax.plot(forcecalls, rmse_f_all_list, 'r', label="Error wrt full ufmin traj")
 if md_features is not None:
-    rmse_f_ax.plot(forcecalls[2:], rmse_f_md_list, 'g', label="Error wrt separate MD traj")
+    rmse_f_ax.plot(forcecalls, rmse_f_md_list, 'g', label="Error wrt separate MD traj")
 rmse_f_ax.set_xlabel("True force call step")
 rmse_f_ax.set_ylabel("Force RMSE (eV/A)")
 rmse_f_ax.tick_params(axis ='y', which = 'minor')
@@ -249,6 +260,11 @@ plt.savefig( os.path.join(results_dir, error_plot_png) )
 #========================================================================================================
 ### True energies and max forces at each true force call step ###
 # get true fmax at each true force call step
+init_fmax_list = list()
+for init_force in init_forces:
+    init_force_squared = np.sum( np.square(init_force), axis=1 )
+    init_fmax_list.append( np.sqrt(np.max(init_force_squared)) )
+
 true_fmax_list = list()
 for true_force in true_forces:
     true_force_squared = np.sum( np.square(true_force), axis=1 )
@@ -257,7 +273,9 @@ for true_force in true_forces:
 # plot
 true_calc_fig, true_E_ax = plt.subplots()
 color = 'tab:cyan'
+true_E_ax.plot(np.ones(nimages_start) * -1, init_energies, 'c.')
 true_E_ax.plot(forcecalls, true_energies, 'c')
+true_E_ax.plot([-1, 0], [init_energies[-1], true_energies[0]], 'c')
 true_E_ax.set_xlabel("True force call step")
 true_E_ax.set_ylabel("Energy (eV)", color = 'c')
 true_E_ax.tick_params(axis ='y', labelcolor = 'c', which = 'minor')
@@ -265,7 +283,9 @@ true_E_ax.tick_params(axis ='y', labelcolor = 'c', which = 'minor')
 
 true_F_ax = true_E_ax.twinx()
 color = 'tab:magenta'
+true_F_ax.plot(np.ones(nimages_start) * -1, init_fmax_list, 'm.')
 true_F_ax.plot(forcecalls, true_fmax_list, 'm')
+true_F_ax.plot([-1, 0], [init_fmax_list[-1], true_fmax_list[0]], 'm')
 true_F_ax.set_ylabel("Max force (eV/A)", color = 'm')
 true_F_ax.tick_params(axis ='y', labelcolor = 'm', which = 'minor')
 true_F_ax.set_yscale("log")
@@ -276,29 +296,27 @@ plt.savefig( os.path.join(results_dir, opt_plot_png) )
 with open( os.path.join(results_dir, opt_plot_png + "_obj.pckl"), 'wb' ) as f:
     pickle.dump([true_calc_fig, true_E_ax, true_F_ax], f)
 
-
 #======================================================================================================
 ### True and UF3 energies and max forces at each UF3 force call step ###
 # finishing touches on model_calc_E and calculate UF3 fmax
 model_calc_fmax_list = list()
-for true_call_step in range(1, n_images+1):
-    if true_call_step == 1 or true_call_step == 2:  # 1st 2 steps (does not use UF3)
-        i = true_call_step-1
-        t = [ (true_energies[i], true_energies[i]) ]
-        model_calc_E.insert(i, t)
-        t = [ (true_fmax_list[i], true_fmax_list[i]) ]
-        model_calc_fmax_list.append(t)
-    else:  # all other steps
-        i = true_call_step-3
-        force_pair_list = model_calc_F[i]  # list of tuples of pairs (model F, true F)
-        each_step_fmax_list = list()
-        for force_pair in force_pair_list:
-            uf3_fmax = np.sqrt(np.max(np.sum( np.square(force_pair[0]), axis=1 )))
-            true_fmax = np.sqrt(np.max(np.sum( np.square(force_pair[1]), axis=1 )))
-            each_step_fmax_list.append( (uf3_fmax, true_fmax) )
-        model_calc_fmax_list.append(each_step_fmax_list)
-assert len(model_calc_fmax_list) == n_images
-assert len(model_calc_E) == n_images
+for true_call_step in range(0, nimages):
+    #if true_call_step == 1 or true_call_step == 2:  # 1st 2 steps (does not use UF3)
+    #    i = true_call_step-1
+    #    t = [ (true_energies[i], true_energies[i]) ]
+    #    model_calc_E.insert(i, t)
+    #    t = [ (true_fmax_list[i], true_fmax_list[i]) ]
+    #    model_calc_fmax_list.append(t)
+    i = true_call_step
+    force_pair_list = model_calc_F[i]  # list of tuples of pairs (model F, true F)
+    each_step_fmax_list = list()
+    for force_pair in force_pair_list:
+        uf3_fmax = np.sqrt(np.max(np.sum( np.square(force_pair[0]), axis=1 )))
+        true_fmax = np.sqrt(np.max(np.sum( np.square(force_pair[1]), axis=1 )))
+        each_step_fmax_list.append( (uf3_fmax, true_fmax) )
+    model_calc_fmax_list.append(each_step_fmax_list)
+assert len(model_calc_fmax_list) == nimages
+assert len(model_calc_E) == nimages
 
 # plot
 model_calc_fig, model_calc_E_ax = plt.subplots()
@@ -309,20 +327,24 @@ model_calc_E_ax.set_xlabel("Force call step (true and UF3)")
 model_calc_fmax_ax.set_ylabel("Max force (eV/A)", color='r')
 model_calc_E_ax.set_ylabel("Energy (eV)", color='b')
 p1, p2, p3, p4 = None, None, None, None  # uninitialized
-all_calls_counter = 1
-for true_call_step in range(1, n_images+1):
-    i = true_call_step - 1
+all_calls_counter = 0
+for true_call_step in range(0, nimages):
+    i = true_call_step
     e = np.array(model_calc_E[i])
     f = np.array(model_calc_fmax_list[i])
     assert len(e) == len(f)
     call_numbers = np.arange(all_calls_counter, all_calls_counter+len(e))
-    all_calls_counter += len(e)
+    all_calls_counter += len(e) - 1  # -1 because of overlap between steps
     p1 = model_calc_fmax_ax.plot(call_numbers, f[:, 0], 'r-', linewidth=0.6, label="UF3 max force")
     p2 = model_calc_fmax_ax.plot(call_numbers, f[:, 1], 'm--', linewidth=0.6, label="True max force")
     p3 = model_calc_E_ax.plot(call_numbers, e[:, 0], 'b-', linewidth=0.6, label="UF3 energy")
     p4 = model_calc_E_ax.plot(call_numbers, e[:, 1], 'c--', linewidth=0.6, label="True energy")
     
     # plot each true call step with bolder markers
+    model_calc_fmax_ax.plot(call_numbers[0], f[0, 0], 'r.', markersize=5)
+    model_calc_fmax_ax.plot(call_numbers[0], f[0, 1], 'm.', markersize=5)
+    model_calc_E_ax.plot(call_numbers[0], e[0, 0], 'b.', markersize=5)
+    model_calc_E_ax.plot(call_numbers[0], e[0, 1], 'c.', markersize=5)
     model_calc_fmax_ax.plot(call_numbers[-1], f[-1, 0], 'r.', markersize=5)
     model_calc_fmax_ax.plot(call_numbers[-1], f[-1, 1], 'm.', markersize=5)
     model_calc_E_ax.plot(call_numbers[-1], e[-1, 0], 'b.', markersize=5)
@@ -338,12 +360,8 @@ with open( os.path.join(results_dir, opt_plot_detailed_png + "_obj.pckl"), 'wb' 
     pickle.dump([model_calc_fig, model_calc_E_ax, model_calc_fmax_ax], f)
 #================================================================================================
 # uf3 force call per true force call plot
-forcecalls = np.arange(0, n_images)
-n_uf3_calls = [len(step) for step in model_calc_E]
-n_uf3_calls[0] = 0
-n_uf3_calls[1] = 0
-#n_uf3_calls.insert(0, 0)  # 2nd force call was done before training     REPLACE ABOVE 2 LINES WITH THESE 2 LINES IF SKIPPING DETAILED PLOTTING
-#n_uf3_calls.insert(0, 0)  # 1st force call was done before training
+forcecalls = np.arange(0, nimages)
+n_uf3_calls = [len(step)-1 for step in model_calc_E]
 call_ratio_fig, call_ratio_ax = plt.subplots()
 call_ratio_ax.plot(forcecalls, n_uf3_calls)
 call_ratio_ax.set_xlabel("True force call step")
@@ -362,4 +380,5 @@ plt.savefig( os.path.join(results_dir, model_diff_png) )
 
 #plt.show()
 
+init_traj.close()
 opt_traj.close()

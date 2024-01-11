@@ -8,14 +8,14 @@ nModels = 20
 
 coefficients = dict()
 data_coverages = dict()
-for i in range(1, nModels+1):
+for i in range(0, nModels):
     model_file = "model_" + str(i) + ".json"
     model = least_squares.WeightedLinearModel.from_json(model_file)
     coefficients[i] = model.coefficients
     data_coverages[i] = model.data_coverage
 
 coefficient_change = []
-for i in range(2, nModels+1):
+for i in range(1, nModels):
     change = np.abs((coefficients[i] - coefficients[i-1])/np.minimum(coefficients[i], coefficients[i-1]))
     change = change[data_coverages[i]]  # only coefficients with data coverage
     coefficient_change.append( (i, max(change)) )

@@ -149,12 +149,13 @@ def plot_single_model(model, training_data=None, nAtoms=None, label='',
 
 if __name__ == '__main__':
     n_models = 7
-    for i in range(1, n_models+1):
+    for i in range(0, n_models):
     #i = 7
     #if True:
         print(i)
         model_file = "model_" + str(i) + ".json"
         model_number = i
+        init_traj_file = "initial_data.traj"
         opt_traj_file = "ufmin.traj"
         rspacing = 0.01
         epsilon = 0.0000001
@@ -181,9 +182,13 @@ if __name__ == '__main__':
 
         model = least_squares.WeightedLinearModel.from_json(model_file)
 
-        if opt_traj_file is not None:
+        if opt_traj_file is not None and init_traj_file is not None:
+            init_traj = Trajectory(init_traj_file, 'r')
+            init_training_traj = make_pair_energy_data(init_traj, lj_p)
+            init_traj.close()
             opt_traj = Trajectory(opt_traj_file, 'r')
-            training_traj = make_pair_energy_data(opt_traj[0:model_number+1], lj_p)
+            training_traj = make_pair_energy_data(opt_traj[0:model_number], lj_p)
+            training_traj = (init_training_traj[0] + training_traj[0], init_training_traj[1] + training_traj[1])
             nAtoms = len(opt_traj[0])
             opt_traj.close()
         else:

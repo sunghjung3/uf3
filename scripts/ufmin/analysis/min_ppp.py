@@ -209,10 +209,11 @@ if __name__ == "__main__":
 
     results_dir = "."
     model_file_prefix = "model"
+    init_traj_file = "initial_data.traj"
     opt_traj_file = "ufmin.traj"
     model_traj_file = "ufmin_model.traj"
     movie_file = "min_ppp.avi"   # will write at results_dir/movie_file
-    plot_xlim = [1.5, 5]
+    plot_xlim = [1.5, 6]
     plot_ylim = [-15, 20]
     combine_subplots = True
     movie_fps = 3  # framerate of movie
@@ -222,9 +223,18 @@ if __name__ == "__main__":
     lj_p = functools.partial(lj, r_min, well_depth)  # the true radial potential
 
     #============================================
-
+    init_traj = Trajectory( os.path.join(results_dir, init_traj_file), 'r' )
+    nimages_start = len(init_traj)
+    traj = list()
+    for image in init_traj:
+        traj.append(image)
+    init_traj.close()
     opt_traj = Trajectory( os.path.join(results_dir, opt_traj_file), 'r' )
-    print(len(opt_traj))
+    nimages = len(opt_traj)
+    for image in opt_traj:
+        traj.append(image)
+    opt_traj.close()
+    print(nimages)
 
     with open( os.path.join(results_dir, model_traj_file), 'rb' ) as f:
         model_traj = list()
@@ -237,12 +247,11 @@ if __name__ == "__main__":
     print(len(model_traj))
 
     n_models = len(model_traj)
-    n_images = len(opt_traj)  # also the number of true force calls
-    assert n_models + 2 == n_images
+    assert n_models == nimages
 
 
     frames = list()
-    for i in range(1, n_models+1):  # for each model
+    for i in range(0, n_models):  # for each model
         print("model", i)
 
         # load model
@@ -251,8 +260,8 @@ if __name__ == "__main__":
             raise Exception(f"{model_path} does not exist.")
         model = least_squares.WeightedLinearModel.from_json(model_path)
 
-        min_traj = model_traj[i-1]
-        training_traj = opt_traj[0:i+1]
+        min_traj = model_traj[i]
+        training_traj = traj[0:nimages_start+i]
         frames += opt_pair_pot_frames(lj_p, min_traj, model=model, training_traj=training_traj, xlim=plot_xlim, ylim=plot_ylim, label=str(i), combine=combine_subplots)
         frames.append(frames[-1])  # duplicate last frame of each UF3 minimization
         frames.append(frames[-1])  # duplicate again
@@ -265,4 +274,3 @@ if __name__ == "__main__":
     cv2.destroyAllWindows()
     movie.release()
 
-    opt_traj.close()
