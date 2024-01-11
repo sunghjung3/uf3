@@ -32,7 +32,7 @@ from uf3.data import geometry, composition
 import r_uq
 from preprocess import preprocess
 
-import copy, sys, time, os, glob, pickle, gc, concurrent
+import copy, sys, time, os, glob, pickle, gc, concurrent, warnings
 
 #from memory_profiler import profile
 
@@ -92,6 +92,11 @@ def check_vasp_convergence(vasprun_file="vasprun.xml") -> bool:
     if Vasprun(vasprun_file).converged_electronic:
         return True
     raise ValueError("VASP calculation did not converge. Terminating UFMin.")
+
+def status_message(*args, column_width=12):
+    formatted_row = [format(num, f'>{column_width}.7g') for num in args]
+    return ' '.join(formatted_row)
+
 
 def initial_data_prep(structure_input,
                       nimages_start,
@@ -287,6 +292,10 @@ def ufmin(structure_input = "POSCAR",
 
         if not os.path.isfile(live_features_file):
             sys.exit(f"Live features file {live_features_file} does not exist. Cannot resume.")
+        
+        if not os.path.isfile(status_update_file):
+            warnings.warn(f"Status update file {status_update_file} does not exist. Creating new file.")
+        status_file = open(status_update_file, 'a')
 
 
     else:  # start from scratch
@@ -304,6 +313,7 @@ def ufmin(structure_input = "POSCAR",
         opt_traj = trajectory.Trajectory(opt_traj_file, mode='w')  # to save optimization traj
         model_traj_file = open(model_traj_file, 'wb')
         model_calc_file = open(model_calc_file, 'wb')
+        status_file = open(status_update_file, 'w')
 
 
     ### Set up ###
@@ -489,19 +499,34 @@ def ufmin(structure_input = "POSCAR",
         dyn = optimizer(atoms)
         step_model_calc_E = list()  # store model calc values for this UF3 minimization step. Will eventually be appended to model_calc_E
         step_model_calc_F = list()
+        e_val = atoms.get_potential_energy()
+        f_val = atoms.get_forces()
+        true_e_val = most_recent_E_eval
+        true_f_val = most_recent_F_eval
+        step_model_calc_E.append( (e_val, true_e_val) )
+        step_model_calc_F.append( (f_val, true_f_val) )
+        true_forces_squared = np.sum( np.square(true_f_val), axis=1 )
+        true_fmax_squared = np.max(true_forces_squared)
+        uf3_forces_squared = np.sum( np.square(f_val), axis=1 )
+        uf3_fmax_squared = np.max(uf3_forces_squared)
         step_traj = list()
         tmp_atoms = copy.deepcopy(atoms)
         del tmp_atoms.calc
         step_traj.append(tmp_atoms)
 
-        # minimization on UF3
         ufmin_counter = 0
+        #status = str(forcecall_counter) + ", " + str(ufmin_counter) + ", " + str(e_val) + ", " + str(true_e_val) + ", " + str(np.sqrt(uf3_fmax_squared)) + ", " + str(np.sqrt(true_fmax_squared)) + "\n"
+        #status = str(forcecall_counter) + "\t" + str(ufmin_counter) + "\t" + "{0:.7g}".format(e_val) + "\t" + "{0:.7g}".format(true_e_val) + "\t" + "{0:.7g}".format(np.sqrt(uf3_fmax_squared)) + "\t" + "{0:.7g}".format(np.sqrt(true_fmax_squared)) + "\n"
+        status_file.write(status_message(forcecall_counter, ufmin_counter, e_val, true_e_val, np.sqrt(uf3_fmax_squared), np.sqrt(true_fmax_squared)) + "\n")
+        status_file.flush()
+
+        # minimization on UF3
         while True:
             #dyn.run(steps=1, fmax=0.00000000001)  # set force tolerance to a super small number so that this doesn't get in the way of this while loop  FOR SCIPY OPTS
             dyn.run(steps=ufmin_counter+1, fmax=0.000000000001)
             ufmin_counter += 1
 
-            # compare with true energy and froces at this point
+            # compare with true energy and forces at this point
             e_val = atoms.get_potential_energy()
             f_val = atoms.get_forces()
             if true_forcecall_always:
@@ -509,6 +534,8 @@ def ufmin(structure_input = "POSCAR",
                 true_atoms.calc = true_calc
                 true_e_val = true_atoms.get_potential_energy()
                 true_f_val = true_atoms.get_forces()
+                true_forces_squared = np.sum( np.square(true_f_val), axis=1 )
+                true_fmax_squared = np.max(true_forces_squared)
                 if true_calc_type == "vasp":
                     check_vasp_convergence()
                 del true_atoms[:]
@@ -520,15 +547,16 @@ def ufmin(structure_input = "POSCAR",
             step_model_calc_F.append( (f_val, true_f_val) )
 
 
-            uf3_forces_squared = np.sum( np.square(step_model_calc_F[-1][0]), axis=1 )
+            uf3_forces_squared = np.sum( np.square(f_val), axis=1 )
             uf3_fmax_squared = np.max(uf3_forces_squared)
             tmp_atoms = copy.deepcopy(atoms)
             del tmp_atoms.calc
             step_traj.append(tmp_atoms)
 
-            with open(status_update_file, 'a') as f:
-                status = str(forcecall_counter) + ", " + str(ufmin_counter) + ", " + str(step_model_calc_E[-1]) + ", " + str(most_recent_E_eval) + ", " + str(np.sqrt(uf3_fmax_squared)) + "\n"
-                f.write(status)
+            #status = str(forcecall_counter) + ", " + str(ufmin_counter) + ", " + str(e_val) + ", " + str(true_e_val) + ", " + str(np.sqrt(uf3_fmax_squared)) + ", " + str(np.sqrt(true_fmax_squared)) + "\n"
+            #status = str(forcecall_counter) + "\t" + str(ufmin_counter) + "\t" + "{0:.7g}".format(e_val) + "\t" + "{0:.7g}".format(true_e_val) + "\t" + "{0:.7g}".format(np.sqrt(uf3_fmax_squared)) + "\t" + "{0:.7g}".format(np.sqrt(true_fmax_squared)) + "\n"
+            status_file.write(status_message(forcecall_counter, ufmin_counter, e_val, true_e_val, np.sqrt(uf3_fmax_squared), np.sqrt(true_fmax_squared)) + "\n")
+            status_file.flush()
 
             
             #if too_uncertain(traj[-1], atoms) or uf3_fmax_squared < ufmin_uf3_fmax_squared or ufmin_counter > max_uf3_calls:
@@ -558,6 +586,7 @@ def ufmin(structure_input = "POSCAR",
         forcecall_counter += 1
         image_prefix += 1
         model_number += 1
+        status_file.write("\n")
 
         # explicit garbage collection
         del step_model_calc_E[:]
@@ -580,6 +609,7 @@ def ufmin(structure_input = "POSCAR",
     model_traj_file.close()
     model_calc_file.close()
     opt_traj.close()
+    status_file.close()
 
 
     # explicit garbage collection
