@@ -1,5 +1,5 @@
 from ase.io import read
-from ase.io import trajectory
+from ase.io import trajectory, ulm
 from ase.atoms import Atoms
 import ase.data as ase_data
 
@@ -98,36 +98,50 @@ def status_message(*args, column_width=12):
     return ' '.join(formatted_row)
 
 
+def read_data(input):
+    if isinstance(input, str):
+        # structure file or trajectory file
+        try:
+            input = trajectory.Trajectory(input, mode='r')
+            tmp = list()
+            for atoms in input:
+                tmp.append(copy.deepcopy(atoms))
+            input.close()
+            input = tmp
+        except ulm.InvalidULMFileError:
+            atoms = read(input)
+            input = [atoms]
+    elif isinstance(input, Atoms):
+        input = [copy.deepcopy(input)]
+    elif isinstance(input, trajectory.TrajectoryReader):
+        tmp = list()
+        for atoms in input:
+            tmp.append(copy.deepcopy(atoms))
+        input.close()
+        input = tmp
+    else:
+        raise TypeError("Input must be a structure file, trajectory file, or ASE Atoms object.")
+    return input
+
+
 def initial_data_prep(structure_input,
                       nimages_start,
                       bspline_config,
                       true_calc,
                       true_calc_type,
                       conv_fmax,
+                      preprocess_strength
                       ):
     '''
     Read in initial data/structure and calculate energy and forces (if necessary).
     '''
-    if isinstance(structure_input, str):
-        # structure file or trajectory file
-        try:
-            structure_input = trajectory.Trajectory(structure_input, mode='r')
-        except:
-            atoms = read(structure_input)
-            structure_input = [atoms]
-    else:
-        # ase.Atoms object or List[ase.Atoms] or trajectory.Trajectory
-        if isinstance(structure_input, Atoms):
-            structure_input = [copy.deepcopy(structure_input)]
-        elif isinstance(structure_input, trajectory.TrajectoryReader):
-            structure_input = copy.deepcopy(structure_input)
-        else:
-            assert isinstance(structure_input, list)
-            tmp = list()
-            for atoms in structure_input:
-                assert isinstance(atoms, Atoms)
-                tmp.append(copy.deepcopy(atoms))
-            structure_input = tmp
+    if not isinstance(structure_input, list):
+        structure_input = read_data(structure_input)
+    else:  # list
+        tmp = list()
+        for subdata in structure_input:
+            tmp.extend(read_data(subdata))
+        structure_input = tmp
 
     # preprocess all image in traj
     pair_tuples = bspline_config.interactions_map[2]
@@ -136,6 +150,8 @@ def initial_data_prep(structure_input,
         print("Preprocessing image", i)
         preprocessed_atoms = preprocess(atoms, pair_tuples, strength=preprocess_strength)
         traj.append(preprocessed_atoms)
+    del structure_input[:]
+    del structure_input
 
     # calculate energy and forces for all images in traj
     for i, atoms in enumerate(traj):
@@ -345,6 +361,7 @@ def ufmin(structure_input = "POSCAR",
                                  true_calc,
                                  true_calc_type,
                                  ufmin_true_fmax,
+                                 preprocess_strength,
                                  )
         nimages_start = len(traj)
         init_traj = trajectory.Trajectory(initial_data_output_file, mode='w')

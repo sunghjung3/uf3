@@ -49,7 +49,8 @@ basis:
   knots_path: knots.json  # only if load_knots=yes (read) or dump_knots=yes (write)
 
 data:
-  db_path: "data.db"  # training data file (.db or anything supported by ase.io.read())
+  db_path:  # training data file (.db or anything supported by ase.io.read())
+    - "data.db"
 features:
   features_path: "df_features.h5"  # file name to write featurizations (h5 file)
   n_cores: 16  # number of cores to use in featurization (default: 16)

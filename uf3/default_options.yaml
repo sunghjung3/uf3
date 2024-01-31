@@ -4,7 +4,8 @@ degree: 2
 seed: 0
 
 data:
-    db_path: data.db
+    db_path:
+    data_prefix:
     max_per_file: -1
     min_diff: 0.0
     generate_stats: yes
@@ -54,3 +55,4 @@ learning:
         curvature_2b: 1.0e-16
         curvature_3b: 1.0e-16
     normalize_residual: yes
+    sample_weights:

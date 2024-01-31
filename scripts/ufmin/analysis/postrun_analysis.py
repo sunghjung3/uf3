@@ -39,6 +39,7 @@ plot_2b_xlim = [1.5, 6.0]  # for 2 body potential plotting
 plot_2b_ylim = [-6, 11]  # for 2 body potential plotting
 plotting_pair = ("Pt", "Pt")
 gif_fps = 0.2  # framerate of gif
+ufmin_true_fmax = 0.01
 
 #=======================================================================================================
 def create_2b_potential_frame(model, bspline_config, pair, label, img_filename):
@@ -289,7 +290,7 @@ true_F_ax.plot([-1, 0], [init_fmax_list[-1], true_fmax_list[0]], 'm')
 true_F_ax.set_ylabel("Max force (eV/A)", color = 'm')
 true_F_ax.tick_params(axis ='y', labelcolor = 'm', which = 'minor')
 true_F_ax.set_yscale("log")
-true_F_ax.axhline(y=0.01, color='r', linestyle='--')
+true_F_ax.axhline(y=ufmin_true_fmax, color='r', linestyle='--')
 
 true_calc_fig.suptitle("UF3-accelerated Optimization")
 plt.savefig( os.path.join(results_dir, opt_plot_png) )
@@ -350,7 +351,7 @@ for true_call_step in range(0, nimages):
     model_calc_E_ax.plot(call_numbers[-1], e[-1, 0], 'b.', markersize=5)
     model_calc_E_ax.plot(call_numbers[-1], e[-1, 1], 'c.', markersize=5)
 
-model_calc_fmax_ax.axhline(y=0.01, color='r', linestyle='--')   # horizontal line at force convergence
+model_calc_fmax_ax.axhline(y=ufmin_true_fmax, color='r', linestyle='--')   # horizontal line at force convergence
 ps = p1 + p2 + p3 + p4
 labs = [l.get_label() for l in ps]
 model_calc_fmax_ax.legend(ps, labs, loc='upper right')

@@ -113,8 +113,6 @@ def resolve_input_conflict(passed_value, settings_dict: dict, settings_key: str,
     def args_over_settings(arg_value, settings_dict: dict, settings_key: str, name: str) -> str:
         if arg_value is None:
             try:
-                if name == "features file name":
-                    print(settings_dict)
                 arg_value = settings_dict[settings_key]
             except KeyError:
                 warnings.warn(f"{name} not provided anywhere. It will not be read or written.")
@@ -122,10 +120,12 @@ def resolve_input_conflict(passed_value, settings_dict: dict, settings_key: str,
         return arg_value
 
     def settings_over_args(arg_value, settings_dict: dict, settings_key: str, name: str) -> str:
-        arg_value = settings_dict.get(settings_key, arg_value)
-        if arg_value is None:
+        settings_value = settings_dict.get(settings_key, None)
+        if settings_value is None:
+            settings_value = arg_value
+        if settings_value is None:
             warnings.warn(f"{name} not provided anywhere. It will not be read or written.")
-        return arg_value
+        return settings_value
 
     if override:
         return args_over_settings(passed_value, settings_dict, settings_key, name)
@@ -257,11 +257,11 @@ def initialize(settings_file: str = "settings.yaml",
 
 
 def featurize(bspline_config: bspline.BSplineBasis,
-              data: Atoms | List[Atoms] | str = None,
+              data: Atoms | List[Atoms] | str | List[str] = None,
               features_file: str = None,
               zbl_scale: float = None,
               settings_file: str = "settings.yaml",
-              data_prefix: str = None,
+              data_prefix: str | List[str] = None,
               return_df_data: bool = False,
               override: bool = True,
               overwrite: bool = True,
@@ -273,8 +273,8 @@ def featurize(bspline_config: bspline.BSplineBasis,
     Args:
         bspline_config (bspline.BSplineBasis): B-spline basis configurations for training;
             Return value from uf3_run.initialize()
-        data (ase.atoms.Atoms | str): training data, either Atoms object(s), file name, or directory name.
-            File can be any format supported by ase.io.read() or additional database formats supported by
+        data (ase.atoms.Atoms | str): training data, either Atoms object(s) or file name(s).
+            Files can be any format supported by ase.io.read() or additional database formats supported by
             uf3.data.io.parse_trajectory().
             If passing in Atoms object(s), the current UF3 implementation recommends that Atoms.get_potential_energy() and 
             Atoms.get_forces() have been called before.
@@ -284,10 +284,11 @@ def featurize(bspline_config: bspline.BSplineBasis,
             ZBL potential is scaled by this value.
         settings_file (str): name of the settings file (default: settings.yaml).
             For an example of the content, see "defaults_options.yaml" at `uf3.__file__` (execute this in Python to see path)
-        data_prefix (str): prefix for data and features labeling.
+        data_prefix (str | List[str]): prefix for data and features labeling.
             Useful for debugging if data/features from multiple sources will eventually be combined.
-            If data is read from a file, takes the filename as the default prefix.
-            If data is read from an Atoms object, takes the current time (time.time_ns()) as the default prefix.
+            If `data` is a list of files, `data_prefix` must be a list of strings of the same length as `data`.
+            If `data` is read from a file, takes the filename as the default prefix.
+            If `data` is read from an Atoms object, takes the current time (time.time_ns()) as the default prefix.
         return_df_data (bool): returns Pandas dataframe of the training data created during the featurization process if True,
             in addition to the features dataframe (default: False)
         override (bool): these inputs override any conflicting values in the settings file in case of a conflict (default: True)
@@ -312,30 +313,52 @@ def featurize(bspline_config: bspline.BSplineBasis,
     data = resolve_input_conflict(data, data_settings, "db_path", "data", override)
     if data is None:
         raise Exception("You must provide training data.")
+    data_prefix = resolve_input_conflict(data_prefix, data_settings, "data_prefix", "data prefix", override)
     features_file = resolve_input_conflict(features_file, features_settings, "features_path", "features file name", override)
     model_settings = settings.get("model", dict())
     zbl_scale = resolve_input_conflict(zbl_scale, model_settings, "zbl_scale", "zbl_scale", override)
     logger(f"* data: {data}", message_verbosity=2)
+    logger(f"* data_prefix: {data_prefix}", message_verbosity=2)
     logger(f"* features_file: {features_file}", message_verbosity=2)
     logger(f"* zbl_scale: {zbl_scale}", message_verbosity=2)
 
     # read training data and create dataframe
     data_coordinator = io.DataCoordinator()
-    if isinstance(data, str):  # data is a file or directory
-        try:  # single file
-            if data_prefix is None:
-                data_prefix = data
-            data_coordinator.dataframe_from_trajectory(data, prefix=data_prefix)
-        except:  # maybe a directory of files
-            for datafile in os.listdir(data):  # iterate through all files in the directory
-                if data_prefix is None:
-                    data_prefix = datafile
-                data_coordinator.dataframe_from_trajectory(datafile, prefix=data_prefix)
+    if isinstance(data, str):  # data is a single file
+        if data_prefix is None:
+            data_prefix = data
+        elif isinstance(data_prefix, list):
+            try:
+                assert len(data_prefix) == 1
+            except:
+                raise ValueError(f"Length of data_prefix must be 1.")
+            data_prefix = data_prefix[0]
+        data_coordinator.dataframe_from_trajectory(data, prefix=data if data_prefix is None else data_prefix)
+    elif isinstance(data, list) and isinstance(data[0], str):  # data is a list of files
+        if isinstance(data_prefix, str):
+            data_prefix = [data_prefix] * len(data)
+        elif isinstance(data_prefix, list) and len(data_prefix) == 1:
+            data_prefix = data_prefix * len(data)
+        elif data_prefix is None:
+            data_prefix = [datafile for datafile in data]
+        else:
+            try:
+                assert len(data_prefix) == len(data)
+            except:
+                raise ValueError(f"Length of data_prefix must be 1 or equal to the number of provided input files.")
+        for i, datafile in enumerate(data):
+            data_coordinator.dataframe_from_trajectory(datafile, prefix=data_prefix[i])
     else:  # data is an Atoms object or a list of them
         if isinstance(data, Atoms):
             data = [data]  # list of Atoms objects
         if data_prefix is None:
             data_prefix = str(time.time_ns())
+        elif isinstance(data_prefix, list):
+            try:
+                assert len(data_prefix) == 1
+            except:
+                raise ValueError(f"Length of data_prefix must be 1.")
+            data_prefix = data_prefix[0]
         try:
             data_coordinator.dataframe_from_lists(data, prefix=data_prefix, copy=False)  # TODO: probably have to add prefix as input to function to consolidate multiple h5 files during active learning
         except:
@@ -441,7 +464,12 @@ def train(features: pd.DataFrame | str | Tuple[np.ndarray, np.ndarray, np.ndarra
     model_file = resolve_input_conflict(model_file, model_settings, "model_path", "model file name", override)
     zbl_scale = resolve_input_conflict(zbl_scale, model_settings, "zbl_scale", "zbl_scale", override)
     logger(f"* model_file: {model_file}", message_verbosity=2)
+    sample_weights = resolve_input_conflict(sample_weights, learning_settings, "sample_weights", "sample weights", override)
+    logger(f"* sample_weights: {sample_weights}", message_verbosity=2)
     if isinstance(features, tuple):
+        if sample_weights is not None:
+            logger("Sample_weights will not be used for training if features are not passed as a dataframe or a filename.",
+                   message_verbosity=0)
         x_e, y_e, x_f, y_f = features
     else:
         if isinstance(features, str):
@@ -583,8 +611,8 @@ if __name__ == "__main__":  # if this script is called from command line instead
         parser.add_argument("-s", "--settings", help=
     """name of the settings file (default: settings.yaml)""",
                             default="settings.yaml")
-        parser.add_argument("-d", "--data", help=
-    """name of training data file. Either a file or a directory.
+        parser.add_argument("-d", "--data", nargs='+', help=
+    """name of training data file(s). Either a file or a list of files.
     Files can be any format supported by ase.io.read() or additional database formats
     supported by uf3.data.io.parse_trajectory().""",
                             default=None)
@@ -621,7 +649,7 @@ if __name__ == "__main__":  # if this script is called from command line instead
 
     args = parse_args()
     settings_file = args.settings
-    data_file = args.data
+    data_files = args.data
     model_file = args.model  # file to save the model after training
     features_file = args.features
     featurize_only = args.d2f
@@ -638,7 +666,7 @@ if __name__ == "__main__":  # if this script is called from command line instead
 
     if full_run or featurize_only:
         df_features = featurize(bspline_config,
-                             data=data_file,
+                             data=data_files,
                              features_file=features_file,
                              settings_file=settings_file,
                              override=override,

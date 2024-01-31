@@ -5,7 +5,12 @@ degree: 2
 seed: 1234
 
 data:
-    db_path: data_all.db
+    db_path:
+      - data_1.db
+      - data_2.db
+    data_prefix:
+      - data_1
+      - data_2
     max_per_file: -1
     min_diff: 0
     generate_stats: True
@@ -55,5 +60,6 @@ learning:
         curvature_1b: 0.0
         curvature_2b: 1.0e-9 
         curvature_3b: 1.0e-6
-
+    sample_weights:
+        "data_49": 64.0
 
