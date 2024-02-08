@@ -150,9 +150,9 @@ class UFCalculator(ase_calc.Calculator):
 
 
     def _get_potential_energy(self,
-                             atoms: ase.Atoms = None,
-                             force_consistent: bool = None
-                             ) -> float:
+                              atoms: ase.Atoms = None,
+                              force_consistent: bool = None
+                              ) -> float:
         """Evaluate the total energy of a configuration."""""
         if any(atoms.pbc):
             supercell = geometry.get_supercell(atoms, r_cut=self.r_cut)
@@ -185,8 +185,8 @@ class UFCalculator(ase_calc.Calculator):
         return energy
 
     def _energy_2b(self,
-                  atoms,
-                  supercell):
+                   atoms,
+                   supercell):
         pair_tuples = self.interactions_map[2]
         distances_map = distances.distances_by_interaction(atoms,
                                                            pair_tuples,
@@ -218,8 +218,8 @@ class UFCalculator(ase_calc.Calculator):
         return energy
 
     def _energy_3b(self,
-                  atoms,
-                  supercell):
+                   atoms,
+                   supercell):
         energy = 0.0
 
         trio_list = self.bspline_config.interactions_map[3]
@@ -410,9 +410,9 @@ class UFCalculator(ase_calc.Calculator):
     #     return f_accumulate
 
     def _get_stress(self,
-                   atoms: ase.Atoms = None,
-                   **kwargs
-                   ) -> np.ndarray:
+                    atoms: ase.Atoms = None,
+                    **kwargs
+                    ) -> np.ndarray:
         """Return the (numerical) stress."""
         return self.calculate_numerical_stress(atoms, **kwargs)
 
