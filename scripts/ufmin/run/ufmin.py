@@ -353,6 +353,7 @@ def ufmin(structure_input = "POSCAR",
     if true_calc_type == "vasp" and structure_input == "POSCAR":
         tmp_poscar_name = "POSCAR_" + str(time.time_ns())
         os.rename("POSCAR", tmp_poscar_name)
+        structure_input = tmp_poscar_name
 
     if not resume:
         traj = initial_data_prep(structure_input,
