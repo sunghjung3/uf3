@@ -3,10 +3,13 @@ This module provides the UFCalculator class for evaluating energies,
 forces, stresses, and other properties using the ASE Calculator protocol.
 """
 
-from typing import List, Dict, Collection, Tuple, Any
+from typing import List, Dict, Collection, Tuple, Any, Callable
 import os
 import time
 import warnings
+import multiprocessing as mp
+import ctypes
+import functools
 import numpy as np
 from scipy import interpolate
 import ase
@@ -54,6 +57,8 @@ class UFCalculator(ase_calc.Calculator):
 
     def __init__(self,
                  model: least_squares.WeightedLinearModel,
+                 n_procs: int = 1,
+                 par_type: str = 'speed',
                  **kwargs):
         super().__init__(**kwargs)
         self.bspline_config = model.bspline_config
@@ -74,6 +79,11 @@ class UFCalculator(ase_calc.Calculator):
         if self.degree > 2:
             self.trio_potentials = construct_trio_potentials(
                 self.solutions, self.bspline_config)
+
+        self.n_procs = n_procs
+        if par_type not in ['speed', 'mem']:
+            raise ValueError("Invalid `par_type`.")
+        self.par_type = par_type  # speed or mem
 
     def __repr__(self):
         summary = ["UFCalculator:",
@@ -140,10 +150,13 @@ class UFCalculator(ase_calc.Calculator):
 
         ase_calc.Calculator.calculate(self, atoms, properties, system_changes)
 
+        print("calculate called")
         if 'energy' or 'free_energy' in properties:
+            print("energy called")
             self.results['energy'] = self._get_potential_energy(atoms)
             self.results['free_energy'] = self.results['energy']
         if 'forces' in properties:
+            print("force called")
             self.results['forces'] = self._get_forces(atoms)
         if 'stress' in properties:
             self.results['stress'] = self._get_stress(atoms)
@@ -165,12 +178,18 @@ class UFCalculator(ase_calc.Calculator):
             e_1b = 0.0
 
         if self.degree >= 2:
+            start = time.time_ns()
             e_2b = self._energy_2b(atoms, supercell)
+            end = time.time_ns()
+            print("2b time:", (end-start)/1e9, "s")
         else:
             e_2b = 0.0
 
         if self.degree >= 3:
+            start = time.time_ns()
             e_3b = self._energy_3b(atoms, supercell)
+            end = time.time_ns()
+            print("3b time:", (end-start)/1e9, "s")
         else:
             e_3b = 0.0
         energy = e_1b + e_2b + e_3b
@@ -256,12 +275,18 @@ class UFCalculator(ase_calc.Calculator):
 
         f_shape = np.zeros((n_atoms, 3))
         if self.degree >= 2:
+            start = time.time_ns()
             f_2b = self._forces_2b(atoms, supercell)
+            end = time.time_ns()
+            print("2b time:", (end-start)/1e9, "s")
         else:
             f_2b = np.zeros_like(f_shape)
 
         if self.degree >= 3:
+            start = time.time_ns()
             f_3b = self._forces_3b(atoms, supercell)
+            end = time.time_ns()
+            print("3b time:", (end-start)/1e9, "s")
         else:
             f_3b = np.zeros_like(f_shape)
         forces = f_2b + f_3b
@@ -306,9 +331,80 @@ class UFCalculator(ase_calc.Calculator):
 
         return forces
 
+    def _force_triplet(self,
+                       triplet_batch,
+                       coords,
+                       matrix,
+                       n_atoms,
+                       trio_list,
+                       n_interactions):
+        forces_chunk = np.zeros((n_atoms, 3))
+        for interaction_idx in range(n_interactions):
+            interaction_data = triplet_batch[interaction_idx]
+            if interaction_data is None:
+                continue
+            spline = self.trio_potentials[trio_list[interaction_idx]]
+            i, r_l, r_m, r_n, ituples = interaction_data
+            drij_dr = distances.compute_direction_cosines(coords,
+                                                          matrix,
+                                                          ituples[:, 0],
+                                                          ituples[:, 1],
+                                                          n_atoms)
+            drik_dr = distances.compute_direction_cosines(coords,
+                                                          matrix,
+                                                          ituples[:, 0],
+                                                          ituples[:, 2],
+                                                          n_atoms)
+            drjk_dr = distances.compute_direction_cosines(coords,
+                                                          matrix,
+                                                          ituples[:, 1],
+                                                          ituples[:, 2],
+                                                          n_atoms)
+            triangles = np.vstack([r_l, r_m, r_n]).T
+            val_l = spline(triangles, nus=np.array([1, 0, 0]))
+            val_m = spline(triangles, nus=np.array([0, 1, 0]))
+            val_n = spline(triangles, nus=np.array([0, 0, 1]))
+            forces_chunk -= np.dot(drij_dr, val_l)
+            forces_chunk -= np.dot(drik_dr, val_m)
+            forces_chunk -= np.dot(drjk_dr, val_n)
+        return forces_chunk
+
+    def _force_triplet_reduce(self,
+                              triplet_batch,
+                              coords,
+                              matrix,
+                              n_atoms,
+                              trio_list,
+                              n_interactions,
+                              ):
+        """
+        Used for parallel 3-body force calculation with `self.par_type=mem` to
+        add to the shared-memory `forces` array with a lock to prevent race conditions.
+        
+        The underlying multiprocessing array of `forces`, called `mp_arr`, must
+        have been initialized for each process using `self._mp_init`.
+        """
+        triplet_force = self._force_triplet(triplet_batch,
+                                            coords,
+                                            matrix,
+                                            n_atoms,
+                                            trio_list,
+                                            n_interactions)
+        forces = np.frombuffer(mp_arr.get_obj()).reshape((n_atoms, 3))
+        with mp_arr.get_lock():
+            forces += triplet_force
+
+    def _mp_init(self, mp_arr_passed):
+        """
+        Initialize shared-memory array for parallel 3-body force calculation
+        with `self.par_type=mem`.
+        """
+        global mp_arr
+        mp_arr = mp_arr_passed
+        
     def _forces_3b(self, atoms, supercell):
+        start = time.time_ns()
         n_atoms = len(atoms)
-        forces = np.zeros((n_atoms, 3))
 
         trio_list = self.bspline_config.interactions_map[3]
         hashes = self.bspline_config.chemical_system.interaction_hashes[3]
@@ -323,36 +419,58 @@ class UFCalculator(ase_calc.Calculator):
                                                               square=True)
         triplet_generator = angles.generate_triplets(
             x_where, y_where, sup_comp, hashes, matrix, knot_sets)
+        end = time.time_ns()
+        print("setup time:", (end-start)/1e9, "s")
 
-        for triplet_batch in triplet_generator:
-            for interaction_idx in range(n_interactions):
-                interaction_data = triplet_batch[interaction_idx]
-                if interaction_data is None:
-                    continue
-                spline = self.trio_potentials[trio_list[interaction_idx]]
-                i, r_l, r_m, r_n, ituples = interaction_data
-                drij_dr = distances.compute_direction_cosines(coords,
-                                                              matrix,
-                                                              ituples[:, 0],
-                                                              ituples[:, 1],
-                                                              n_atoms)
-                drik_dr = distances.compute_direction_cosines(coords,
-                                                              matrix,
-                                                              ituples[:, 0],
-                                                              ituples[:, 2],
-                                                              n_atoms)
-                drjk_dr = distances.compute_direction_cosines(coords,
-                                                              matrix,
-                                                              ituples[:, 1],
-                                                              ituples[:, 2],
-                                                              n_atoms)
-                triangles = np.vstack([r_l, r_m, r_n]).T
-                val_l = spline(triangles, nus=np.array([1, 0, 0]))
-                val_m = spline(triangles, nus=np.array([0, 1, 0]))
-                val_n = spline(triangles, nus=np.array([0, 0, 1]))
-                forces -= np.dot(drij_dr, val_l)
-                forces -= np.dot(drik_dr, val_m)
-                forces -= np.dot(drjk_dr, val_n)
+        if self.n_procs > 1:
+            if self.par_type == 'mem':
+                # Parallelized using multiprocessing where array reduction is
+                # applied with a lock
+                mp_arr = mp.Array(ctypes.c_double, n_atoms * 3)
+                forces = np.frombuffer(mp_arr.get_obj()).reshape((n_atoms, 3))
+                forces[:, :] = 0.0  # initialization
+                start = time.time_ns()
+                with mp.Pool(processes=self.n_procs,
+                            initializer=self._mp_init,
+                            initargs=((mp_arr,))) as pool:
+                    task = functools.partial(self._force_triplet_reduce,
+                                            coords=coords,
+                                            matrix=matrix,
+                                            n_atoms=n_atoms,
+                                            trio_list=trio_list,
+                                            n_interactions=n_interactions,
+                                            )
+                    pool.map(task, triplet_generator)
+                end = time.time_ns()
+                print("parallel time:", (end-start)/1e9, "s")
+            elif self.par_type == 'speed':
+                # Parallelized using multiprocessing where array reduction is
+                # performed at the end
+                start = time.time_ns()
+                with mp.Pool(processes=self.n_procs) as pool:
+                    task = functools.partial(self._force_triplet,
+                                            coords=coords,
+                                            matrix=matrix,
+                                            n_atoms=n_atoms,
+                                            trio_list=trio_list,
+                                            n_interactions=n_interactions,
+                                            )
+                    results = pool.map(task, triplet_generator)
+                    print("results length:", len(results)) 
+                    forces = sum(results)
+                end = time.time_ns()
+                print("parallel time:", (end-start)/1e9, "s")
+            else:
+                raise ValueError("Invalid `par_type`.")
+        else:
+            forces = np.zeros((n_atoms, 3))
+            for triplet_batch in triplet_generator:
+                forces += self._force_triplet(triplet_batch,
+                                            coords,
+                                            matrix,
+                                            n_atoms,
+                                            trio_list,
+                                            n_interactions)
         return forces
 
     # def evaluate_forces_3b(geom: ase.Atoms,
@@ -740,3 +858,22 @@ def regenerate_coefficients(x: np.ndarray,
                                                         y,
                                                         regularizer=matrix)
     return coefficients
+
+
+def locked_reduce(reduce_arr: np.ndarray,
+                  mp_arr: mp.Array,
+                  update_arr: np.ndarray,
+                  ) -> None:
+    """
+    Update shared array with lock with an array returned by a given function.
+
+    Args:
+        reduce_arr (np.ndarray): shared Numpy array.
+        mp_arr (mp.Array): shared Multiprocessing array that underlies
+            `reduce_arr`. Needed to lock the array while reducing.
+            ex: reduce_arr = np.frombuffer(mp_arr.get_obj())
+        update_arr (np.ndarray): Numpy array that is added to `reduced_arr`.
+            Must be size-compatible with `reduce_arr`.
+    """
+    with mp_arr.get_lock():
+        reduce_arr += update_arr
