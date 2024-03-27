@@ -9,6 +9,7 @@ import time
 import warnings
 import multiprocessing as mp
 import ctypes
+import cProfile
 import functools
 import numpy as np
 from scipy import interpolate
@@ -49,6 +50,9 @@ class UFCalculator(ase_calc.Calculator):
 
     Args:
         model (uf3.regression.WeightedLinearModel): fit model to use.
+        n_procs (int): number of processes to use for parallelization.
+            Recommended: 4 - 16.
+        par_type (str): parallelization type. Options: 'speed' or 'mem'.
     """
 
     implemented_properties = ['energy', 'forces']
@@ -251,16 +255,19 @@ class UFCalculator(ase_calc.Calculator):
         dist_matrix, i_where, j_where = angles.identify_ij(atoms,
                                                            knot_sets,
                                                            supercell)
-        triplet_generator = angles.generate_triplets(
-            i_where, j_where, sup_comp, hashes, dist_matrix, knot_sets)
+        i_values, i_groups = angles.group_idx_by_center(i_where, j_where)
 
-        for triplet_batch in triplet_generator:
+        for i_value, i_group in zip(i_values, i_groups):
+            triplet_batch = angles.generate_triplet_batch(i_value, i_group,
+                                                          sup_comp, hashes,
+                                                          dist_matrix,
+                                                          knot_sets)
             for interaction_idx in range(n_interactions):
                 interaction_data = triplet_batch[interaction_idx]
                 if interaction_data is None:
                     continue
                 spline = self.trio_potentials[trio_list[interaction_idx]]
-                i, r_l, r_m, r_n, ituples = interaction_data
+                r_l, r_m, r_n, ituples = interaction_data
                 component = spline(np.vstack([r_l, r_m, r_n]).T)
                 energy += np.sum(component)
         return energy
@@ -332,19 +339,27 @@ class UFCalculator(ase_calc.Calculator):
         return forces
 
     def _force_triplet(self,
-                       triplet_batch,
+                       i_value,
+                       i_group,
+                       sup_comp,
+                       trio_hashes,
                        coords,
                        matrix,
+                       knot_sets,
                        n_atoms,
                        trio_list,
-                       n_interactions):
+                       ):
         forces_chunk = np.zeros((n_atoms, 3))
-        for interaction_idx in range(n_interactions):
+        triplet_batch = angles.generate_triplets(i_value, i_group,
+                                                 sup_comp, trio_hashes,
+                                                 matrix, knot_sets)
+                                                      
+        for interaction_idx in range(len(trio_hashes)):
             interaction_data = triplet_batch[interaction_idx]
             if interaction_data is None:
                 continue
             spline = self.trio_potentials[trio_list[interaction_idx]]
-            i, r_l, r_m, r_n, ituples = interaction_data
+            r_l, r_m, r_n, ituples = interaction_data
             drij_dr = distances.compute_direction_cosines(coords,
                                                           matrix,
                                                           ituples[:, 0],
@@ -370,12 +385,15 @@ class UFCalculator(ase_calc.Calculator):
         return forces_chunk
 
     def _force_triplet_reduce(self,
-                              triplet_batch,
+                              i_value,
+                              i_group,
+                              sup_comp,
+                              trio_hashes,
                               coords,
                               matrix,
+                              knot_sets,
                               n_atoms,
                               trio_list,
-                              n_interactions,
                               ):
         """
         Used for parallel 3-body force calculation with `self.par_type=mem` to
@@ -384,12 +402,16 @@ class UFCalculator(ase_calc.Calculator):
         The underlying multiprocessing array of `forces`, called `mp_arr`, must
         have been initialized for each process using `self._mp_init`.
         """
-        triplet_force = self._force_triplet(triplet_batch,
+        triplet_force = self._force_triplet(i_value,
+                                            i_group,
+                                            sup_comp,
+                                            trio_hashes,
                                             coords,
                                             matrix,
+                                            knot_sets,
                                             n_atoms,
                                             trio_list,
-                                            n_interactions)
+                                            )
         forces = np.frombuffer(mp_arr.get_obj()).reshape((n_atoms, 3))
         with mp_arr.get_lock():
             forces += triplet_force
@@ -408,7 +430,6 @@ class UFCalculator(ase_calc.Calculator):
 
         trio_list = self.bspline_config.interactions_map[3]
         hashes = self.bspline_config.chemical_system.interaction_hashes[3]
-        n_interactions = len(hashes)
         knot_sets = [self.bspline_config.knots_map[trio] for trio in trio_list]
 
         sup_comp = supercell.get_atomic_numbers()
@@ -417,8 +438,10 @@ class UFCalculator(ase_calc.Calculator):
                                                               knot_sets,
                                                               supercell,
                                                               square=True)
-        triplet_generator = angles.generate_triplets(
-            x_where, y_where, sup_comp, hashes, matrix, knot_sets)
+        i_values, i_groups = angles.group_idx_by_center(x_where, y_where)
+        print("number of i_values:", len(i_values))
+        #triplet_generator = angles.generate_triplets(
+        #    x_where, y_where, sup_comp, hashes, matrix, knot_sets)
         end = time.time_ns()
         print("setup time:", (end-start)/1e9, "s")
 
@@ -434,13 +457,17 @@ class UFCalculator(ase_calc.Calculator):
                             initializer=self._mp_init,
                             initargs=((mp_arr,))) as pool:
                     task = functools.partial(self._force_triplet_reduce,
+                                            sup_comp=sup_comp,
+                                            trio_hashes=hashes,
                                             coords=coords,
                                             matrix=matrix,
+                                            knot_sets=knot_sets,
                                             n_atoms=n_atoms,
                                             trio_list=trio_list,
-                                            n_interactions=n_interactions,
                                             )
-                    pool.map(task, triplet_generator)
+                    n_chunks = min(16, 2 * self.n_procs)
+                    pool.starmap(task, zip(i_values, i_groups),
+                                 chunksize=len(i_values)//n_chunks)
                 end = time.time_ns()
                 print("parallel time:", (end-start)/1e9, "s")
             elif self.par_type == 'speed':
@@ -449,28 +476,39 @@ class UFCalculator(ase_calc.Calculator):
                 start = time.time_ns()
                 with mp.Pool(processes=self.n_procs) as pool:
                     task = functools.partial(self._force_triplet,
+                                            sup_comp=sup_comp,
+                                            trio_hashes=hashes,
                                             coords=coords,
                                             matrix=matrix,
+                                            knot_sets=knot_sets,
                                             n_atoms=n_atoms,
                                             trio_list=trio_list,
-                                            n_interactions=n_interactions,
                                             )
-                    results = pool.map(task, triplet_generator)
-                    print("results length:", len(results)) 
+                    n_chunks = min(16, 2 * self.n_procs)
+                    results = pool.starmap(task, zip(i_values, i_groups),
+                                           chunksize=len(i_values)//n_chunks)
+                    red_start = time.time_ns()
                     forces = sum(results)
+                    red_end = time.time_ns()
+                    print("reduction time:", (red_end-red_start)/1e9, "s")
+                    print("results length:", len(results))
                 end = time.time_ns()
                 print("parallel time:", (end-start)/1e9, "s")
             else:
                 raise ValueError("Invalid `par_type`.")
         else:
             forces = np.zeros((n_atoms, 3))
-            for triplet_batch in triplet_generator:
-                forces += self._force_triplet(triplet_batch,
-                                            coords,
-                                            matrix,
-                                            n_atoms,
-                                            trio_list,
-                                            n_interactions)
+            for i_value, i_group in zip(i_values, i_groups):
+                forces += self._force_triplet(i_value,
+                                              i_group,
+                                              sup_comp,
+                                              hashes,
+                                              coords,
+                                              matrix,
+                                              knot_sets,
+                                              n_atoms,
+                                              trio_list,
+                                              )
         return forces
 
     # def evaluate_forces_3b(geom: ase.Atoms,
