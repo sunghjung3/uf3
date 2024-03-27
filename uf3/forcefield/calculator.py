@@ -60,7 +60,7 @@ class UFCalculator(ase_calc.Calculator):
 
     def __init__(self,
                  model: least_squares.WeightedLinearModel,
-                 n_procs: int = 1,
+                 n_procs: int = 16,
                  **kwargs):
         super().__init__(**kwargs)
         self.bspline_config = model.bspline_config
