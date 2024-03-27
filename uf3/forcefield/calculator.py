@@ -52,7 +52,6 @@ class UFCalculator(ase_calc.Calculator):
         model (uf3.regression.WeightedLinearModel): fit model to use.
         n_procs (int): number of processes to use for parallelization.
             Recommended: 4 - 16.
-        par_type (str): parallelization type. Options: 'speed' or 'mem'.
     """
 
     implemented_properties = ['energy', 'forces']
@@ -62,7 +61,6 @@ class UFCalculator(ase_calc.Calculator):
     def __init__(self,
                  model: least_squares.WeightedLinearModel,
                  n_procs: int = 1,
-                 par_type: str = 'speed',
                  **kwargs):
         super().__init__(**kwargs)
         self.bspline_config = model.bspline_config
@@ -85,9 +83,6 @@ class UFCalculator(ase_calc.Calculator):
                 self.solutions, self.bspline_config)
 
         self.n_procs = n_procs
-        if par_type not in ['speed', 'mem']:
-            raise ValueError("Invalid `par_type`.")
-        self.par_type = par_type  # speed or mem
 
     def __repr__(self):
         summary = ["UFCalculator:",
@@ -154,13 +149,10 @@ class UFCalculator(ase_calc.Calculator):
 
         ase_calc.Calculator.calculate(self, atoms, properties, system_changes)
 
-        print("calculate called")
         if 'energy' or 'free_energy' in properties:
-            print("energy called")
             self.results['energy'] = self._get_potential_energy(atoms)
             self.results['free_energy'] = self.results['energy']
         if 'forces' in properties:
-            print("force called")
             self.results['forces'] = self._get_forces(atoms)
         if 'stress' in properties:
             self.results['stress'] = self._get_stress(atoms)
@@ -182,18 +174,12 @@ class UFCalculator(ase_calc.Calculator):
             e_1b = 0.0
 
         if self.degree >= 2:
-            start = time.time_ns()
             e_2b = self._energy_2b(atoms, supercell)
-            end = time.time_ns()
-            print("2b time:", (end-start)/1e9, "s")
         else:
             e_2b = 0.0
 
         if self.degree >= 3:
-            start = time.time_ns()
             e_3b = self._energy_3b(atoms, supercell)
-            end = time.time_ns()
-            print("3b time:", (end-start)/1e9, "s")
         else:
             e_3b = 0.0
         energy = e_1b + e_2b + e_3b
@@ -258,10 +244,10 @@ class UFCalculator(ase_calc.Calculator):
         i_values, i_groups = angles.group_idx_by_center(i_where, j_where)
 
         for i_value, i_group in zip(i_values, i_groups):
-            triplet_batch = angles.generate_triplet_batch(i_value, i_group,
-                                                          sup_comp, hashes,
-                                                          dist_matrix,
-                                                          knot_sets)
+            triplet_batch = angles.generate_triplets(i_value, i_group,
+                                                     sup_comp, hashes,
+                                                     dist_matrix,
+                                                     knot_sets)
             for interaction_idx in range(n_interactions):
                 interaction_data = triplet_batch[interaction_idx]
                 if interaction_data is None:
@@ -282,18 +268,12 @@ class UFCalculator(ase_calc.Calculator):
 
         f_shape = np.zeros((n_atoms, 3))
         if self.degree >= 2:
-            start = time.time_ns()
             f_2b = self._forces_2b(atoms, supercell)
-            end = time.time_ns()
-            print("2b time:", (end-start)/1e9, "s")
         else:
             f_2b = np.zeros_like(f_shape)
 
         if self.degree >= 3:
-            start = time.time_ns()
             f_3b = self._forces_3b(atoms, supercell)
-            end = time.time_ns()
-            print("3b time:", (end-start)/1e9, "s")
         else:
             f_3b = np.zeros_like(f_shape)
         forces = f_2b + f_3b
@@ -396,8 +376,8 @@ class UFCalculator(ase_calc.Calculator):
                               trio_list,
                               ):
         """
-        Used for parallel 3-body force calculation with `self.par_type=mem` to
-        add to the shared-memory `forces` array with a lock to prevent race conditions.
+        Used for parallel 3-body force calculation to add to the shared-memory
+        `forces` array with a lock to prevent race conditions.
         
         The underlying multiprocessing array of `forces`, called `mp_arr`, must
         have been initialized for each process using `self._mp_init`.
@@ -418,14 +398,12 @@ class UFCalculator(ase_calc.Calculator):
 
     def _mp_init(self, mp_arr_passed):
         """
-        Initialize shared-memory array for parallel 3-body force calculation
-        with `self.par_type=mem`.
+        Initialize shared-memory array for parallel 3-body force calculation.
         """
         global mp_arr
         mp_arr = mp_arr_passed
         
     def _forces_3b(self, atoms, supercell):
-        start = time.time_ns()
         n_atoms = len(atoms)
 
         trio_list = self.bspline_config.interactions_map[3]
@@ -439,63 +417,44 @@ class UFCalculator(ase_calc.Calculator):
                                                               supercell,
                                                               square=True)
         i_values, i_groups = angles.group_idx_by_center(x_where, y_where)
-        print("number of i_values:", len(i_values))
-        #triplet_generator = angles.generate_triplets(
-        #    x_where, y_where, sup_comp, hashes, matrix, knot_sets)
-        end = time.time_ns()
-        print("setup time:", (end-start)/1e9, "s")
 
         if self.n_procs > 1:
-            if self.par_type == 'mem':
-                # Parallelized using multiprocessing where array reduction is
-                # applied with a lock
-                mp_arr = mp.Array(ctypes.c_double, n_atoms * 3)
-                forces = np.frombuffer(mp_arr.get_obj()).reshape((n_atoms, 3))
-                forces[:, :] = 0.0  # initialization
-                start = time.time_ns()
-                with mp.Pool(processes=self.n_procs,
-                            initializer=self._mp_init,
-                            initargs=((mp_arr,))) as pool:
-                    task = functools.partial(self._force_triplet_reduce,
-                                            sup_comp=sup_comp,
-                                            trio_hashes=hashes,
-                                            coords=coords,
-                                            matrix=matrix,
-                                            knot_sets=knot_sets,
-                                            n_atoms=n_atoms,
-                                            trio_list=trio_list,
-                                            )
-                    n_chunks = min(16, 2 * self.n_procs)
-                    pool.starmap(task, zip(i_values, i_groups),
-                                 chunksize=len(i_values)//n_chunks)
-                end = time.time_ns()
-                print("parallel time:", (end-start)/1e9, "s")
-            elif self.par_type == 'speed':
-                # Parallelized using multiprocessing where array reduction is
-                # performed at the end
-                start = time.time_ns()
-                with mp.Pool(processes=self.n_procs) as pool:
-                    task = functools.partial(self._force_triplet,
-                                            sup_comp=sup_comp,
-                                            trio_hashes=hashes,
-                                            coords=coords,
-                                            matrix=matrix,
-                                            knot_sets=knot_sets,
-                                            n_atoms=n_atoms,
-                                            trio_list=trio_list,
-                                            )
-                    n_chunks = min(16, 2 * self.n_procs)
-                    results = pool.starmap(task, zip(i_values, i_groups),
-                                           chunksize=len(i_values)//n_chunks)
-                    red_start = time.time_ns()
-                    forces = sum(results)
-                    red_end = time.time_ns()
-                    print("reduction time:", (red_end-red_start)/1e9, "s")
-                    print("results length:", len(results))
-                end = time.time_ns()
-                print("parallel time:", (end-start)/1e9, "s")
-            else:
-                raise ValueError("Invalid `par_type`.")
+            # Parallelized using multiprocessing where array reduction is
+            # applied with a lock
+            mp_arr = mp.Array(ctypes.c_double, n_atoms * 3)
+            forces = np.frombuffer(mp_arr.get_obj()).reshape((n_atoms, 3))
+            forces[:, :] = 0.0  # initialization
+            with mp.Pool(processes=self.n_procs,
+                        initializer=self._mp_init,
+                        initargs=((mp_arr,))) as pool:
+                task = functools.partial(self._force_triplet_reduce,
+                                        sup_comp=sup_comp,
+                                        trio_hashes=hashes,
+                                        coords=coords,
+                                        matrix=matrix,
+                                        knot_sets=knot_sets,
+                                        n_atoms=n_atoms,
+                                        trio_list=trio_list,
+                                        )
+                n_chunks = min(16, 2 * self.n_procs)
+                pool.starmap(task, zip(i_values, i_groups),
+                                chunksize=len(i_values)//n_chunks)
+            ## Parallelized using multiprocessing where array reduction is
+            ## performed at the end
+            #with mp.Pool(processes=self.n_procs) as pool:
+            #    task = functools.partial(self._force_triplet,
+            #                            sup_comp=sup_comp,
+            #                            trio_hashes=hashes,
+            #                            coords=coords,
+            #                            matrix=matrix,
+            #                            knot_sets=knot_sets,
+            #                            n_atoms=n_atoms,
+            #                            trio_list=trio_list,
+            #                            )
+            #    n_chunks = min(16, 2 * self.n_procs)
+            #    results = pool.starmap(task, zip(i_values, i_groups),
+            #                           chunksize=len(i_values)//n_chunks)
+            #    forces = sum(results)
         else:
             forces = np.zeros((n_atoms, 3))
             for i_value, i_group in zip(i_values, i_groups):
