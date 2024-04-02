@@ -691,7 +691,7 @@ if __name__ == "__main__":
     normalize_forces = False
     true_forcecall_always = True
     sample_weight_type = "image_based"
-    sample_weight_strength = 1
+    sample_weight_strength = 6
     resume = 0
 
     ### ==================== ###
