@@ -90,7 +90,7 @@ def strip_calc(atoms, e_val, f_val, inplace=False):
     if inplace:
         ret_atoms = atoms
     else:
-        ret_atoms = copy.deepcopy(atoms)
+        ret_atoms = atoms.copy()
     ret_atoms.calc = SinglePointCalculator(ret_atoms, energy=e_val, forces=f_val)
     return ret_atoms
 
@@ -118,11 +118,23 @@ def read_data(input):
             atoms = read(input)
             input = [atoms]
     elif isinstance(input, Atoms):
-        input = [copy.deepcopy(input)]
+        tmp = input.copy()
+        if atoms.calc is not None:
+            try:
+                strip_calc(tmp, tmp.calc.get_potential_energy(), tmp.calc.get_forces(), inplace=True)
+            except AttributeError:
+                pass
+        input = [tmp]
     elif isinstance(input, trajectory.TrajectoryReader):
         tmp = list()
         for atoms in input:
-            tmp.append(copy.deepcopy(atoms))
+            tmp_atoms = atoms.copy()
+            if atoms.calc is not None:
+                try:
+                    strip_calc(tmp_atoms, tmp_atoms.calc.get_potential_energy(), tmp_atoms.calc.get_forces(), inplace=True)
+                except AttributeError:
+                    pass
+            tmp.append(tmp_atoms)
         input.close()
         input = tmp
     else:
@@ -178,7 +190,7 @@ def initial_data_prep(structure_input,
     n = len(traj)
     for i in range(n, nimages_start):
         print("Generating image", i)
-        atoms = copy.deepcopy(traj[-1])
+        atoms = traj[-1].copy()
         atoms.calc = true_calc
         dyn = optimizer(atoms)
         dyn.run(steps=1, fmax=conv_fmax)
@@ -550,7 +562,7 @@ def ufmin(structure_input = "POSCAR",
         uf3_forces_squared = np.sum( np.square(f_val), axis=1 )
         uf3_fmax_squared = np.max(uf3_forces_squared)
         step_traj = list()
-        tmp_atoms = copy.deepcopy(atoms)
+        tmp_atoms = atoms.copy()
         del tmp_atoms.calc
         step_traj.append(tmp_atoms)
 
@@ -570,7 +582,7 @@ def ufmin(structure_input = "POSCAR",
             e_val = atoms.get_potential_energy()
             f_val = atoms.get_forces()
             if true_forcecall_always:
-                true_atoms = copy.deepcopy(atoms)
+                true_atoms = atoms.copy()
                 true_atoms.calc = true_calc
                 true_e_val = true_atoms.get_potential_energy()
                 true_f_val = true_atoms.get_forces()
@@ -589,7 +601,7 @@ def ufmin(structure_input = "POSCAR",
 
             uf3_forces_squared = np.sum( np.square(f_val), axis=1 )
             uf3_fmax_squared = np.max(uf3_forces_squared)
-            tmp_atoms = copy.deepcopy(atoms)
+            tmp_atoms = atoms.copy()
             del tmp_atoms.calc
             step_traj.append(tmp_atoms)
 
