@@ -436,7 +436,7 @@ class UFCalculator(ase_calc.Calculator):
                                         n_atoms=n_atoms,
                                         trio_list=trio_list,
                                         )
-                n_chunks = min(16, 2 * self.n_procs)
+                n_chunks = min(16, 2 * self.n_procs, len(i_values))
                 pool.starmap(task, zip(i_values, i_groups),
                                 chunksize=len(i_values)//n_chunks)
             ## Parallelized using multiprocessing where array reduction is
