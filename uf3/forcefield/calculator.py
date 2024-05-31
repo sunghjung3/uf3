@@ -147,6 +147,28 @@ class UFCalculator(ase_calc.Calculator):
         if properties is None:
             properties = self.implemented_properties
 
+    
+    def calculate(self,
+                  atoms=None,
+                  properties=None,
+                  system_changes=tuple(ase_calc.all_changes),
+                  ):
+        """
+        Method called by `self.get_property` if it deems a new calculation
+        is required. After the calculation, the results are cached in
+        `self.results` so that these values can be fetched later if none of
+        the atoms object's attributes (i.e. positions, cell, etc.) have
+        changed since the last calculation.
+
+        Args:
+            atoms (ase.Atoms): configuration of interest.
+            properties (list): list of properties to calculate.
+                Must be a subset of `self.implemented_properties`.
+            system_changes (tuple): changes to system.
+        """
+        if properties is None:
+            properties = self.implemented_properties
+
         ase_calc.Calculator.calculate(self, atoms, properties, system_changes)
 
         if 'energy' or 'free_energy' in properties:
