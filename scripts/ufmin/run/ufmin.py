@@ -37,7 +37,7 @@ import copy, sys, time, os, glob, pickle, gc, concurrent, warnings
 #from memory_profiler import profile
 
 
-def generate_sample_weights(current_image_prefix, strength, nimages_start=1):
+def image_based_weighting(current_image_prefix, strength, nimages_start=1):
     """
     Generate sample weights for training data.
 
@@ -63,6 +63,12 @@ def generate_sample_weights(current_image_prefix, strength, nimages_start=1):
     return sample_weights
 
 
+def fmax_based_weighting(image, strength=1.0):
+    forces = image.get_forces()
+    fmax = np.sqrt(np.max(np.sum(forces**2, axis=1)))
+    return max(strength / fmax, 1.0)  # weigh lower fmax more
+
+
 class Pseudodict(dict):
     """
     An object that appears like a dictionary but returns one value for any
@@ -84,7 +90,7 @@ def strip_calc(atoms, e_val, f_val, inplace=False):
     if inplace:
         ret_atoms = atoms
     else:
-        ret_atoms = copy.deepcopy(atoms)
+        ret_atoms = atoms.copy()
     ret_atoms.calc = SinglePointCalculator(ret_atoms, energy=e_val, forces=f_val)
     return ret_atoms
 
@@ -112,11 +118,23 @@ def read_data(input):
             atoms = read(input)
             input = [atoms]
     elif isinstance(input, Atoms):
-        input = [copy.deepcopy(input)]
+        tmp = input.copy()
+        if atoms.calc is not None:
+            try:
+                strip_calc(tmp, tmp.calc.get_potential_energy(), tmp.calc.get_forces(), inplace=True)
+            except AttributeError:
+                pass
+        input = [tmp]
     elif isinstance(input, trajectory.TrajectoryReader):
         tmp = list()
         for atoms in input:
-            tmp.append(copy.deepcopy(atoms))
+            tmp_atoms = atoms.copy()
+            if atoms.calc is not None:
+                try:
+                    strip_calc(tmp_atoms, tmp_atoms.calc.get_potential_energy(), tmp_atoms.calc.get_forces(), inplace=True)
+                except AttributeError:
+                    pass
+            tmp.append(tmp_atoms)
         input.close()
         input = tmp
     else:
@@ -156,31 +174,31 @@ def initial_data_prep(structure_input,
     # calculate energy and forces for all images in traj
     for i, atoms in enumerate(traj):
         try:
-            most_recent_E_eval = atoms.get_potential_energy()
-            most_recent_F_eval = atoms.get_forces()
+            atoms.get_potential_energy()
+            atoms.get_forces()
             print("Using provided energy and forces for image", i)
         except RuntimeError:
             atoms.calc = true_calc
-            most_recent_E_eval = atoms.get_potential_energy()
-            most_recent_F_eval = atoms.get_forces()
+            atoms.get_potential_energy()
+            atoms.get_forces()
             if true_calc_type == "vasp":
                 check_vasp_convergence()
             print("Calculated energy and forces for image", i)
-        strip_calc(atoms, most_recent_E_eval, most_recent_F_eval, inplace=True)
+        strip_calc(atoms, atoms.calc.get_potential_energy(), atoms.calc.get_forces(), inplace=True)
 
     # generate additional images if necessary
     n = len(traj)
     for i in range(n, nimages_start):
         print("Generating image", i)
-        atoms = copy.deepcopy(traj[-1])
+        atoms = traj[-1].copy()
         atoms.calc = true_calc
         dyn = optimizer(atoms)
         dyn.run(steps=1, fmax=conv_fmax)
-        most_recent_E_eval = atoms.get_potential_energy()
-        most_recent_F_eval = atoms.get_forces()
+        atoms.get_potential_energy()
+        atoms.get_forces()
         if true_calc_type == "vasp":
             check_vasp_convergence()
-        strip_calc(atoms, most_recent_E_eval, most_recent_F_eval, inplace=True)
+        strip_calc(atoms, atoms.calc.get_potential_energy(), atoms.calc.get_forces(), inplace=True)
         traj.append(atoms)
 
     return traj
@@ -210,6 +228,7 @@ def ufmin(structure_input = "POSCAR",
           regularization_values = None,
           uq_tolerance = 1.0,
           preprocess_strength = 0.5,
+          sample_weight_type = None,
           sample_weight_strength = 6,
           pretrained_models = None,
           normalize_forces = False,
@@ -264,8 +283,10 @@ def ufmin(structure_input = "POSCAR",
         uq_tolerance (float): How tolerable this workflow is to uncertainty.
             See `r_uq.R_UQ` class for more details.
         preprocess_strength (float): Strength of preprocessing (0.0 to 1.0)
-        sample_weight_strength (int): how strongly to weigh the most recent sample vs the oldest.
-            See `generate_sample_weights` function for more details.
+        sample_weight_type (str): Type of sample weighting (None, "image_based", "fmax_based").
+        sample_weight_strength (int): See corresponding weighting function for more details.
+            imaged_based: `image_based_weighting()`
+            fmax_based: `fmax_based_weighting()`
         pretrained_models (dict): List of pretrained models to use for training. 
             forcecall number -> model file path
         normalize_forces (bool): Whether or not to normalize features by max true force value.
@@ -276,6 +297,10 @@ def ufmin(structure_input = "POSCAR",
 
     ufmin_true_fmax_squared = ufmin_true_fmax ** 2
     ufmin_uf3_fmax_squared = ufmin_uf3_fmax ** 2
+
+    sample_weights = dict()
+    if sample_weight_type not in ["image_based", "fmax_based", None]:
+        raise ValueError("Invalid sample_weight_type. Must be 'image_based', 'fmax_based', or None.")
 
     if resume:
         # load existing files to resume process
@@ -289,6 +314,10 @@ def ufmin(structure_input = "POSCAR",
         except FileNotFoundError:
             sys.exit(f"Initial data file {initial_data_output_file} does not exist. Cannot resume.")
 
+        if sample_weight_type == "fmax_based":
+            for i, image in enumerate(init_traj):
+                sample_weights[str(-1) + "_" + str(i)] = fmax_based_weighting(image)
+
         try:
             opt_traj = trajectory.Trajectory(opt_traj_file, mode='r')
             for image in opt_traj:
@@ -297,6 +326,10 @@ def ufmin(structure_input = "POSCAR",
             opt_traj = trajectory.Trajectory(opt_traj_file, mode='a')  # open in append mode to add on
         except FileNotFoundError:
             sys.exit(f"Optimization trajectory file {opt_traj_file} does not exist. Cannot resume.")
+
+        if sample_weight_type == "fmax_based":
+            for i, image in enumerate(opt_traj):
+                sample_weights[str(i) + "_" + str(0)] = fmax_based_weighting(image)
         
         if not os.path.isfile(model_traj_file):
             sys.exit(f"Model trajectory file {model_traj_file} does not exist. Cannot resume.")
@@ -470,7 +503,8 @@ def ufmin(structure_input = "POSCAR",
         process.save_feature_db(dataframe=df_features, filename=live_features_file)
 
         if pretrained_models is None or pretrained_models.get(model_number, None) is None:
-            sample_weights = generate_sample_weights(image_prefix, sample_weight_strength, nimages_start=nimages_start)
+            if sample_weight_type == "image_based":
+                sample_weights = image_based_weighting(image_prefix, sample_weight_strength, nimages_start=nimages_start)
             if model_file_prefix is None:
                 model_file = None
             else:
@@ -528,7 +562,7 @@ def ufmin(structure_input = "POSCAR",
         uf3_forces_squared = np.sum( np.square(f_val), axis=1 )
         uf3_fmax_squared = np.max(uf3_forces_squared)
         step_traj = list()
-        tmp_atoms = copy.deepcopy(atoms)
+        tmp_atoms = atoms.copy()
         del tmp_atoms.calc
         step_traj.append(tmp_atoms)
 
@@ -548,7 +582,7 @@ def ufmin(structure_input = "POSCAR",
             e_val = atoms.get_potential_energy()
             f_val = atoms.get_forces()
             if true_forcecall_always:
-                true_atoms = copy.deepcopy(atoms)
+                true_atoms = atoms.copy()
                 true_atoms.calc = true_calc
                 true_e_val = true_atoms.get_potential_energy()
                 true_f_val = true_atoms.get_forces()
@@ -567,7 +601,7 @@ def ufmin(structure_input = "POSCAR",
 
             uf3_forces_squared = np.sum( np.square(f_val), axis=1 )
             uf3_fmax_squared = np.max(uf3_forces_squared)
-            tmp_atoms = copy.deepcopy(atoms)
+            tmp_atoms = atoms.copy()
             del tmp_atoms.calc
             step_traj.append(tmp_atoms)
 
@@ -597,13 +631,15 @@ def ufmin(structure_input = "POSCAR",
         true_forces_squared = np.sum( np.square(most_recent_F_eval), axis=1 )
         true_fmax_squared = np.max(true_forces_squared)
         print(forcecall_counter, " ; true F =", np.sqrt(true_fmax_squared))
-        stripped_calc_atoms = strip_calc(atoms, most_recent_E_eval, most_recent_F_eval)
+        stripped_calc_atoms = strip_calc(atoms, atoms.calc.get_potential_energy(), atoms.calc.get_forces())
         traj.append(stripped_calc_atoms)
         opt_traj.write(stripped_calc_atoms)
 
         forcecall_counter += 1
         image_prefix += 1
         model_number += 1
+        if sample_weight_type == "fmax_based":
+            sample_weights[str(image_prefix) + "_" + str(0)] = fmax_based_weighting(stripped_calc_atoms)
         status_file.write("\n")
 
         # explicit garbage collection
@@ -660,34 +696,36 @@ if __name__ == "__main__":
     uq_tolerance = 1.0  # how tolerable this workflow is to uncertainty
     preprocess_strength = 0.5
     optimizer = FIRE
-    max_forcecalls = 200
-    max_uf3_calls = 1000
+    max_forcecalls = 100
+    max_uf3_calls = 200
     verbose = 0
     pretrained_models = None
     normalize_forces = False
     true_forcecall_always = True
+    sample_weight_type = "image_based"
+    sample_weight_strength = 6
     resume = 0
 
     ### ==================== ###
     ### TRUE CALCULATORS ###
     # Lennard-Jones
-    r_min = 2.22
-    r_cut = 8 * r_min
-    well_depth = 9
-    true_calc = LennardJones(sigma=r_min*(2 ** (-1/6)), epsilon=well_depth, rc=r_cut)
-    true_calc_type = "lj"
+    #r_min = 2.22
+    #r_cut = 8 * r_min
+    #well_depth = 9
+    #true_calc = LennardJones(sigma=r_min*(2 ** (-1/6)), epsilon=well_depth, rc=r_cut)
+    #true_calc_type = "lj"
 
     # Morse
     #r_e = 2.897
     #D_e = 0.7102
     #exp_prefactor = 1.6047
     #rho0 = exp_prefactor * r_e 
-    #true_calc = MorsePotential(epsilon=D_e, r0=r_e, rho0=rho0, rcut1=4.0, rcut2=7.0)
+    #true_calc = MorsePotential(epsilon=D_e, r0=r_e, rho0=rho0, rcut1=1.38, rcut2=2.07)
     #true_calc_type = "morse"
 
     # EMT
-    #true_calc = EMT()
-    #true_calc_type = "emt"
+    true_calc = EMT()
+    true_calc_type = "emt"
 
     # UF3
     #true_model = least_squares.WeightedLinearModel.from_json("/home/sung/UFMin/sung/representability_test/fit_3b/trimer_fit/true_model_3b.json")
@@ -753,6 +791,8 @@ if __name__ == "__main__":
                 uq_tolerance=uq_tolerance,
                 pretrained_models=pretrained_models,
                 true_forcecall_always=true_forcecall_always,
+                sample_weight_type=sample_weight_type,
+                sample_weight_strength=sample_weight_strength,
                 resume=resume,
                 )
     del tmp

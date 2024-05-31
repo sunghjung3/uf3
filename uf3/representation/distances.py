@@ -321,6 +321,7 @@ def kronecker_vectorized(n_atoms: int,
     return kronecker
 
 
+@nb.jit(nopython=True, nogil=True)
 def compute_direction_cosines(sup_positions: np.ndarray,
                               distance_matrix: np.ndarray,
                               i_where: np.ndarray,
@@ -347,10 +348,24 @@ def compute_direction_cosines(sup_positions: np.ndarray,
     kronecker = kronecker_delta(np.arange(n_atoms, dtype=np.int32),
                                 i_where,
                                 j_where)
+
     # n_distances x 3
-    delta_r = sup_positions[j_where, :] - sup_positions[i_where, :]
+    n = len(i_where)
+    delta_r = np.zeros((n, 3))
+    for idx in range(n):
+        i = i_where[idx]
+        j = j_where[idx]
+        delta_r[idx] = sup_positions[j] - sup_positions[i]
+    #delta_r = sup_positions[j_where] - sup_positions[i_where]
+
     # n_distances
-    rij = distance_matrix[i_where, j_where]
+    rij = np.zeros(n)
+    for idx in range(n):
+        i = i_where[idx]
+        j = j_where[idx]
+        rij[idx] = distance_matrix[i, j]
+    #rij = distance_matrix[i_where, j_where]
+
     drij_dr = (kronecker[:, None, :]
                * delta_r.T[None, :, :]
                / rij[None, None, :])

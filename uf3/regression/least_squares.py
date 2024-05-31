@@ -420,8 +420,8 @@ class WeightedLinearModel(BasicLinearModel):
             gram_f (np.ndarray): gram matrix (x^T x) for forces.
             ord_e (np.ndarray): ordinate (x^T y) for energies.
             ord_f (np.ndarray): ordinate (x^T y) for forces.
-            energy_weight: 1 / (# energies * sqrt(Var(energies)))
-            force_weight: 1 / (# forces * sqrt(Var(forces)))
+            energy_weight: sqrt(1 / (# energies * Var(energies)))
+            force_weight: sqrt(1 / (# forces * Var(forces)))
             weight (float): parameter balancing contribution from energies
                 vs. forces. Higher values favor energies; defaults to 0.5.
 
