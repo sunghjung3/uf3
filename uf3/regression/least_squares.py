@@ -744,7 +744,11 @@ class AlchemicalModel(WeightedLinearModel):
                       progress: str = "bar",
                       drop_columns: List[str] = None,
                       max_iter: int = 1,
-                      save_freq: int = 10):
+                      checkpoint: int = 10,
+                      params_filename: str = "alchemical_model_params.npz",
+                      tracker_filename: str = "train_tracker.npz",
+                      train_iter_filename: str = ".train_iter",
+                      ):
         """
         Accumulate inputs and outputs from batched parsing of HDF5 file
         and train the model parameters using alternating least-squaures
@@ -766,9 +770,34 @@ class AlchemicalModel(WeightedLinearModel):
                 features of the intended cutoffs. Use with Caution.
             max_iter (int): maximum number of iterations for alternating
                 least-squares optimization.
-            save_freq (int): frequency of saving model parameters to disk.
+            checkpoint (int): frequency of checkpointing the training RMSE and
+                saving parameters to disk.
+            params_filename (str): filename for saving parameters during
+                checkpoints.
+            train_tracker (str): filename for saving training tracker during
+                checkpoints.
+            train_iter_filename (str): filename for writing current iteration
+                number during checkpoints.
         """
+        if os.path.exists(params_filename):
+            print(f"Warning: {params_filename} already exists. It will be overwritten")
+        if os.path.exists(tracker_filename):
+            print(f"Warning: {tracker_filename} already exists. It will be overwritten")
+
         self.frozen_2b_data_coverage = np.zeros(self.n_basis, dtype=bool)
+        change_pseudo_tracker = np.zeros(max_iter)
+        change_1b_tracker = np.zeros(max_iter)
+        change_2b_tracker = np.zeros(max_iter)
+        rmse_e_tracker = np.zeros(max_iter)
+        rmse_f_tracker = np.zeros(max_iter)
+
+        # Initial RMSE check
+        print("Initial RMSE check.")
+        self.uncompress_alchemical_parameters()
+        y_e, p_e, y_f, p_f, rmse_e, rmse_f = self.batched_predict(filename,
+                                                keys=subset)
+        print()
+
         if not os.path.isfile(filename):
             raise FileNotFoundError(filename)
         n_tables, _, table_names, _ = io.analyze_hdf_tables(filename)
@@ -848,6 +877,8 @@ class AlchemicalModel(WeightedLinearModel):
                     coeff_2b = fitted_params[self.n_elements:].reshape(self.n_basis, self.n_pseudo)
                     max_change_1b = np.max(np.abs(coeff_1b - self.coeff_1b))
                     max_change_2b = np.max(np.abs(coeff_2b[self.frozen_2b_data_coverage] - self.coeff_2b[self.frozen_2b_data_coverage]))
+                    change_1b_tracker[i] = max_change_1b
+                    change_2b_tracker[i] = max_change_2b
                     print(f"\tMax change in 1-body coefficients: {max_change_1b:.3E}")
                     print(f"\tMax change in 2-body coefficients: {max_change_2b:.3E}")  # TODO: take into account normalization factor from W training
                     self.coeff_1b = coeff_1b
@@ -859,26 +890,52 @@ class AlchemicalModel(WeightedLinearModel):
                     pseudo_weights /= normalization_factor
                     self.coeff_2b *= normalization_factor  # not necessary if coeffs are train again
                     max_change_pseudo = np.max(np.abs(pseudo_weights - self.pseudo_weights))
+                    change_pseudo_tracker[i] = max_change_pseudo
                     print(f"\tMax change in pseudo weights: {max_change_pseudo:.3E}")
                     self.pseudo_weights = pseudo_weights
                 print()
         
-            # Save parameters to .npz
-            if ((i+1) % save_freq == 0) or (i+1 == max_iter):
-                np.savez("alchemical_model_params.npz",
-                            iter=i+1,
-                            coeff_1b=self.coeff_1b,
-                            coeff_2b=self.coeff_2b,
-                            pseudo_weights=self.pseudo_weights)
+            # Checkpoint
+            if ((i+1) % checkpoint == 0) or (i+1 == max_iter):
+                print("Checkpointing.")
 
-        # Uncompress and store to self.coefficients
+                # Uncompress and store to self.coefficients
+                self.uncompress_alchemical_parameters()
+
+                # Check RMSE
+                y_e, p_e, y_f, p_f, rmse_e, rmse_f = self.batched_predict(filename,
+                                                        keys=subset)
+                rmse_e_tracker[i] = rmse_e
+                rmse_f_tracker[i] = rmse_f
+
+                np.savez(params_filename,
+                         coeff_1b=self.coeff_1b,
+                         coeff_2b=self.coeff_2b,
+                         pseudo_weights=self.pseudo_weights)
+
+                np.savez(tracker_filename,
+                            change_pseudo=change_pseudo_tracker,
+                            change_1b=change_1b_tracker,
+                            change_2b=change_2b_tracker,
+                            rmse_e=rmse_e_tracker,
+                            rmse_f=rmse_f_tracker)
+
+                with open(train_iter_filename, "w") as f:
+                    f.write(f"{i+1}\n")
+                print()
+            else:
+                rmse_e_tracker[i] = rmse_e
+                rmse_f_tracker[i] = rmse_f
+
+    def uncompress_alchemical_parameters(self):
+        """Uncompress the alchemical spline coefficients and store to self.coefficients."""
         coefficients = (self.coeff_2b @ self.pseudo_weights.T).flatten(order="F")
         coefficients = np.concatenate([self.coeff_1b, coefficients])
         coefficients = revert_frozen_coefficients(coefficients,
-                                                  self.n_feats,
-                                                  self.mask,
-                                                  self.frozen_c,
-                                                  self.col_idx)
+                                                self.n_feats,
+                                                self.mask,
+                                                self.frozen_c,
+                                                self.col_idx)
         self.coefficients = coefficients
 
     def initialize_gramC_ordinateC(self):
