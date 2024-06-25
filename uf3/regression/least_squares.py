@@ -8,6 +8,7 @@ import os
 import warnings
 import numpy as np
 import pandas as pd
+import scipy
 import ndsplines
 from uf3.representation import bspline, process
 from uf3.data import io
@@ -457,20 +458,15 @@ class WeightedLinearModel(BasicLinearModel):
                 operations in constructing gram matrices.
         """
         n_elements = len(self.bspline_config.element_list)
-        x_e, y_e, x_f, y_f = dataframe_to_tuples(df.loc[keys],
-                                                 n_elements=n_elements,
-                                                 energy_key=energy_key,
-                                                 sample_weights=sample_weights)
-        x_e, y_e = freeze_columns(x_e,
-                                  y_e,
-                                  self.mask,
-                                  self.frozen_c,
-                                  self.col_idx)
-        x_f, y_f = freeze_columns(x_f,
-                                  y_f,
-                                  self.mask,
-                                  self.frozen_c,
-                                  self.col_idx)
+        x_e, y_e, x_f, y_f = freeze_columns_from_df(df,
+                                                    keys,
+                                                    n_elements,
+                                                    self.mask,
+                                                    self.frozen_c,
+                                                    self.col_idx,
+                                                    energy_key=energy_key,
+                                                    sample_weights=sample_weights,
+                                                    )
         if e_variance is not None and f_variance is not None:
             e_variance.update(y_e)
             f_variance.update(y_f)
@@ -645,6 +641,431 @@ class WeightedLinearModel(BasicLinearModel):
                                             min_curvature=min_curvature)
         print(f"{pair} Correction: adjusted {len(idx_fix)} coefficients.")
         self.coefficients[idx_subset[idx_fix]] = c_new
+
+
+class AlchemicalModel(WeightedLinearModel):
+    """
+    Alchemical learning ("pseudo-interaction") model for fitting energies and
+    forces.
+
+    XXX: currently only 2-body interactions and all pseudo-interactions
+    must have the same spline construction and offsets are fit.
+
+    XXX: self.data_coverage is not implemented yet.
+    
+    XXX: the regularizer matrix should already have frozen coefficients removed.
+
+    """
+    def __init__(self,
+                 bspline_config,
+                 n_pseudo,
+                 regularizer=None,
+                 data_coverage=None,
+                 init_params=None,
+                 **params):
+        super().__init__(bspline_config, regularizer, data_coverage, **params)
+        if self.bspline_config.degree != 2:
+            raise ValueError("Only 2-body interactions supported.")
+        self.n_pseudo = n_pseudo
+        component_sizes = self.bspline_config.get_interaction_partitions()[0]
+
+        # temporary sanity checks
+        for pair in self.bspline_config.interactions_map[2]:
+            if not component_sizes[pair] == self.n_basis + self.bspline_config.leading_trim + self.bspline_config.trailing_trim:
+                raise ValueError("Inconsistent component sizes.")
+        assert self.bspline_config.offset_1b  # fit 1-body
+
+        # Parameter arrays for training.
+        # After training, they will be stored to self.coefficients.
+        self.initialize_parameters(init_params)
+    
+    @property
+    def n_basis(self):
+        component_sizes = self.bspline_config.get_interaction_partitions()[0]
+        n_basis = component_sizes[self.bspline_config.interactions_map[2][0]]
+        return n_basis - self.bspline_config.leading_trim - \
+                self.bspline_config.trailing_trim
+
+    @property
+    def n_elements(self):
+        return len(self.bspline_config.element_list)
+    
+    @property
+    def n_pairtypes(self):
+        return len(self.bspline_config.interactions_map[2])
+
+    def __repr__(self):
+        if self.coefficients is None:
+            fit = "False"
+        else:
+            fit = "True"
+        summary = ["AlchemicalModel:",
+                   f"    Fit: {fit}",
+                   f"    n_pseudo: {self.n_pseudo}",
+                   f"    n_basis: {self.n_basis}",
+                   self.bspline_config.__repr__()
+                   ]
+        return "\n".join(summary)
+
+    def __str__(self):
+        return self.__repr__()
+    
+    def initialize_parameters(self, init_params):
+        """Initialize parameters for training."""
+        # TODO: need to figure out best way to initialize these
+        if init_params is None:
+            self.coeff_1b = np.zeros(self.n_elements)
+            self.coeff_2b = np.zeros((self.n_basis, self.n_pseudo))
+            self.pseudo_weights = np.random.rand(self.n_pairtypes, self.n_pseudo)*2-1
+        else:
+            self.coeff_1b = init_params['coeff_1b']
+            if self.coeff_1b.shape != (self.n_elements,):
+                raise ValueError("Incorrect shape for 1-body coefficients.\n"
+                                 f"\tExpected: ({self.n_elements},)\n"
+                                 f"\tProvided: {self.coeff_1b.shape}")
+            self.coeff_2b = init_params['coeff_2b']
+            if self.coeff_2b.shape != (self.n_basis, self.n_pseudo):
+                raise ValueError("Incorrect shape for 2-body coefficients.\n"
+                                  f"\tExpected: ({self.n_basis}, {self.n_pseudo})\n"
+                                  f"\tProvided: {self.coeff_2b.shape}")
+            self.pseudo_weights = init_params['pseudo_weights']
+            if self.pseudo_weights.shape != (self.n_pairtypes, self.n_pseudo):
+                raise ValueError("Incorrect shape for pseudo weights.\n"
+                                  f"\tExpected: ({self.n_pairtypes}, {self.n_pseudo})\n"
+                                  f"\tProvided: {self.pseudo_weights.shape}")
+
+    def fit_from_file(self,
+                      filename: str,
+                      subset: Collection,
+                      weight: float = 0.5,
+                      batch_size=2500,
+                      sample_weights: Dict = None,
+                      energy_key="energy",
+                      progress: str = "bar",
+                      drop_columns: List[str] = None,
+                      max_iter: int = 1,
+                      save_freq: int = 10):
+        """
+        Accumulate inputs and outputs from batched parsing of HDF5 file
+        and train the model parameters using alternating least-squaures
+        of the alchemical spline coefficients and weighting factors.
+
+        Args:
+            filename (str): path to HDF5 file.
+            subset (list): list of keys for training.
+            weight (float): parameter balancing contribution from energies
+                vs. forces. Higher values favor energies; defaults to 0.5.
+            batch_size (int): batch size, in rows, for matrix multiplication
+                operations in constructing gram matrices.
+            sample_weights (dict):
+            energy_key (str): column name for energies, default "energy".
+            progress (str): style for progress indicators.
+            drop_columns (list): list of columns to drop. Used when modifying
+                the cutoffs of the feature vectors from HDF5 file. No internal
+                checks are performed to see if dropping provided columns produce
+                features of the intended cutoffs. Use with Caution.
+            max_iter (int): maximum number of iterations for alternating
+                least-squares optimization.
+            save_freq (int): frequency of saving model parameters to disk.
+        """
+        self.frozen_2b_data_coverage = np.zeros(self.n_basis, dtype=bool)
+        if not os.path.isfile(filename):
+            raise FileNotFoundError(filename)
+        n_tables, _, table_names, _ = io.analyze_hdf_tables(filename)
+
+        # Outer-most ALS loop
+        for i in range(max_iter):
+            print(f"Iteration {i+1}/{max_iter}")
+
+            for param_to_fit in ("coeff", "pseudo_weights"):
+                e_variance = VarianceRecorder()
+                f_variance = VarianceRecorder()
+
+                if param_to_fit == "coeff":
+                    print(f"\tFitting alchemical spline coefficients.")
+                    gram_e, gram_f, ord_e, ord_f = self.initialize_gramC_ordinateC()
+                elif param_to_fit == "pseudo_weights":
+                    print(f"\tFitting pseudo weights.")
+                    gram_e, gram_f, ord_e, ord_f = self.initialize_gramW_ordinateW()
+                else:
+                    raise ValueError("Something went wrong.")
+
+                table_iterator = parallel.progress_iter(np.arange(n_tables),
+                                                        style=progress)
+                for j in table_iterator:
+                    table_name = table_names[j]
+                    df = process.load_feature_db(filename, table_name)
+                    keys = df.index.unique(level=0).intersection(subset)
+                    if len(keys) == 0:
+                        continue
+
+                    if drop_columns != None:
+                        df.drop(columns=drop_columns,inplace=True)
+
+                    if param_to_fit == "coeff":
+                        intermediates = self.gramC_from_df(df,
+                                                         keys,
+                                                         e_variance=e_variance,
+                                                         f_variance=f_variance,
+                                                         sample_weights=sample_weights,
+                                                         energy_key=energy_key,
+                                                         batch_size=batch_size)
+                    elif param_to_fit == "pseudo_weights":
+                        intermediates = self.gramW_from_df(df,
+                                                         keys,
+                                                         e_variance=e_variance,
+                                                         f_variance=f_variance,
+                                                         sample_weights=sample_weights,
+                                                         energy_key=energy_key,
+                                                         batch_size=batch_size)
+                    else:
+                        raise ValueError("Something went wrong.")
+                    g_e, g_f, o_e, o_f = intermediates
+                    gram_e += g_e
+                    gram_f += g_f
+                    ord_e += o_e
+                    ord_f += o_f
+                energy_weight, force_weight = calc_E_F_weights(e_variance.n,
+                                                            f_variance.n,
+                                                            e_variance.std,
+                                                            f_variance.std)
+                gram, ordinate = self.combine_weighted_gram(gram_e,
+                                                            gram_f,
+                                                            ord_e,
+                                                            ord_f,
+                                                            energy_weight,
+                                                            force_weight,
+                                                            weight)
+
+                if param_to_fit == "coeff":
+                    # add regularization
+                    regularizer = np.dot(self.regularizer.T, self.regularizer)
+                    gram += regularizer
+                fitted_params = lu_factorization(gram, ordinate)
+
+                if param_to_fit == "coeff":
+                    coeff_1b = fitted_params[:self.n_elements]
+                    coeff_2b = fitted_params[self.n_elements:].reshape(self.n_basis, self.n_pseudo)
+                    max_change_1b = np.max(np.abs(coeff_1b - self.coeff_1b))
+                    max_change_2b = np.max(np.abs(coeff_2b[self.frozen_2b_data_coverage] - self.coeff_2b[self.frozen_2b_data_coverage]))
+                    print(f"\tMax change in 1-body coefficients: {max_change_1b:.3E}")
+                    print(f"\tMax change in 2-body coefficients: {max_change_2b:.3E}")  # TODO: take into account normalization factor from W training
+                    self.coeff_1b = coeff_1b
+                    self.coeff_2b = coeff_2b
+                elif param_to_fit == "pseudo_weights":
+                    pseudo_weights = fitted_params.reshape(self.n_pairtypes, self.n_pseudo)
+                    # normalize all weights between -1 and 1
+                    normalization_factor = np.max(np.abs(pseudo_weights))
+                    pseudo_weights /= normalization_factor
+                    self.coeff_2b *= normalization_factor  # not necessary if coeffs are train again
+                    max_change_pseudo = np.max(np.abs(pseudo_weights - self.pseudo_weights))
+                    print(f"\tMax change in pseudo weights: {max_change_pseudo:.3E}")
+                    self.pseudo_weights = pseudo_weights
+                print()
+        
+            # Save parameters to .npz
+            if ((i+1) % save_freq == 0) or (i+1 == max_iter):
+                np.savez("alchemical_model_params.npz",
+                            iter=i+1,
+                            coeff_1b=self.coeff_1b,
+                            coeff_2b=self.coeff_2b,
+                            pseudo_weights=self.pseudo_weights)
+
+        # Uncompress and store to self.coefficients
+        coefficients = (self.coeff_2b @ self.pseudo_weights.T).flatten(order="F")
+        coefficients = np.concatenate([self.coeff_1b, coefficients])
+        coefficients = revert_frozen_coefficients(coefficients,
+                                                  self.n_feats,
+                                                  self.mask,
+                                                  self.frozen_c,
+                                                  self.col_idx)
+        self.coefficients = coefficients
+
+    def initialize_gramC_ordinateC(self):
+        """Initialize empty matrices for gram matrices and ordinates for fitting
+        the alchemical spline coefficients."""
+        n_columns = self.n_elements + self.n_basis * self.n_pseudo
+        gram_e = np.zeros((n_columns, n_columns))
+        ord_e = np.zeros(n_columns)
+        gram_f = np.zeros((n_columns, n_columns))
+        ord_f = np.zeros(n_columns)
+        return gram_e, gram_f, ord_e, ord_f
+
+    def gramC_from_df(self,
+                      df: pd.DataFrame,
+                      keys: Collection,
+                      e_variance: VarianceRecorder = None,
+                      f_variance: VarianceRecorder = None,
+                      sample_weights: Dict = None,
+                      energy_key: str = "energy",
+                      batch_size: int = 2500):
+        """
+        Extract inputs and outputs from dataframe and compute
+        moore-penrose components (gram matrices and ordinates) for
+        training the alchemical spline coefficients.
+
+        Args:
+            df (pd.DataFrame): DataFrame of energy/force features.
+            keys (list): keys to query from df (e.g. training subset).
+            e_variance (VarianceRecorder): handler for accumulating
+                statistics for energies (mean and variance).
+            f_variance (VarianceRecorder): handler for accumulating
+                statistics for forces (mean and variance).
+            sample_weights (dict):
+            energy_key (str): column name for energies, default "energy".
+            batch_size (int): batch size, in rows, for matrix multiplication
+                operations in constructing gram matrices.
+        """
+        n_elements = len(self.bspline_config.element_list)
+        x_e, y_e, x_f, y_f = freeze_columns_from_df(df,
+                                                    keys,
+                                                    n_elements,
+                                                    self.mask,
+                                                    self.frozen_c,
+                                                    self.col_idx,
+                                                    energy_key=energy_key,
+                                                    sample_weights=sample_weights,
+                                                    )
+        if e_variance is not None and f_variance is not None:
+            e_variance.update(y_e)
+            f_variance.update(y_f)
+        data_coverage_2b_e = (np.sum(x_e[:, self.n_elements:], axis=0) != 0).reshape(self.n_pairtypes, self.n_basis)
+        data_coverage_2b_e = np.any(data_coverage_2b_e, axis=0)
+        data_coverage_2b_f = (np.sum(x_f[:, self.n_elements:], axis=0) != 0).reshape(self.n_pairtypes, self.n_basis)
+        data_coverage_2b_f = np.any(data_coverage_2b_f, axis=0)
+        self.frozen_2b_data_coverage = np.logical_or(self.frozen_2b_data_coverage,
+                                                    data_coverage_2b_e)
+        self.frozen_2b_data_coverage = np.logical_or(self.frozen_2b_data_coverage,
+                                                    data_coverage_2b_f)
+        
+        WX_e = self.feature_matrixC(x_e, self.pseudo_weights)
+        WX_f = self.feature_matrixC(x_f, self.pseudo_weights)
+
+        gram_e, ordinate_e = batched_moore_penrose(WX_e,
+                                                   y_e,
+                                                   batch_size=batch_size)
+        gram_f, ordinate_f = batched_moore_penrose(WX_f,
+                                                   y_f,
+                                                   batch_size=batch_size)
+        return gram_e, gram_f, ordinate_e, ordinate_f
+    
+    def feature_matrixC(self, X, W):
+        """
+        Given the frozen UF3 feature matrix X of shape
+        (n_data, n_e + n_basis * n_pairtypes) and the pseudo_weights W of shape
+        (n_pairs, n_pseudo), compute the feature matrix WX for training the
+        alchemical spline coefficients C.
+
+        Args:
+            X (np.ndarray): frozen UF3 feature matrix of shape 
+                (n_data, n_e + n_basis * n_pairtypes)
+            W (np.ndarray): pseudo_weights of shape (n_pairs, n_pseudo)
+
+        Returns:
+            WX (np.ndarray): feature matrix for training the alchemical spline
+                coefficients C
+        """
+        X1 = X[:, :self.n_elements]  # 1-body features
+        X2 = X[:, self.n_elements:]  # 2-body features
+        n_data, _ = np.shape(X2)
+        X2_tensor = X2.reshape(n_data, self.n_pairtypes, self.n_basis)
+        WX = broad_row_krp_sum(W, X2_tensor)
+        WX = np.hstack((X1, WX))  # append 1-body features
+        return WX
+
+    def initialize_gramW_ordinateW(self):
+        """Initialize empty matrices for gram matrices and ordinates for fitting
+        the pseudo_weights."""
+        n_columns = self.n_pairtypes * self.n_pseudo
+        gram_e = np.zeros((n_columns, n_columns))
+        ord_e = np.zeros(n_columns)
+        gram_f = np.zeros((n_columns, n_columns))
+        ord_f = np.zeros(n_columns)
+        return gram_e, gram_f, ord_e, ord_f
+
+    def gramW_from_df(self,
+                      df: pd.DataFrame,
+                      keys: Collection,
+                      e_variance: VarianceRecorder = None,
+                      f_variance: VarianceRecorder = None,
+                      sample_weights: Dict = None,
+                      energy_key: str = "energy",
+                      batch_size: int = 2500):
+        """
+        Extract inputs and outputs from dataframe and compute
+        moore-penrose components (gram matrices and ordinates) for
+        training the pseudo_weights.
+
+        Args:
+            df (pd.DataFrame): DataFrame of energy/force features.
+            keys (list): keys to query from df (e.g. training subset).
+            e_variance (VarianceRecorder): handler for accumulating
+                statistics for energies (mean and variance).
+            f_variance (VarianceRecorder): handler for accumulating
+                statistics for forces (mean and variance).
+            sample_weights (dict):
+            energy_key (str): column name for energies, default "energy".
+            batch_size (int): batch size, in rows, for matrix multiplication
+                operations in constructing gram matrices.
+        """
+        n_elements = len(self.bspline_config.element_list)
+        x_e, y_e, x_f, y_f = freeze_columns_from_df(df,
+                                                    keys,
+                                                    n_elements,
+                                                    self.mask,
+                                                    self.frozen_c,
+                                                    self.col_idx,
+                                                    energy_key=energy_key,
+                                                    sample_weights=sample_weights,
+                                                    )
+        if e_variance is not None and f_variance is not None:
+            e_variance.update(y_e)
+            f_variance.update(y_f)
+        
+        XC_e, yhat_e_1b = self.feature_matrixW(x_e, self.coeff_2b, self.coeff_1b)
+        XC_f = self.feature_matrixW(x_f, self.coeff_2b)
+
+        gram_e, ordinate_e = batched_moore_penrose(XC_e,
+                                                   y_e - yhat_e_1b,
+                                                   batch_size=batch_size)
+        gram_f, ordinate_f = batched_moore_penrose(XC_f,
+                                                   y_f,
+                                                   batch_size=batch_size)
+        return gram_e, gram_f, ordinate_e, ordinate_f
+
+    def feature_matrixW(self, X, C2, C1=None):
+        """
+        Given the frozen UF3 feature matrix X of shape
+        (n_data, n_e + n_basis * n_pairtypes) and the 2-body alchemical spline
+        coefficients C2 of shape (n_basis, n_pseudo), compute the feature matrix
+        XC for training the pseudo_weights W.
+
+        If the 1-body alchemical spline coefficients C1 are provided, their
+        contribution is also returned to be subtracted from the target values.
+        Necessary for energies if the 1-body offset is being fit. Not necessary
+        for forces.
+
+        Args:
+            X (np.ndarray): frozen UF3 feature matrix of shape 
+                (n_data, n_e + n_basis * n_pairtypes)
+            C2 (np.ndarray): 2-body alchemical spline coefficients of shape
+                (n_basis, n_pseudo)
+            C1 (np.ndarray): 1-body alchemical spline coefficients of shape
+                (n_elements,)
+
+        Returns:
+            XC (np.ndarray): feature matrix for training the pseudo_weights W
+        """
+        X1 = X[:, :self.n_elements]
+        X2 = X[:, self.n_elements:]
+        n_data, _ = np.shape(X2)
+        X2_tensor = X2.reshape(n_data, self.n_pairtypes, self.n_basis)
+        XC = X2_tensor @ C2  # (n_data, n_pairtypes, n_pseudo)
+        XC = XC.reshape(n_data, self.n_pairtypes * self.n_pseudo)
+        if C1 is None:
+            return XC
+        else:
+            return XC, X1 @ C1
 
 
 def get_spline_taylor_expansion(r_target,
@@ -856,6 +1277,53 @@ def freeze_columns(x: np.ndarray,
     x = x[:, mask]
     y = np.subtract(y, np.dot(x_fixed, frozen_c))
     return x, y
+
+
+def freeze_columns_from_df(df: pd.DataFrame,
+                           keys: Collection,
+                           n_elements: int,
+                           mask: np.ndarray,
+                           frozen_c: np.ndarray,
+                           col_idx: np.ndarray,
+                           energy_key: str = "energy",
+                           sample_weights: Dict = None,
+                           ) -> Tuple[np.ndarray, np.ndarray,
+                                      np.ndarray, np.ndarray]:
+    """
+    Convenience function for freezing columns from DataFrame.
+
+    Args:
+        df (pd.DataFrame): DataFrame of energy/force features.
+        keys (list): keys to query from df (e.g. training subset).
+        n_elements (int): number of leading columns to consider for size
+            normalization.
+        mask (np.ndarray): set of non-frozen indices.
+        frozen_c (np.ndarray): values of coefficients to be frozen.
+        col_idx (np.ndarray): indices of coefficients to be frozen.
+        energy_key (str): column name for energies, default "energy".
+        sample_weights (dict): sample weights (optional).
+
+    Returns:
+        x_e (np.ndarray): input energy matrix without frozen columns.
+        y_e (np.ndarray): output energy vector, minus frozen contributions.
+        x_f (np.ndarray): input force matrix without frozen columns.
+        y_f (np.ndarray): output force vector, minus frozen contributions.
+    """
+    x_e, y_e, x_f, y_f = dataframe_to_tuples(df.loc[keys],
+                                             n_elements=n_elements,
+                                             energy_key=energy_key,
+                                             sample_weights=sample_weights)
+    x_e, y_e = freeze_columns(x_e,
+                              y_e,
+                              mask,
+                              frozen_c,
+                              col_idx)
+    x_f, y_f = freeze_columns(x_f,
+                              y_f,
+                              mask,
+                              frozen_c,
+                              col_idx)
+    return x_e, y_e, x_f, y_f
 
 
 def freeze_regularizer(regularizer: np.ndarray,
@@ -1167,3 +1635,26 @@ def calc_E_F_weights(n_e, n_f, std_e, std_f):
         energy_weight = 1 / np.sqrt(n_e) / std_e
         force_weight = 1 / np.sqrt(n_f) / std_f
     return energy_weight, force_weight
+
+
+def broad_row_krp_sum(A, B):
+    """
+    Broadcasted Khatri-Rao product of rows between A and slices of B along its
+    0-th axis, with a summation along the 1st axis and a squeeze at the end.
+    Used in the AlchemicalModel for computating the feature matrix for the
+    alchemical spline coefficient fitting.
+
+    Args:
+        A (np.ndarray): first matrix of shape (m, n).
+        B (np.ndarray): second matrix of shape (r, m, s).
+
+    Returns:
+        result (np.ndarray): the result of shape (r, n * s).
+    """
+    result = np.vstack(
+        [
+            np.sum(scipy.linalg.khatri_rao(A.T, B[i, :, :].T).T, axis=0)
+            for i in range(B.shape[0])
+            ]
+        )
+    return result

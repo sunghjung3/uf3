@@ -15,6 +15,7 @@ from uf3.data import composition
 from uf3.representation import angles
 from uf3.regression import regularize
 from uf3.util import json_io
+from uf3.regression import least_squares
 
 
 class BSplineBasis:
@@ -1132,3 +1133,75 @@ def tuple_consistency_check(map_, interaction_map):
     for entry in map_:
         if entry not in interactions:
             warnings.warn(f"{entry} specification unused.")
+
+
+# temporary function for testing
+def get_alchemy_regularization_matrix(bspline_config: BSplineBasis,
+                                      n_pseudo: int,
+                                      ridge_map={},
+                                      curvature_map={},
+                                      **kwargs):
+    # determine AlchemicalModel structure
+    n_elements = len(bspline_config.element_list)
+    lead_trim = bspline_config.leading_trim
+    trail_trim = bspline_config.trailing_trim
+    component_sizes = bspline_config.get_interaction_partitions()[0]
+    n_basis = component_sizes[bspline_config.interactions_map[2][0]] - \
+                lead_trim - trail_trim
+    # temporary sanity checks
+    for pair in bspline_config.interactions_map[2]:
+        if not component_sizes[pair] == n_basis + lead_trim + trail_trim:
+            raise ValueError("Inconsistent component sizes.")
+
+    for k in kwargs:
+        if k.lower()[0] == 'r':
+            ridge_map[int(re.sub('[^0-9]', '', k))] = float(kwargs[k])
+        elif k.lower()[0] == 'c':
+            curvature_map[int(re.sub('[^0-9]', '', k))] = float(kwargs[k])
+
+    ridge_map = {1: regularize.DEFAULT_REGULARIZER_GRID["ridge_1b"],
+                    2: regularize.DEFAULT_REGULARIZER_GRID["ridge_2b"],
+                    3: regularize.DEFAULT_REGULARIZER_GRID["ridge_3b"],
+                    **ridge_map}
+    curvature_map = {1: 0.0,
+                        2: regularize.DEFAULT_REGULARIZER_GRID["curve_2b"],
+                        3: regularize.DEFAULT_REGULARIZER_GRID["curve_3b"],
+                        **curvature_map}
+    # one-body element terms
+    matrix = bspline_config.get_regularization_matrix_1b(n_elements, ridge=ridge_map[1])
+    matrices = [matrix]
+    # two- and three-body terms
+    assert bspline_config.degree == 2
+    degree = 2
+
+    r = ridge_map[degree]
+    c = curvature_map[degree]
+    for _ in range(n_pseudo):  # each pseudo interaction
+
+        #matrix = bspline_config.get_regularization_matrix_2b(interaction,
+        #                                            ridge=r,
+        #                                            curvature=c)
+        matrix = regularize.get_ridge_penalty_matrix(n_basis + lead_trim + trail_trim)
+        matrix *= np.sqrt(r)
+        if c > 0:
+            matrix_c = regularize.get_curvature_penalty_matrix_1D(n_basis + lead_trim + trail_trim)
+            matrix_c *= np.sqrt(c)
+            matrix = np.vstack((matrix, matrix_c))
+
+        matrices.append(matrix)
+    combined_matrix = regularize.combine_regularizer_matrices(matrices)
+
+    # mask frozen columns
+    frozen_indices = []
+    frozen_indices.extend(range(n_elements))  # 1b
+    current_idx = n_elements
+    for _ in range(n_pseudo):
+        frozen_indices.extend(
+            range(current_idx+lead_trim, current_idx+lead_trim+n_basis)
+        )
+        current_idx = current_idx + lead_trim + n_basis + trail_trim
+    frozen_indices = np.array(frozen_indices, dtype=int)
+    combined_matrix = least_squares.freeze_regularizer(combined_matrix,
+                                                       frozen_indices)
+
+    return combined_matrix
