@@ -5,6 +5,7 @@ from featurized DataFrames using regularized least squares.
 
 from typing import List, Dict, Collection, Tuple
 import os
+import copy
 import warnings
 import numpy as np
 import pandas as pd
@@ -678,7 +679,7 @@ class AlchemicalModel(WeightedLinearModel):
         # Parameter arrays for training.
         # After training, they will be stored to self.coefficients.
         self.initialize_parameters(init_params)
-    
+
     @property
     def n_basis(self):
         component_sizes = self.bspline_config.get_interaction_partitions()[0]
@@ -793,7 +794,7 @@ class AlchemicalModel(WeightedLinearModel):
 
         # Initial RMSE check
         print("Initial RMSE check.")
-        self.uncompress_alchemical_parameters()
+        self.decompress_alchemical_parameters()
         y_e, p_e, y_f, p_f, rmse_e, rmse_f = self.batched_predict(filename,
                                                 keys=subset)
         print()
@@ -899,8 +900,8 @@ class AlchemicalModel(WeightedLinearModel):
             if ((i+1) % checkpoint == 0) or (i+1 == max_iter):
                 print("Checkpointing.")
 
-                # Uncompress and store to self.coefficients
-                self.uncompress_alchemical_parameters()
+                # Decompress and store to self.coefficients
+                self.decompress_alchemical_parameters()
 
                 # Check RMSE
                 y_e, p_e, y_f, p_f, rmse_e, rmse_f = self.batched_predict(filename,
@@ -927,8 +928,8 @@ class AlchemicalModel(WeightedLinearModel):
                 rmse_e_tracker[i] = rmse_e
                 rmse_f_tracker[i] = rmse_f
 
-    def uncompress_alchemical_parameters(self):
-        """Uncompress the alchemical spline coefficients and store to self.coefficients."""
+    def decompress_alchemical_parameters(self):
+        """Decompress the alchemical spline coefficients and store to self.coefficients."""
         coefficients = (self.coeff_2b @ self.pseudo_weights.T).flatten(order="F")
         coefficients = np.concatenate([self.coeff_1b, coefficients])
         coefficients = revert_frozen_coefficients(coefficients,
@@ -1715,3 +1716,49 @@ def broad_row_krp_sum(A, B):
             ]
         )
     return result
+
+
+def expand_alchemical_init_params(params_dict, n_pseudo):
+    """
+    Using the pseudo-interaction coefficients and weighting factors for a
+    small `n_pseudo`, create initial parameters for a larger `n_pseudo`.
+
+    Args:
+        params_dict (dict | np.lib.npyio.NpzFile'): dictionary of initial parameters.
+            Keys should include `coeff_2b` and `pseudo_weights` (others optional)
+        n_pseudo (int): number of pseudo-interactions in the expanded system.
+            
+    Returns:
+        expanded_params (dict): dictionary of expanded parameters.
+    """
+    assert "coeff_2b" in params_dict
+    assert "pseudo_weights" in params_dict
+    coeff_2b_old = params_dict["coeff_2b"]
+    pseudo_weights_old = params_dict["pseudo_weights"]
+    n_pseudo_old = pseudo_weights_old.shape[1]
+    assert n_pseudo_old == coeff_2b_old.shape[1]
+    expanded_params = dict()
+    for key, value in params_dict.items():
+        expanded_params[key] = value.copy()
+    if n_pseudo_old >= n_pseudo:
+        return expanded_params
+    n_basis = coeff_2b_old.shape[0]
+    n_pairtypes = pseudo_weights_old.shape[0]
+    coeff_2b_new = np.zeros((n_basis, n_pseudo))
+    pseudo_weights_new = np.zeros((n_pairtypes, n_pseudo))
+    coeff_2b_new[:, :n_pseudo_old] = coeff_2b_old
+    pseudo_weights_new[:, :n_pseudo_old] = pseudo_weights_old
+
+    # generate new pseudo-interaction coefficients using a convolution method
+    for j in range(n_pseudo_old, n_pseudo):
+        random_pseudo_idx = np.random.randint(0, n_pseudo_old)
+        convolve_width = np.random.randint(2, int(n_basis / 4))
+        convolve_window = np.random.rand(convolve_width) * 2 / convolve_width  # expectation of sum is 1
+        convolved = np.convolve(coeff_2b_old[:, random_pseudo_idx], convolve_window, mode="full")
+        random_cut = np.random.randint(0, convolve_width)
+        coeff_2b_new[:, j] = convolved[random_cut:random_cut+n_basis]
+    
+    expanded_params["coeff_2b"] = coeff_2b_new
+    expanded_params["pseudo_weights"] = pseudo_weights_new  # new weights are 0
+
+    return expanded_params
