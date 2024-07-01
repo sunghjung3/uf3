@@ -9,6 +9,7 @@ import copy
 import warnings
 import numpy as np
 import pandas as pd
+import torch
 import scipy
 import ndsplines
 from uf3.representation import bspline, process
@@ -16,6 +17,7 @@ from uf3.data import io
 from uf3.data import composition
 from uf3.util import json_io
 from uf3.util import parallel
+from uf3.util import torch_util
 
 
 class VarianceRecorder:
@@ -887,9 +889,9 @@ class AlchemicalModel(WeightedLinearModel):
                 elif param_to_fit == "pseudo_weights":
                     pseudo_weights = fitted_params.reshape(self.n_pairtypes, self.n_pseudo)
                     # normalize all weights between -1 and 1
-                    normalization_factor = np.max(np.abs(pseudo_weights))
-                    pseudo_weights /= normalization_factor
-                    self.coeff_2b *= normalization_factor  # not necessary if coeffs are train again
+                    #normalization_factor = np.max(np.abs(pseudo_weights))
+                    #pseudo_weights /= normalization_factor
+                    #self.coeff_2b *= normalization_factor  # not necessary if coeffs are train again
                     max_change_pseudo = np.max(np.abs(pseudo_weights - self.pseudo_weights))
                     change_pseudo_tracker[i] = max_change_pseudo
                     print(f"\tMax change in pseudo weights: {max_change_pseudo:.3E}")
@@ -974,10 +976,9 @@ class AlchemicalModel(WeightedLinearModel):
             batch_size (int): batch size, in rows, for matrix multiplication
                 operations in constructing gram matrices.
         """
-        n_elements = len(self.bspline_config.element_list)
         x_e, y_e, x_f, y_f = freeze_columns_from_df(df,
                                                     keys,
-                                                    n_elements,
+                                                    self.n_elements,
                                                     self.mask,
                                                     self.frozen_c,
                                                     self.col_idx,
@@ -1066,10 +1067,9 @@ class AlchemicalModel(WeightedLinearModel):
             batch_size (int): batch size, in rows, for matrix multiplication
                 operations in constructing gram matrices.
         """
-        n_elements = len(self.bspline_config.element_list)
         x_e, y_e, x_f, y_f = freeze_columns_from_df(df,
                                                     keys,
-                                                    n_elements,
+                                                    self.n_elements,
                                                     self.mask,
                                                     self.frozen_c,
                                                     self.col_idx,
@@ -1124,6 +1124,317 @@ class AlchemicalModel(WeightedLinearModel):
             return XC
         else:
             return XC, X1 @ C1
+
+
+class AlchemicalModelTorch(AlchemicalModel, torch.nn.Module):
+    """
+    Alchemical learning ("pseudo-interaction") model for fitting energies and
+    forces using PyTorch.
+
+    XXX: currently only 2-body interactions and all pseudo-interactions
+    must have the same spline construction and offsets are fit.
+
+    XXX: self.data_coverage is not implemented yet.
+
+    XXX: the regularizer matrix should already have frozen coefficients removed.
+    """
+    def __init__(self,
+                 bspline_config,
+                 n_pseudo,
+                 regularizer=None,
+                 data_coverage=None,
+                 init_params=None,
+                 dtype=torch.float64,
+                 **params):
+        AlchemicalModel.__init__(self,
+                                 bspline_config,
+                                 n_pseudo,
+                                 regularizer,
+                                 data_coverage,
+                                 init_params,
+                                 **params)
+        torch.nn.Module.__init__(self)
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.to(self.device)
+        self.dtype = dtype
+        self.convert2torch()
+
+    def __repr__(self):
+        if self.coefficients is None:
+            fit = "False"
+        else:
+            fit = "True"
+        summary = ["AlchemicalModelTorch:",
+                   f"    Fit: {fit}",
+                   f"    n_pseudo: {self.n_pseudo}",
+                   f"    n_basis: {self.n_basis}",
+                   self.bspline_config.__repr__()
+                   ]
+        return "\n".join(summary)
+
+    def convert2torch(self):
+        """Convert numpy array attributes to torch tensors."""
+        self.coeff_1b = torch.tensor(self.coeff_1b, device=self.device,
+                                     dtype=self.dtype, requires_grad=True)
+        self.coeff_2b = torch.tensor(self.coeff_2b, device=self.device,
+                                     dtype=self.dtype, requires_grad=True)
+        self.pseudo_weights = torch.tensor(self.pseudo_weights, device=self.device,
+                                           dtype=self.dtype, requires_grad=True)
+        self.regularizer = torch.tensor(self.regularizer, device=self.device,
+                                        dtype=self.dtype, requires_grad=False)
+
+    def parameters(self):
+        return [self.coeff_1b, self.coeff_2b, self.pseudo_weights]
+
+    def decompress_alchemical_parameters(self, write2self=False):
+        """Redefining parent method but with torch tensors."""
+        coefficients = (self.pseudo_weights @ self.coeff_2b.T).view(-1)  # row-wise version
+        coefficients = torch.cat([self.coeff_1b, coefficients])
+        if write2self:
+            coefficients = coefficients.detach().cpu().numpy()
+            coefficients = revert_frozen_coefficients(coefficients,
+                                                    self.n_feats,
+                                                    self.mask,
+                                                    self.frozen_c,
+                                                    self.col_idx)
+            self.coefficients = coefficients
+        else:
+            return coefficients
+
+    def forward(self, x):
+        """
+        Forward pass for the alchemical model.
+
+        Args:
+            x (torch.Tensor): input tensor of shape (n_data, n_elements + n_basis * n_pairtypes)
+
+        Returns:
+            y (torch.Tensor): output tensor of shape (n_data,)
+        """
+        decompressed_params = self.decompress_alchemical_parameters(write2self=False)
+        y = torch.matmul(x, decompressed_params)
+        return y
+    
+    def normalize_parameters(self):
+        """Normalize the alchemical model parameters."""
+        normalization_factor = torch.max(torch.abs(self.pseudo_weights))
+        self.pseudo_weights /= normalization_factor
+        self.coeff_2b *= normalization_factor
+
+    def regularization_loss(self):
+        """
+        Compute the regularization loss for the alchemical model.
+
+        Returns:
+            loss (torch.Tensor): regularization loss
+        """
+        alchemical_coeffs = self.coeff_2b.T.contiguous().view(-1)  # TODO: redefine coeff_2b to be row-wise for each pseudo-interaction
+        alchemical_coeffs = torch.cat([self.coeff_1b, alchemical_coeffs])
+        loss = torch.matmul(self.regularizer, alchemical_coeffs)
+        loss = torch.sum(loss**2)
+        return loss
+
+    def train_from_file(self,
+                        filename: str,
+                        subset: Collection,
+                        weight: float = 0.5,
+                        batch_size=1,
+                        sample_weights: Dict = None,
+                        energy_key="energy",
+                        progress: str = "bar",
+                        drop_columns: List[str] = None,
+                        max_epochs: int = 1,
+                        optimizer: torch.optim.Optimizer = None,
+                        checkpoint: int = 10,
+                        shuffle: bool = True,
+                        drop_last: bool = False,
+                        dataloader_n_workers: int = 0,
+                        params_filename: str = "alchemical_model_params.pt",
+                        tracker_filename: str = "train_tracker.npz",
+                        train_iter_filename: str = ".train_iter",
+                        ):
+        """
+        Accumulate inputs and outputs from batched parsing of HDF5 file
+        and train the Alchemical model parameters using a gradient-based
+        optimizer.
+
+        Args:
+            filename (str): path to HDF5 file.
+            subset (list): list of keys for training.
+            weight (float): parameter balancing contribution from energies
+                vs. forces. Higher values favor energies; defaults to 0.5.
+            batch_size (int): batch size, in number of tables from HDF5 file,
+                for PyTorch DataLoader.
+            sample_weights (dict):
+            energy_key (str): column name for energies, default "energy".
+            progress (str): style for progress indicators.
+            drop_columns (list): list of columns to drop. Used when modifying
+                the cutoffs of the feature vectors from HDF5 file. No internal
+                checks are performed to see if dropping provided columns produce
+                features of the intended cutoffs. Use with Caution.
+            max_epochs (int): maximum number of iterations for alternating
+                least-squares optimization.
+            optimizer (torch.optim.Optimizer): optimizer for training. If None,
+                defaults to Adam.
+            checkpoint (int): frequency of checkpointing the training RMSE and
+                saving parameters to disk.
+            shuffle (bool): shuffle the dataset during training.
+            drop_last (bool): drop the last incomplete batch during training.
+            dataloader_n_workers (int): number of workers for PyTorch DataLoader.
+            params_filename (str): filename for saving parameters during
+                checkpoints.
+            train_tracker (str): filename for saving training tracker during
+                checkpoints.
+            train_iter_filename (str): filename for writing current iteration
+                number during checkpoints.
+        """
+        if os.path.exists(params_filename):
+            print(f"Warning: {params_filename} already exists. It will be overwritten")
+        if os.path.exists(tracker_filename):
+            print(f"Warning: {tracker_filename} already exists. It will be overwritten")
+
+        self.frozen_2b_data_coverage = np.zeros(self.n_basis, dtype=bool)
+        change_pseudo_tracker = np.zeros(max_epochs)
+        change_1b_tracker = np.zeros(max_epochs)
+        change_2b_tracker = np.zeros(max_epochs)
+        rmse_e_tracker = np.zeros(max_epochs)
+        rmse_f_tracker = np.zeros(max_epochs)
+
+        # Initial RMSE check
+        #print("Initial RMSE check.")
+        #self.decompress_alchemical_parameters(write2self=True)
+        #_, _, _, _, rmse_e, rmse_f = self.batched_predict(filename,
+        #                                        keys=subset)
+        #print()
+
+        # Optimizer
+        if optimizer is None:
+            optimizer = torch.optim.Adam(self.parameters(), lr=0.001)
+        else:
+            optimizer = optimizer
+
+        # Create PyTorch DataLoader
+        if not os.path.isfile(filename):
+            raise FileNotFoundError(filename)
+        _, _, table_names, _ = io.analyze_hdf_tables(filename)
+        assert batch_size == 1  # XXX: for now
+        dataloader = torch_util.hdf5_dataloader(filename,
+                                                table_names,
+                                                subset,
+                                                batch_size=batch_size,
+                                                shuffle=shuffle,
+                                                drop_last=drop_last,
+                                                num_workers=dataloader_n_workers,
+                                                )
+        n_batches = len(dataloader)
+
+        # Outer-most training loop
+        self.train()  # set model to training mode
+        for i in range(max_epochs):
+            print(f"Iteration {i+1}/{max_epochs}")
+
+            # if doing stochastic optimization, we need to do these each time
+            # the parameters are updated
+            e_variance = VarianceRecorder()
+            f_variance = VarianceRecorder()
+            optimizer.zero_grad()
+            loss_e = 0.0
+            loss_f = 0.0
+            #self.normalize_parameters()
+
+            table_iterator = parallel.progress_iter(dataloader,
+                                                    style=progress,
+                                                    total=n_batches,
+                                                    leave=False)
+            for dfs in table_iterator:
+                df = dfs[0]  # we contrained batch_size=1 above
+                keys = df.index.unique(level=0).intersection(subset)
+                if len(keys) == 0:
+                    continue
+                if drop_columns != None:
+                    df.drop(columns=drop_columns,inplace=True)
+                
+                x_e, y_e, x_f, y_f = freeze_columns_from_df(df,
+                                                keys,
+                                                self.n_elements,
+                                                self.mask,
+                                                self.frozen_c,
+                                                self.col_idx,
+                                                energy_key=energy_key,
+                                                sample_weights=sample_weights,
+                                                )    
+                # if we allowed more than one batch, we would need to stack them here
+                e_variance.update(y_e)
+                f_variance.update(y_f)
+                data_coverage_2b_e = (np.sum(x_e[:, self.n_elements:], axis=0) != 0).reshape(self.n_pairtypes, self.n_basis)
+                data_coverage_2b_e = np.any(data_coverage_2b_e, axis=0)
+                data_coverage_2b_f = (np.sum(x_f[:, self.n_elements:], axis=0) != 0).reshape(self.n_pairtypes, self.n_basis)
+                data_coverage_2b_f = np.any(data_coverage_2b_f, axis=0)
+                self.frozen_2b_data_coverage = np.logical_or(self.frozen_2b_data_coverage,
+                                                            data_coverage_2b_e)
+                self.frozen_2b_data_coverage = np.logical_or(self.frozen_2b_data_coverage,
+                                                            data_coverage_2b_f)
+                
+                # Accumulate losses
+                x_e = torch.tensor(x_e, device=self.device, dtype=self.dtype,
+                                   requires_grad=False)
+                y_e = torch.tensor(y_e, device=self.device, dtype=self.dtype,
+                                   requires_grad=False)
+                p_e = self(x_e)
+                loss_e += torch.nn.functional.mse_loss(p_e, y_e, reduction="sum")
+                x_f = torch.tensor(x_f, device=self.device, dtype=self.dtype,
+                                   requires_grad=False)
+                y_f = torch.tensor(y_f, device=self.device, dtype=self.dtype,
+                                   requires_grad=False)
+                p_f = self(x_f)
+                loss_f += torch.nn.functional.mse_loss(p_f, y_f, reduction="sum")
+                
+            # Compute total loss
+            energy_weight, force_weight = calc_E_F_weights(e_variance.n,
+                                                           f_variance.n,
+                                                           e_variance.std,
+                                                           f_variance.std)
+            print(torch.sqrt(loss_e.data / e_variance.n), torch.sqrt(loss_f.data / f_variance.n))
+            loss, _ = self.combine_weighted_gram(loss_e, loss_f, 0, 0,
+                                                 energy_weight, force_weight, weight)
+            loss += self.regularization_loss()
+
+            # Backpropagation
+            loss.backward()
+            optimizer.step()
+
+            # Checkpoint
+            if ((i+1) % checkpoint == 0) or (i+1 == max_epochs):
+                print("Checkpointing.")
+
+                # Decompress and store to self.coefficients
+                self.decompress_alchemical_parameters(write2self=True)
+
+                # Check RMSE
+                _, _, _, _, rmse_e, rmse_f = self.batched_predict(filename,
+                                                        keys=subset)
+                rmse_e_tracker[i] = rmse_e
+                rmse_f_tracker[i] = rmse_f
+
+                torch.save(self.state_dict(), params_filename)
+
+                np.savez(tracker_filename,
+                            change_pseudo=change_pseudo_tracker,
+                            change_1b=change_1b_tracker,
+                            change_2b=change_2b_tracker,
+                            rmse_e=rmse_e_tracker,
+                            rmse_f=rmse_f_tracker)
+
+                with open(train_iter_filename, "w") as f:
+                    f.write(f"{i+1}\n")
+                print()
+
+        self.eval()  # set model to evaluation mode
+
+    def fit_from_file(self, *args, **kwargs):
+        warnings.warn("Calling fit_from_file() of AlchemcalModelTorch.\n"
+                      "Redirecting to train_from_file().")
+        return self.train_from_file(*args, **kwargs)
 
 
 def get_spline_taylor_expansion(r_target,
