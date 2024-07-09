@@ -487,7 +487,12 @@ class WeightedLinearModel(BasicLinearModel):
                         keys: List[str] = None,
                         table_names: List[str] = None,
                         score: bool = True,
-                        drop_columns: List[str] = None):
+                        drop_columns: List[str] = None,
+                        client = None,
+                        n_jobs: int = 1,
+                        shuffle: bool = False,
+                        progress: str = "bar",
+                        ):
         """
         Extract inputs and outputs from HDF5 file and predict energies/forces.
 
@@ -508,14 +513,23 @@ class WeightedLinearModel(BasicLinearModel):
                 the cutoffs of the feature vectors from HDF5 file. No internal
                 checks are performed to see if dropping provided columns produce
                 features of the intended cutoffs. Use with Caution.
+            client (concurrent.futures.Executor, dask.distributed.Client)
+            n_jobs (int): number of parallel jobs for batched prediction.
+            shuffle (bool): whether to shuffle the order of keys.
+            progress (str): style for progress indicators.
         """
         n_elements = len(self.bspline_config.element_list)
-        y_e, p_e, y_f, p_f = batched_prediction(self,
-                                                filename,
-                                                table_names=table_names,
-                                                subset_keys=keys,
-                                                n_elements=n_elements,
-                                                drop_columns=drop_columns)
+        y_e, p_e, y_f, p_f = batched_prediction_parallel(self,
+                                                         filename,
+                                                         table_names=table_names,
+                                                         subset_keys=keys,
+                                                         n_elements=n_elements,
+                                                         drop_columns=drop_columns,
+                                                         client=client,
+                                                         n_jobs=n_jobs,
+                                                         shuffle=shuffle,
+                                                         progress=progress,
+                                                         )
         if score:
             rmse_e = rmse_metric(y_e, p_e)
             rmse_f = rmse_metric(y_f, p_f)
@@ -821,7 +835,6 @@ class AlchemicalModel(WeightedLinearModel):
             starttime = time.time()
 
             for param_to_fit in ("coeff", "pseudo_weights"):
-                print(f"\tFitting {param_to_fit}.")
                 e_variance = VarianceRecorder()
                 f_variance = VarianceRecorder()
 
@@ -1861,9 +1874,9 @@ def subset_prediction(df: pd.DataFrame,
     return y_e, p_e, y_f, p_f
 
 
-def batched_prediction(model: WeightedLinearModel,
+def batched_prediction(table_names: Collection,
+                       model: WeightedLinearModel,
                        filename: str,
-                       table_names: Collection = None,
                        subset_keys: Collection = None,
                        drop_columns: List[str] = None,
                        **kwargs):
@@ -1872,8 +1885,8 @@ def batched_prediction(model: WeightedLinearModel,
     from HDF5 file and predict using fitted model.
 
     Args:
-        filename (str): path to HDF5 file.
         model (WeightedLinearModel): fitted model.
+        filename (str): path to HDF5 file.
         table_names (list): list of table names to query from HDF5 file.
         subset_keys (list): list of keys to query from DataFrame.
         drop_columns (list): list of columns to drop. Used when modifying
@@ -1887,8 +1900,6 @@ def batched_prediction(model: WeightedLinearModel,
         y_f (np.ndarray): target values for forces.
         p_f (np.ndarray): prediction values for forces.
     """
-    if table_names is None:
-        _, _, table_names, _ = io.analyze_hdf_tables(filename)
     df_batches = io.dataframe_batch_loader(filename, table_names)
     y_e = []
     p_e = []
@@ -1911,6 +1922,82 @@ def batched_prediction(model: WeightedLinearModel,
     y_f = np.concatenate(y_f)
     p_f = np.concatenate(p_f)
     return y_e, p_e, y_f, p_f
+
+
+def batched_prediction_parallel(model: WeightedLinearModel,
+                                filename: str,
+                                table_names: Collection = None,
+                                subset_keys: Collection = None,
+                                drop_columns: List[str] = None,
+                                client = None,
+                                n_jobs: int = 1,
+                                shuffle: bool = False,
+                                progress: str = "bar",
+                                **kwargs):
+    """
+    Parallelized version of batched_prediction().
+
+    Args:
+        filename (str): path to HDF5 file.
+        model (WeightedLinearModel): fitted model.
+        table_names (list): list of table names to query from HDF5 file.
+        subset_keys (list): list of keys to query from DataFrame.
+        drop_columns (list): list of columns to drop. Used when modifying
+            the cutoffs of the feature vectors from HDF5 file. No internal
+            checks are performed to see if dropping provided columns produce
+            features of the intended cutoffs. Use with Caution.
+        client (concurrent.futures.Executor, dask.distributed.Client)
+        n_jobs (int): number of parallel jobs for batched prediction.
+        shuffle (bool): shuffle the dataset during prediction.
+        progress (str): style for progress indicators.
+
+    Returns:
+        y_e (np.ndarray): target values for energies.
+        p_e (np.ndarray): prediction values for energies.
+        y_f (np.ndarray): target values for forces.
+        p_f (np.ndarray): prediction values for forces.
+    """
+    if table_names is None:
+        _, _, table_names, _ = io.analyze_hdf_tables(filename)
+    else:
+        table_names = copy.copy(table_names)
+
+    if n_jobs < 2 or client is None:
+        warnings.warn("Processing in serial.", RuntimeWarning)
+        return batched_prediction(table_names,
+                                  model,
+                                  filename,
+                                  subset_keys=subset_keys,
+                                  drop_columns=drop_columns,
+                                  **kwargs,
+                                  )
+    if shuffle:
+        np.random.shuffle(table_names)
+    batches = parallel.split_zip(n_jobs, table_names)[0]
+    try:
+        batches = [client.scatter(batch) for batch in batches]
+    except AttributeError:
+        pass
+
+    future_list = parallel.batch_submit(batched_prediction,
+                                        batches,
+                                        client,
+                                        model=model,
+                                        filename=filename,
+                                        subset_keys=subset_keys,
+                                        drop_columns=drop_columns,
+                                        **kwargs,
+                                        )
+    results_tuple = parallel.gather_and_merge(future_list,
+                                              client=client,
+                                              cancel=True,
+                                              progress=progress)
+    try:
+        for batch in batches:
+            client.cancel(batch)
+    except AttributeError:
+        pass
+    return results_tuple  # y_e, p_e, y_f, p_f
 
 
 def rmse_metric(predicted: Collection,

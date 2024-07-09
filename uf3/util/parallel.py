@@ -226,6 +226,20 @@ def gather_and_merge(future_list,
             item_list = client.gather(future_list)
         except AttributeError:
             item_list = [future.result() for future in future_list]
+    if isinstance(item_list[0], (list, tuple)):
+        result = tuple(merge_by_type(sub_list) for sub_list in zip(*item_list))
+    else:
+        result = merge_by_type(item_list)
+    if cancel:
+        try:  # more efficient but not implemented in concurrent.futures
+            client.cancel(future_list)
+        except AttributeError:
+            for future in future_list:
+                future.cancel()
+    return result
+
+
+def merge_by_type(item_list):
     # merge according to data type
     if isinstance(item_list[0], dict):
         result = {}
@@ -242,10 +256,4 @@ def gather_and_merge(future_list,
     else:
         warnings.warn("Unable to merge gathered futures.", RuntimeWarning)
         result = item_list
-    if cancel:
-        try:  # more efficient but not implemented in concurrent.futures
-            client.cancel(future_list)
-        except AttributeError:
-            for future in future_list:
-                future.cancel()
     return result
