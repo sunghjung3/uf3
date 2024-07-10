@@ -8,7 +8,9 @@ import os
 import warnings
 import sqlite3
 import numpy as np
+import scipy
 import pandas as pd
+import tables
 from uf3.representation import distances
 from uf3.representation import angles
 from uf3.representation import bspline
@@ -261,7 +263,24 @@ class BasisFeaturizer:
                        batch_size=50,
                        progress="bar",
                        table_template="features_{}",
+                       sparse=False,
                        **kwargs):
+        """
+        Featurize structures and write to HDF5 file in batches.
+
+        Args:
+            filename (str): path to HDF5 file.
+            df_data (pd.DataFrame): dataframe containing geometries
+                (from uf3.data.io.DataCoordinator)
+            client (concurrent.futures.Executor, dask.distributed.Client)
+            n_jobs (int): number of parallel jobs to run concurrently for
+                featurization.
+            batch_size (int): number of configurations per batch.
+            progress (str): style of progress counter.
+            table_template (str): template for table names.
+            sparse (bool): whether to save as sparse matrix (CSC format).
+            **kwargs: additional arguments to pass to evaluate_parallel.
+        """
         idx_all = np.arange(len(df_data))
         idx_splits = idx_all[batch_size::batch_size]
         idx_batches = np.array_split(idx_all, idx_splits)
@@ -288,7 +307,9 @@ class BasisFeaturizer:
             df_features = self.evaluate_parallel(df_data.iloc[idx_batch],
                                                  client,
                                                  **kwargs)
-            save_feature_db(df_features, filename, table_name=table_name)
+            save_feature_db(df_features, filename,
+                            table_name=table_name,
+                            sparse=sparse)
 
     def evaluate_configuration(self,
                                geom,
@@ -535,7 +556,7 @@ class BasisFeaturizer:
         return x, y, w
 
 
-def save_feature_db(dataframe, filename, table_name='features'):
+def save_feature_db(dataframe, filename, table_name='features', sparse=False):
     """
     Save dataframe with sqlite.
 
@@ -543,22 +564,68 @@ def save_feature_db(dataframe, filename, table_name='features'):
         dataframe (pd.DataFrame)
         filename (str)
         table_name (str): default "features".
+        sparse (bool): whether to save as sparse matrix (CSC format).
     """
-    dataframe.to_hdf(filename, table_name, mode="a", format='fixed')
+    if sparse:
+        # Pandas can't save sparse dataframes to HDF5 yet. So we do this manually.
+        csc_arr = scipy.sparse.csc_matrix(dataframe.values)
+        with tables.open_file(filename, mode='a') as f:
+            if ('/' + table_name) in f:
+                warnings.warn(f"Table {table_name} already exists in {filename}. Skipping...")
+            else:
+                group = f.create_group("/", table_name, '')
+
+                # Store the CSC matrix components
+                f.create_array(group, 'data', csc_arr.data)
+                f.create_array(group, 'indices', csc_arr.indices)
+                f.create_array(group, 'indptr', csc_arr.indptr)
+                f.create_array(group, 'shape', np.array(csc_arr.shape))
+                
+                # Store row and column names
+                geom_labels = dataframe.index.get_level_values(0).astype(str).to_list()
+                component_labels = dataframe.index.get_level_values(1).astype(str).to_list()
+                feature_labels = dataframe.columns.astype(str).to_list()
+
+                f.create_array(group, 'axis1_level0', geom_labels)
+                f.create_array(group, 'axis1_level1', component_labels)
+                f.create_array(group, 'axis0', feature_labels)
+    else:
+        dataframe.to_hdf(filename, table_name, mode="a", format='fixed')
 
 
-def load_feature_db(filename, table_name='features'):
+def load_feature_db(filename, table_name='features', sparse=False):
     """
     Load dataframe with sqlite.
 
     Args:
         filename (str)
         table_name (str): default "features".
+        sparse (bool): whether to load as sparse matrix (CSC format).
 
     Returns:
         dataframe (pd.DataFrame)
     """
-    dataframe = pd.read_hdf(filename, table_name)
+    if sparse:
+        with tables.open_file(filename, mode='r') as f:
+            group = f.get_node("/" + table_name)
+            data = f.get_node(group, 'data')[:]
+            indices = f.get_node(group, 'indices')[:]
+            indptr = f.get_node(group, 'indptr')[:]
+            shape = f.get_node(group, 'shape')[:]
+            geom_labels = [x.decode('utf-8')
+                           for x in f.get_node(group, 'axis1_level0')[:]]
+            component_labels = [x.decode('utf-8')
+                                for x in f.get_node(group, 'axis1_level1')[:]]
+            feature_labels = [x.decode('utf-8')
+                              for x in f.get_node(group, 'axis0')[:]]
+            
+            csc_arr = scipy.sparse.csc_matrix((data, indices, indptr), shape=shape)
+            row_indices = pd.MultiIndex.from_arrays([geom_labels, component_labels])
+            dataframe = pd.DataFrame(csc_arr.toarray(),
+                                     index=row_indices,
+                                     columns=feature_labels)
+    else:
+        dataframe = pd.read_hdf(filename, table_name)
     return dataframe
 
 
