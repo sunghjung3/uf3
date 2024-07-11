@@ -15,6 +15,7 @@ class HDF5Dataset(torch.utils.data.Dataset):
         filename (str): The path to the HDF5 file.
         table_names (list): A list of table names to load from the HDF5 file.
         subset (Collection): A subset of keys to load from the HDF5 file.
+        sparse (bool): Whether the HDF5 features are stored as sparse matrices.
 
     Returns:
         A PyTorch Dataset object.
@@ -23,10 +24,12 @@ class HDF5Dataset(torch.utils.data.Dataset):
                  filename: str,
                  table_names: List[str],
                  subset: Collection,
+                 sparse: bool = False,
                  ):
         self.filename = filename
         self.table_names = table_names
         self.subset = subset
+        self.sparse = sparse
 
     def __len__(self):
         return len(self.table_names)
@@ -34,7 +37,7 @@ class HDF5Dataset(torch.utils.data.Dataset):
     def __getitem__(self,
                     idx: int):
         table_name = self.table_names[idx]
-        df = process.load_feature_db(self.filename, table_name)
+        df = process.load_feature_db(self.filename, table_name, sparse=self.sparse)
         keys = df.index.unique(level=0).intersection(self.subset)
         if len(keys) == 0:
             return None  # Skip if no keys found
@@ -45,6 +48,7 @@ def hdf5_dataloader(filename: str,
                     table_names: List[str],
                     subset: Collection,
                     batch_size: int = 1,
+                    sparse: bool = False,
                     shuffle: bool = False,
                     drop_last: bool = False,
                     num_workers: int = 0,
@@ -57,6 +61,7 @@ def hdf5_dataloader(filename: str,
         table_names (list): A list of table names to load from the HDF5 file.
         subset (Collection): A subset of keys to load from the HDF5 file.
         batch_size (int): The batch size.
+        sparse (bool): Whether the HDF5 features are stored as sparse matrices.
         shuffle (bool): Whether to shuffle the data.
         drop_last (bool): Whether to drop the last batch if it is smaller
             than the batch size.
@@ -67,7 +72,7 @@ def hdf5_dataloader(filename: str,
     """
     def collate_fn(batch):
         return [item for item in batch if item is not None]
-    dataset = HDF5Dataset(filename, table_names, subset)
+    dataset = HDF5Dataset(filename, table_names, subset, sparse=sparse)
     dataloader = torch.utils.data.DataLoader(dataset,
                                              batch_size=batch_size,
                                              shuffle=shuffle,

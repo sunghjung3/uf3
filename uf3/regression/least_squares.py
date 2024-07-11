@@ -365,7 +365,9 @@ class WeightedLinearModel(BasicLinearModel):
                       sample_weights: Dict = None,
                       energy_key="energy",
                       progress: str = "bar",
-                      drop_columns: List[str] = None):
+                      drop_columns: List[str] = None,
+                      sparse: bool = False,
+                      ):
         """
         Accumulate inputs and outputs from batched parsing of HDF5 file
         and compute direct solution via LU decomposition.
@@ -384,6 +386,7 @@ class WeightedLinearModel(BasicLinearModel):
                 the cutoffs of the feature vectors from HDF5 file. No internal
                 checks are performed to see if dropping provided columns produce
                 features of the intended cutoffs. Use with Caution.
+            sparse (bool): whether the HDF5 features file is in sparse format.
         """
         if not os.path.isfile(filename):
             raise FileNotFoundError(filename)
@@ -395,7 +398,7 @@ class WeightedLinearModel(BasicLinearModel):
                                                 style=progress)
         for j in table_iterator:
             table_name = table_names[j]
-            df = process.load_feature_db(filename, table_name)
+            df = process.load_feature_db(filename, table_name, sparse=sparse)
             keys = df.index.unique(level=0).intersection(subset)
             if len(keys) == 0:
                 continue
@@ -761,6 +764,7 @@ class AlchemicalModel(WeightedLinearModel):
                       energy_key="energy",
                       progress: str = "bar",
                       drop_columns: List[str] = None,
+                      sparse: bool = False,
                       max_iter: int = 1,
                       checkpoint: int = 10,
                       params_filename: str = "alchemical_model_params.npz",
@@ -786,6 +790,7 @@ class AlchemicalModel(WeightedLinearModel):
                 the cutoffs of the feature vectors from HDF5 file. No internal
                 checks are performed to see if dropping provided columns produce
                 features of the intended cutoffs. Use with Caution.
+            sparse (bool): whether the HDF5 features file is in sparse format.
             max_iter (int): maximum number of iterations for alternating
                 least-squares optimization.
             checkpoint (int): frequency of checkpointing the training RMSE and
@@ -853,7 +858,7 @@ class AlchemicalModel(WeightedLinearModel):
                                                         leave=False)
                 for j in table_iterator:
                     table_name = table_names[j]
-                    df = process.load_feature_db(filename, table_name)
+                    df = process.load_feature_db(filename, table_name, sparse=sparse)
                     keys = df.index.unique(level=0).intersection(subset)
                     if len(keys) == 0:
                         continue
@@ -1277,6 +1282,7 @@ class AlchemicalModelTorch(AlchemicalModel, torch.nn.Module):
                         energy_key="energy",
                         progress: str = "bar",
                         drop_columns: List[str] = None,
+                        sparse: bool = False,
                         max_epochs: int = 1,
                         optimizer: torch.optim.Optimizer = None,
                         checkpoint: int = 10,
@@ -1306,6 +1312,7 @@ class AlchemicalModelTorch(AlchemicalModel, torch.nn.Module):
                 the cutoffs of the feature vectors from HDF5 file. No internal
                 checks are performed to see if dropping provided columns produce
                 features of the intended cutoffs. Use with Caution.
+            sparse (bool): whether the HDF5 features file is in sparse format.
             max_epochs (int): maximum number of iterations for alternating
                 least-squares optimization.
             optimizer (torch.optim.Optimizer): optimizer for training. If None,
@@ -1352,6 +1359,7 @@ class AlchemicalModelTorch(AlchemicalModel, torch.nn.Module):
                                                 table_names,
                                                 subset,
                                                 batch_size=batch_size,
+                                                sparse=sparse,
                                                 shuffle=shuffle,
                                                 drop_last=drop_last,
                                                 num_workers=dataloader_n_workers,
