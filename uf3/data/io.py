@@ -19,6 +19,7 @@ from ase.calculators import singlepoint
 from ase.calculators import calculator as ase_calc
 from uf3.util import subsample
 from uf3.util import parallel
+from uf3.representation import process
 
 
 class DataCoordinator:
@@ -956,7 +957,10 @@ def analyze_hdf_tables(filename: str) -> Tuple[int, int, List, Dict]:
     return n_chunks, n_entries, chunk_names, chunk_lengths
 
 
-def dataframe_batch_loader(filename: str, table_names: List) -> pd.DataFrame:
+def dataframe_batch_loader(filename: str,
+                           table_names: List,
+                           sparse: bool = False,
+                           ) -> pd.DataFrame:
     """
     Iterator for reading DataFrames from HDF5 using a list of table names,
     i.e. from io.analyze_hdf_tables.
@@ -964,9 +968,10 @@ def dataframe_batch_loader(filename: str, table_names: List) -> pd.DataFrame:
     Args:
         filename (str): path to HDF5 file.
         table_names (list): list of table names in HDF5 to read.
+        sparse (bool): whether the HDF5 features file is in sparse format.
     """
     for table_name in table_names:
-        df = pd.read_hdf(filename, table_name)
+        df = process.load_feature_db(filename, table_name, sparse=sparse)
         yield df
 
 

@@ -491,6 +491,7 @@ class WeightedLinearModel(BasicLinearModel):
                         table_names: List[str] = None,
                         score: bool = True,
                         drop_columns: List[str] = None,
+                        sparse: bool = False,
                         client = None,
                         n_jobs: int = 1,
                         shuffle: bool = False,
@@ -504,6 +505,15 @@ class WeightedLinearModel(BasicLinearModel):
             keys (list): keys to query from df (e.g. training subset).
             table_names (list): list of table names in HDF5 to read.
             score (bool): whether to return root mean square error metrics.
+            drop_columns (list): list of columns to drop. Used when modifying
+                the cutoffs of the feature vectors from HDF5 file. No internal
+                checks are performed to see if dropping provided columns produce
+                features of the intended cutoffs. Use with Caution.
+            sparse (bool): whether the HDF5 features file is in sparse format.
+            client (concurrent.futures.Executor, dask.distributed.Client)
+            n_jobs (int): number of parallel jobs for batched prediction.
+            shuffle (bool): whether to shuffle the order of keys.
+            progress (str): style for progress indicators.
 
         Returns:
             y_e (np.ndarray): target values for energies.
@@ -528,6 +538,7 @@ class WeightedLinearModel(BasicLinearModel):
                                                          subset_keys=keys,
                                                          n_elements=n_elements,
                                                          drop_columns=drop_columns,
+                                                         sparse=sparse,
                                                          client=client,
                                                          n_jobs=n_jobs,
                                                          shuffle=shuffle,
@@ -1887,6 +1898,7 @@ def batched_prediction(table_names: Collection,
                        filename: str,
                        subset_keys: Collection = None,
                        drop_columns: List[str] = None,
+                       sparse: bool = False,
                        **kwargs):
     """
     Convenience function for optimization workflow. Read inputs/outputs
@@ -1901,6 +1913,7 @@ def batched_prediction(table_names: Collection,
             the cutoffs of the feature vectors from HDF5 file. No internal
             checks are performed to see if dropping provided columns produce
             features of the intended cutoffs. Use with Caution.
+        sparse (bool): whether the HDF5 features file is in sparse format.
 
     Returns:
         y_e (np.ndarray): target values for energies.
@@ -1908,7 +1921,7 @@ def batched_prediction(table_names: Collection,
         y_f (np.ndarray): target values for forces.
         p_f (np.ndarray): prediction values for forces.
     """
-    df_batches = io.dataframe_batch_loader(filename, table_names)
+    df_batches = io.dataframe_batch_loader(filename, table_names, sparse=sparse)
     y_e = []
     p_e = []
     y_f = []
@@ -1937,6 +1950,7 @@ def batched_prediction_parallel(model: WeightedLinearModel,
                                 table_names: Collection = None,
                                 subset_keys: Collection = None,
                                 drop_columns: List[str] = None,
+                                sparse: bool = False,
                                 client = None,
                                 n_jobs: int = 1,
                                 shuffle: bool = False,
@@ -1954,6 +1968,7 @@ def batched_prediction_parallel(model: WeightedLinearModel,
             the cutoffs of the feature vectors from HDF5 file. No internal
             checks are performed to see if dropping provided columns produce
             features of the intended cutoffs. Use with Caution.
+        sparse (bool): whether the HDF5 features file is in sparse format.
         client (concurrent.futures.Executor, dask.distributed.Client)
         n_jobs (int): number of parallel jobs for batched prediction.
         shuffle (bool): shuffle the dataset during prediction.
@@ -1977,6 +1992,7 @@ def batched_prediction_parallel(model: WeightedLinearModel,
                                   filename,
                                   subset_keys=subset_keys,
                                   drop_columns=drop_columns,
+                                  sparse=sparse,
                                   **kwargs,
                                   )
     if shuffle:
@@ -1994,6 +2010,7 @@ def batched_prediction_parallel(model: WeightedLinearModel,
                                         filename=filename,
                                         subset_keys=subset_keys,
                                         drop_columns=drop_columns,
+                                        sparse=sparse,
                                         **kwargs,
                                         )
     results_tuple = parallel.gather_and_merge(future_list,
