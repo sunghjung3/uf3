@@ -625,10 +625,13 @@ def load_feature_db(filename, table_name='features', sparse_hdf5=False):
                 row_indices = pd.MultiIndex.from_arrays(
                     [geom_labels, component_labels]
                     )
-                dataframe = pd.DataFrame.sparse.from_spmatrix(csc_arr,
-                                                            index=row_indices,
-                                                            columns=feature_labels,
-                                                            )
+                #dataframe = pd.DataFrame.sparse.from_spmatrix(csc_arr,
+                #                                            index=row_indices,
+                #                                            columns=feature_labels,
+                #                                            )
+                dataframe = pd.DataFrame(csc_arr.toarray(),
+                                        index=row_indices,
+                                        columns=feature_labels)
         except tables.NoSuchNodeError:
             raise ValueError(f"{filename} is not formatted correctly or is corrupt.\n"
                              f"Are you sure {filename} is stored in sparse format?")
