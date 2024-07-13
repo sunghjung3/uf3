@@ -495,7 +495,6 @@ class WeightedLinearModel(BasicLinearModel):
                         drop_columns: List[str] = None,
                         sparse_hdf5: bool = False,
                         client = None,
-                        n_jobs: int = 1,
                         shuffle: bool = False,
                         progress: str = "bar",
                         ):
@@ -513,7 +512,6 @@ class WeightedLinearModel(BasicLinearModel):
                 features of the intended cutoffs. Use with Caution.
             sparse_hdf5 (bool): whether the HDF5 features file is in sparse format.
             client (concurrent.futures.Executor, dask.distributed.Client)
-            n_jobs (int): number of parallel jobs for batched prediction.
             shuffle (bool): whether to shuffle the order of keys.
             progress (str): style for progress indicators.
 
@@ -529,7 +527,6 @@ class WeightedLinearModel(BasicLinearModel):
                 checks are performed to see if dropping provided columns produce
                 features of the intended cutoffs. Use with Caution.
             client (concurrent.futures.Executor, dask.distributed.Client)
-            n_jobs (int): number of parallel jobs for batched prediction.
             shuffle (bool): whether to shuffle the order of keys.
             progress (str): style for progress indicators.
         """
@@ -542,7 +539,6 @@ class WeightedLinearModel(BasicLinearModel):
                                                          drop_columns=drop_columns,
                                                          sparse_hdf5=sparse_hdf5,
                                                          client=client,
-                                                         n_jobs=n_jobs,
                                                          shuffle=shuffle,
                                                          progress=progress,
                                                          )
@@ -783,6 +779,7 @@ class AlchemicalModel(WeightedLinearModel):
                       params_filename: str = "alchemical_model_params.npz",
                       tracker_filename: str = "train_tracker.npz",
                       train_iter_filename: str = ".train_iter",
+                      client = None,
                       ):
         """
         Accumulate inputs and outputs from batched parsing of HDF5 file
@@ -814,6 +811,7 @@ class AlchemicalModel(WeightedLinearModel):
                 checkpoints.
             train_iter_filename (str): filename for writing current iteration
                 number during checkpoints.
+            client (concurrent.futures.Executor, dask.distributed.Client)
         """
         if os.path.exists(params_filename):
             warnings.warn(f"Warning: {params_filename} already exists. It will be overwritten")
@@ -833,7 +831,10 @@ class AlchemicalModel(WeightedLinearModel):
         print("Initial RMSE check.")
         self.decompress_alchemical_parameters()
         _, _, _, _, rmse_e, rmse_f = self.batched_predict(filename,
-                                                keys=subset)
+                                                keys=subset,
+                                                sparse_hdf5=sparse_hdf5,
+                                                client=client,
+                                                )
         print()
 
         if not os.path.isfile(filename):
@@ -936,7 +937,7 @@ class AlchemicalModel(WeightedLinearModel):
                     # normalize all weights between -1 and 1
                     #normalization_factor = np.max(np.abs(pseudo_weights))
                     #pseudo_weights /= normalization_factor
-                    #self.coeff_2b *= normalization_factor  # not necessary if coeffs are train again
+                    #self.coeff_2b *= normalization_factor  # not necessary if coeffs are trained again
                     max_change_pseudo = np.max(np.abs(pseudo_weights - self.pseudo_weights))
                     change_pseudo_tracker[i] = max_change_pseudo
                     print(f"\tMax change in pseudo weights: {max_change_pseudo:.3E}")
@@ -960,7 +961,10 @@ class AlchemicalModel(WeightedLinearModel):
 
                 # Check RMSE
                 _, _, _, _, rmse_e, rmse_f = self.batched_predict(filename,
-                                                        keys=subset)
+                                                        keys=subset,
+                                                        sparse_hdf5=sparse_hdf5,
+                                                        client=client,
+                                                        )
                 if i+1 == max_iter:
                     rmse_e_tracker[-1] = rmse_e
                     rmse_f_tracker[-1] = rmse_f
@@ -1505,7 +1509,9 @@ class AlchemicalModelTorch(AlchemicalModel, torch.nn.Module):
                     print()
                     print("Final RMSE check.")
                     _, _, _, _, rmse_e, rmse_f = self.batched_predict(filename,
-                                                            keys=subset)
+                                                            keys=subset,
+                                                            sparse_hdf5=sparse_hdf5,
+                                                            )
                     rmse_e_tracker[-1] = rmse_e
                     rmse_f_tracker[-1] = rmse_f
 
@@ -1962,7 +1968,6 @@ def batched_prediction_parallel(model: WeightedLinearModel,
                                 drop_columns: List[str] = None,
                                 sparse_hdf5: bool = False,
                                 client = None,
-                                n_jobs: int = 1,
                                 shuffle: bool = False,
                                 progress: str = "bar",
                                 **kwargs):
@@ -1980,7 +1985,6 @@ def batched_prediction_parallel(model: WeightedLinearModel,
             features of the intended cutoffs. Use with Caution.
         sparse_hdf5 (bool): whether the HDF5 features file is in sparse format.
         client (concurrent.futures.Executor, dask.distributed.Client)
-        n_jobs (int): number of parallel jobs for batched prediction.
         shuffle (bool): shuffle the dataset during prediction.
         progress (str): style for progress indicators.
 
@@ -1994,6 +1998,12 @@ def batched_prediction_parallel(model: WeightedLinearModel,
         _, _, table_names, _ = io.analyze_hdf_tables(filename)
     else:
         table_names = copy.copy(table_names)
+
+    if parallel.USE_DASK:
+        client_info = client.scheduler_info()
+        n_jobs = client_info['workers'] * client_info['nthreads']
+    else:
+        n_jobs = client._max_workers
 
     if n_jobs < 2 or client is None:
         warnings.warn("Processing in serial.", RuntimeWarning)
