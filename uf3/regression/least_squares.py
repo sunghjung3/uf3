@@ -366,7 +366,7 @@ class WeightedLinearModel(BasicLinearModel):
                       energy_key="energy",
                       progress: str = "bar",
                       drop_columns: List[str] = None,
-                      sparse: bool = False,
+                      sparse_hdf5: bool = False,
                       ):
         """
         Accumulate inputs and outputs from batched parsing of HDF5 file
@@ -386,7 +386,7 @@ class WeightedLinearModel(BasicLinearModel):
                 the cutoffs of the feature vectors from HDF5 file. No internal
                 checks are performed to see if dropping provided columns produce
                 features of the intended cutoffs. Use with Caution.
-            sparse (bool): whether the HDF5 features file is in sparse format.
+            sparse_hdf5 (bool): whether the HDF5 features file is in sparse format.
         """
         if not os.path.isfile(filename):
             raise FileNotFoundError(filename)
@@ -398,7 +398,7 @@ class WeightedLinearModel(BasicLinearModel):
                                                 style=progress)
         for j in table_iterator:
             table_name = table_names[j]
-            df = process.load_feature_db(filename, table_name, sparse=sparse)
+            df = process.load_feature_db(filename, table_name, sparse_hdf5=sparse_hdf5)
             keys = df.index.unique(level=0).intersection(subset)
             if len(keys) == 0:
                 continue
@@ -412,7 +412,8 @@ class WeightedLinearModel(BasicLinearModel):
                                               f_variance=f_variance,
                                               sample_weights=sample_weights,
                                               energy_key=energy_key,
-                                              batch_size=batch_size)
+                                              batch_size=batch_size,
+                                              )
             g_e, g_f, o_e, o_f = intermediates
             gram_e += g_e
             gram_f += g_f
@@ -447,7 +448,8 @@ class WeightedLinearModel(BasicLinearModel):
                      f_variance: VarianceRecorder = None,
                      sample_weights: Dict = None,
                      energy_key: str = "energy",
-                     batch_size: int = 2500):
+                     batch_size: int = 2500,
+                     ):
         """
         Extract inputs and outputs from dataframe and compute
         moore-penrose components (gram matrices and ordinates).
@@ -491,7 +493,7 @@ class WeightedLinearModel(BasicLinearModel):
                         table_names: List[str] = None,
                         score: bool = True,
                         drop_columns: List[str] = None,
-                        sparse: bool = False,
+                        sparse_hdf5: bool = False,
                         client = None,
                         n_jobs: int = 1,
                         shuffle: bool = False,
@@ -509,7 +511,7 @@ class WeightedLinearModel(BasicLinearModel):
                 the cutoffs of the feature vectors from HDF5 file. No internal
                 checks are performed to see if dropping provided columns produce
                 features of the intended cutoffs. Use with Caution.
-            sparse (bool): whether the HDF5 features file is in sparse format.
+            sparse_hdf5 (bool): whether the HDF5 features file is in sparse format.
             client (concurrent.futures.Executor, dask.distributed.Client)
             n_jobs (int): number of parallel jobs for batched prediction.
             shuffle (bool): whether to shuffle the order of keys.
@@ -538,7 +540,7 @@ class WeightedLinearModel(BasicLinearModel):
                                                          subset_keys=keys,
                                                          n_elements=n_elements,
                                                          drop_columns=drop_columns,
-                                                         sparse=sparse,
+                                                         sparse_hdf5=sparse_hdf5,
                                                          client=client,
                                                          n_jobs=n_jobs,
                                                          shuffle=shuffle,
@@ -775,7 +777,7 @@ class AlchemicalModel(WeightedLinearModel):
                       energy_key="energy",
                       progress: str = "bar",
                       drop_columns: List[str] = None,
-                      sparse: bool = False,
+                      sparse_hdf5: bool = False,
                       max_iter: int = 1,
                       checkpoint: int = 10,
                       params_filename: str = "alchemical_model_params.npz",
@@ -801,7 +803,7 @@ class AlchemicalModel(WeightedLinearModel):
                 the cutoffs of the feature vectors from HDF5 file. No internal
                 checks are performed to see if dropping provided columns produce
                 features of the intended cutoffs. Use with Caution.
-            sparse (bool): whether the HDF5 features file is in sparse format.
+            sparse_hdf5 (bool): whether the HDF5 features file is in sparse format.
             max_iter (int): maximum number of iterations for alternating
                 least-squares optimization.
             checkpoint (int): frequency of checkpointing the training RMSE and
@@ -869,7 +871,7 @@ class AlchemicalModel(WeightedLinearModel):
                                                         leave=False)
                 for j in table_iterator:
                     table_name = table_names[j]
-                    df = process.load_feature_db(filename, table_name, sparse=sparse)
+                    df = process.load_feature_db(filename, table_name, sparse_hdf5=sparse_hdf5)
                     keys = df.index.unique(level=0).intersection(subset)
                     if len(keys) == 0:
                         continue
@@ -1293,7 +1295,7 @@ class AlchemicalModelTorch(AlchemicalModel, torch.nn.Module):
                         energy_key="energy",
                         progress: str = "bar",
                         drop_columns: List[str] = None,
-                        sparse: bool = False,
+                        sparse_hdf5: bool = False,
                         max_epochs: int = 1,
                         optimizer: torch.optim.Optimizer = None,
                         checkpoint: int = 10,
@@ -1323,7 +1325,7 @@ class AlchemicalModelTorch(AlchemicalModel, torch.nn.Module):
                 the cutoffs of the feature vectors from HDF5 file. No internal
                 checks are performed to see if dropping provided columns produce
                 features of the intended cutoffs. Use with Caution.
-            sparse (bool): whether the HDF5 features file is in sparse format.
+            sparse_hdf5 (bool): whether the HDF5 features file is in sparse format.
             max_epochs (int): maximum number of iterations for alternating
                 least-squares optimization.
             optimizer (torch.optim.Optimizer): optimizer for training. If None,
@@ -1370,7 +1372,7 @@ class AlchemicalModelTorch(AlchemicalModel, torch.nn.Module):
                                                 table_names,
                                                 subset,
                                                 batch_size=batch_size,
-                                                sparse=sparse,
+                                                sparse_hdf5=sparse_hdf5,
                                                 shuffle=shuffle,
                                                 drop_last=drop_last,
                                                 num_workers=dataloader_n_workers,
@@ -1550,7 +1552,8 @@ def get_spline_taylor_expansion(r_target,
 def dataframe_to_tuples(df_features,
                         n_elements=None,
                         energy_key='energy',
-                        sample_weights=None):
+                        sample_weights=None,
+                        ):
     """
     Extract energy/force inputs/outputs from DataFrame.
 
@@ -1573,27 +1576,33 @@ def dataframe_to_tuples(df_features,
     energy_mask = (y_index == energy_key)
     force_mask = np.logical_not(energy_mask)
     data = df_features.to_numpy()
-    y = data[:, 0]
+    y = data[:, [0]]
     x = data[:, 1:]
     y_e = y[energy_mask]
     y_f = y[force_mask]
 
-    if n_elements is not None:
-        s = np.sum(x[energy_mask, :n_elements], axis=1)
-        x_e = np.divide(x[energy_mask].T, s).T
-        y_e = y_e / s
+    if n_elements is not None:        
+        s = np.sum(x[energy_mask, :n_elements], axis=1).reshape(-1, 1)
+        x_e = x[energy_mask] / s  # row-wise normalization
+        y_e = y_e / s  # both y_e and s are 2D arrays with shape (n, 1) here
     else:
         x_e = x[energy_mask]
     x_f = x[force_mask]
 
     if sample_weights is not None:
-        w = np.array([sample_weights.get(name, 1.0) for name in names])
+        w = np.array([sample_weights.get(name, 1.0) for name in names]).\
+                reshape(-1, 1)
         w_e = w[energy_mask]
         w_f = w[force_mask]
-        x_e = np.multiply(x_e.T, w_e).T
-        y_e = np.multiply(y_e, w_e)
-        x_f = np.multiply(x_f.T, w_f).T
-        y_f = np.multiply(y_f, w_f)
+        x_e *= w_e
+        y_e *= w_e
+        x_f *= w_f
+        y_f *= w_f
+
+    # Flatten y to 1D
+    y_e = y_e.flatten()
+    y_f = y_f.flatten()
+
     return x_e, y_e, x_f, y_f
 
 
@@ -1775,7 +1784,8 @@ def freeze_columns_from_df(df: pd.DataFrame,
     x_e, y_e, x_f, y_f = dataframe_to_tuples(df.loc[keys],
                                              n_elements=n_elements,
                                              energy_key=energy_key,
-                                             sample_weights=sample_weights)
+                                             sample_weights=sample_weights,
+                                             )
     x_e, y_e = freeze_columns(x_e,
                               y_e,
                               mask,
@@ -1898,7 +1908,7 @@ def batched_prediction(table_names: Collection,
                        filename: str,
                        subset_keys: Collection = None,
                        drop_columns: List[str] = None,
-                       sparse: bool = False,
+                       sparse_hdf5: bool = False,
                        **kwargs):
     """
     Convenience function for optimization workflow. Read inputs/outputs
@@ -1913,7 +1923,7 @@ def batched_prediction(table_names: Collection,
             the cutoffs of the feature vectors from HDF5 file. No internal
             checks are performed to see if dropping provided columns produce
             features of the intended cutoffs. Use with Caution.
-        sparse (bool): whether the HDF5 features file is in sparse format.
+        sparse_hdf5 (bool): whether the HDF5 features file is in sparse format.
 
     Returns:
         y_e (np.ndarray): target values for energies.
@@ -1921,7 +1931,7 @@ def batched_prediction(table_names: Collection,
         y_f (np.ndarray): target values for forces.
         p_f (np.ndarray): prediction values for forces.
     """
-    df_batches = io.dataframe_batch_loader(filename, table_names, sparse=sparse)
+    df_batches = io.dataframe_batch_loader(filename, table_names, sparse_hdf5=sparse_hdf5)
     y_e = []
     p_e = []
     y_f = []
@@ -1950,7 +1960,7 @@ def batched_prediction_parallel(model: WeightedLinearModel,
                                 table_names: Collection = None,
                                 subset_keys: Collection = None,
                                 drop_columns: List[str] = None,
-                                sparse: bool = False,
+                                sparse_hdf5: bool = False,
                                 client = None,
                                 n_jobs: int = 1,
                                 shuffle: bool = False,
@@ -1968,7 +1978,7 @@ def batched_prediction_parallel(model: WeightedLinearModel,
             the cutoffs of the feature vectors from HDF5 file. No internal
             checks are performed to see if dropping provided columns produce
             features of the intended cutoffs. Use with Caution.
-        sparse (bool): whether the HDF5 features file is in sparse format.
+        sparse_hdf5 (bool): whether the HDF5 features file is in sparse format.
         client (concurrent.futures.Executor, dask.distributed.Client)
         n_jobs (int): number of parallel jobs for batched prediction.
         shuffle (bool): shuffle the dataset during prediction.
@@ -1992,7 +2002,7 @@ def batched_prediction_parallel(model: WeightedLinearModel,
                                   filename,
                                   subset_keys=subset_keys,
                                   drop_columns=drop_columns,
-                                  sparse=sparse,
+                                  sparse_hdf5=sparse_hdf5,
                                   **kwargs,
                                   )
     if shuffle:
@@ -2010,7 +2020,7 @@ def batched_prediction_parallel(model: WeightedLinearModel,
                                         filename=filename,
                                         subset_keys=subset_keys,
                                         drop_columns=drop_columns,
-                                        sparse=sparse,
+                                        sparse_hdf5=sparse_hdf5,
                                         **kwargs,
                                         )
     results_tuple = parallel.gather_and_merge(future_list,

@@ -263,7 +263,7 @@ class BasisFeaturizer:
                        batch_size=50,
                        progress="bar",
                        table_template="features_{}",
-                       sparse=False,
+                       sparse_hdf5=False,
                        **kwargs):
         """
         Featurize structures and write to HDF5 file in batches.
@@ -278,7 +278,7 @@ class BasisFeaturizer:
             batch_size (int): number of configurations per batch.
             progress (str): style of progress counter.
             table_template (str): template for table names.
-            sparse (bool): whether to save as sparse matrix (CSC format).
+            sparse_hdf5 (bool): whether to save as sparse matrix (CSC format).
             **kwargs: additional arguments to pass to evaluate_parallel.
         """
         idx_all = np.arange(len(df_data))
@@ -309,7 +309,7 @@ class BasisFeaturizer:
                                                  **kwargs)
             save_feature_db(df_features, filename,
                             table_name=table_name,
-                            sparse=sparse)
+                            sparse_hdf5=sparse_hdf5)
 
     def evaluate_configuration(self,
                                geom,
@@ -556,7 +556,7 @@ class BasisFeaturizer:
         return x, y, w
 
 
-def save_feature_db(dataframe, filename, table_name='features', sparse=False):
+def save_feature_db(dataframe, filename, table_name='features', sparse_hdf5=False):
     """
     Save dataframe with sqlite.
 
@@ -564,9 +564,9 @@ def save_feature_db(dataframe, filename, table_name='features', sparse=False):
         dataframe (pd.DataFrame)
         filename (str)
         table_name (str): default "features".
-        sparse (bool): whether to save as sparse matrix (CSC format).
+        sparse_hdf5 (bool): whether to save as sparse matrix (CSC format).
     """
-    if sparse:
+    if sparse_hdf5:
         # Pandas can't save sparse dataframes to HDF5 yet. So we do this manually.
         csc_arr = scipy.sparse.csc_matrix(dataframe.values)
         with tables.open_file(filename, mode='a') as f:
@@ -593,39 +593,51 @@ def save_feature_db(dataframe, filename, table_name='features', sparse=False):
         dataframe.to_hdf(filename, table_name, mode="a", format='fixed')
 
 
-def load_feature_db(filename, table_name='features', sparse=False):
+def load_feature_db(filename, table_name='features', sparse_hdf5=False):
     """
     Load dataframe with sqlite.
 
     Args:
         filename (str)
         table_name (str): default "features".
-        sparse (bool): whether to load as sparse matrix (CSC format).
+        sparse_hdf5 (bool): whether the HDF5 features file is in sparse format.
 
     Returns:
         dataframe (pd.DataFrame)
     """
-    if sparse:
-        with tables.open_file(filename, mode='r') as f:
-            group = f.get_node("/" + table_name)
-            data = f.get_node(group, 'data')[:]
-            indices = f.get_node(group, 'indices')[:]
-            indptr = f.get_node(group, 'indptr')[:]
-            shape = f.get_node(group, 'shape')[:]
-            geom_labels = [x.decode('utf-8')
-                           for x in f.get_node(group, 'axis1_level0')[:]]
-            component_labels = [x.decode('utf-8')
-                                for x in f.get_node(group, 'axis1_level1')[:]]
-            feature_labels = [x.decode('utf-8')
-                              for x in f.get_node(group, 'axis0')[:]]
-            
-            csc_arr = scipy.sparse.csc_matrix((data, indices, indptr), shape=shape)
-            row_indices = pd.MultiIndex.from_arrays([geom_labels, component_labels])
-            dataframe = pd.DataFrame(csc_arr.toarray(),
-                                     index=row_indices,
-                                     columns=feature_labels)
+    if sparse_hdf5:
+        try:
+            with tables.open_file(filename, mode='r') as f:
+                group = f.get_node("/" + table_name)
+                data = f.get_node(group, 'data')[:]
+                indices = f.get_node(group, 'indices')[:]
+                indptr = f.get_node(group, 'indptr')[:]
+                shape = f.get_node(group, 'shape')[:]
+                geom_labels = [x.decode('utf-8')
+                            for x in f.get_node(group, 'axis1_level0')[:]]
+                component_labels = [x.decode('utf-8')
+                                    for x in f.get_node(group, 'axis1_level1')[:]]
+                feature_labels = [x.decode('utf-8')
+                                for x in f.get_node(group, 'axis0')[:]]
+                
+                csc_arr = scipy.sparse.csc_array((data, indices, indptr),
+                                                 shape=shape)
+                row_indices = pd.MultiIndex.from_arrays(
+                    [geom_labels, component_labels]
+                    )
+                dataframe = pd.DataFrame.sparse.from_spmatrix(csc_arr,
+                                                            index=row_indices,
+                                                            columns=feature_labels,
+                                                            )
+        except tables.NoSuchNodeError:
+            raise ValueError(f"{filename} is not formatted correctly or is corrupt.\n"
+                             f"Are you sure {filename} is stored in sparse format?")
     else:
-        dataframe = pd.read_hdf(filename, table_name)
+        try:
+            dataframe = pd.read_hdf(filename, table_name)
+        except TypeError:
+            raise ValueError(f"{filename} is not formatted correctly or is corrupt.\n"
+                             f"Are you sure {filename} is stored in dense format?")
     return dataframe
 
 
