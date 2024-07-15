@@ -162,7 +162,8 @@ class BasisFeaturizer:
             if energy_key in column_positions:
                 energy = row[column_positions[energy_key]]
             if 'fx' in column_positions and self.fit_forces:
-                forces = [row[column_positions[component]]
+                # reshape to ensure correct forces shape for geom with 1 atom
+                forces = [row[column_positions[component]].reshape((-1,))
                           for component in ['fx', 'fy', 'fz']]
                 if np.any(np.isnan(forces)):
                     forces = None  # invalid forces
