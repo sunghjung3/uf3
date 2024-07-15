@@ -935,9 +935,9 @@ class AlchemicalModel(WeightedLinearModel):
                 elif param_to_fit == "pseudo_weights":
                     pseudo_weights = fitted_params.reshape(self.n_pairtypes, self.n_pseudo)
                     # normalize all weights between -1 and 1
-                    #normalization_factor = np.max(np.abs(pseudo_weights))
-                    #pseudo_weights /= normalization_factor
-                    #self.coeff_2b *= normalization_factor  # not necessary if coeffs are trained again
+                    normalization_factor = np.max(np.abs(pseudo_weights))
+                    pseudo_weights /= normalization_factor
+                    self.coeff_2b *= normalization_factor  # not necessary if coeffs are trained again
                     max_change_pseudo = np.max(np.abs(pseudo_weights - self.pseudo_weights))
                     change_pseudo_tracker[i] = max_change_pseudo
                     print(f"\tMax change in pseudo weights: {max_change_pseudo:.3E}")
