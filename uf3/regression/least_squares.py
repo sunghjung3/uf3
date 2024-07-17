@@ -936,9 +936,9 @@ class AlchemicalModel(WeightedLinearModel):
                         reshape(self.n_pseudo, self.n_basis).T
                 elif param_to_fit == "pseudo_weights":
                     pseudo_weights = fitted_params.reshape(self.n_pairtypes, self.n_pseudo)
-                    # normalize all weights between -1 and 1
-                    normalization_factor = np.max(np.abs(pseudo_weights))
-                    pseudo_weights /= normalization_factor
+                    # normalize weights s.t. each column is between -1 and 1
+                    normalization_factor = np.max(np.abs(pseudo_weights), axis=0)
+                    pseudo_weights /= normalization_factor  # broadcasted over columns
                     self.coeff_2b *= normalization_factor  # not necessary if coeffs are trained again
                     max_change_pseudo = np.max(np.abs(pseudo_weights - self.pseudo_weights))
                     max_change_1b = np.max(np.abs(old_coeff_1b - self.coeff_1b))
