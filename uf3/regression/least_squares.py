@@ -776,6 +776,7 @@ class AlchemicalModel(WeightedLinearModel):
                       sparse_hdf5: bool = False,
                       max_iter: int = 1,
                       checkpoint: int = 10,
+                      checkpoint_dir: str = ".",
                       params_filename: str = "alchemical_model_params.npz",
                       tracker_filename: str = "train_tracker.npz",
                       train_iter_filename: str = ".train_iter",
@@ -805,16 +806,22 @@ class AlchemicalModel(WeightedLinearModel):
                 least-squares optimization.
             checkpoint (int): frequency of checkpointing the training RMSE and
                 saving parameters to disk.
+            checkpoint_dir (str): directory for saving checkpoints.
             params_filename (str): filename for saving parameters during
-                checkpoints.
+                checkpoints. Will be saved to `checkpoint_dir/<iteration>/`.
             train_tracker (str): filename for saving training tracker during
-                checkpoints.
+                checkpoints. Will be saved to `checkpoint_dir/`.
             train_iter_filename (str): filename for writing current iteration
-                number during checkpoints.
+                number during checkpoints. Will be saved to `checkpoint_dir/`.
             client (concurrent.futures.Executor, dask.distributed.Client)
         """
-        if os.path.exists(params_filename):
-            warnings.warn(f"Warning: {params_filename} already exists. It will be overwritten")
+        os.makedirs(checkpoint_dir, exist_ok=True)  # no error if exists
+        get_params_dir = lambda i: os.path.join(checkpoint_dir, str(i))
+        get_params_path = lambda i: os.path.join(get_params_dir(i), params_filename)
+        tracker_filename = os.path.join(checkpoint_dir, tracker_filename)
+        train_iter_filename = os.path.join(checkpoint_dir, train_iter_filename)
+        if os.path.exists( get_params_path(1) ):
+            warnings.warn(f"Warning: {get_params_path(1)} already exists. It will be overwritten")
         if os.path.exists(tracker_filename):
             warnings.warn(f"Warning: {tracker_filename} already exists. It will be overwritten")
 
@@ -845,7 +852,7 @@ class AlchemicalModel(WeightedLinearModel):
         print(f"Beginning alternating least-squares optimization:")
         print(f"\tMax iterations: {max_iter}")
         print(f"\tCheckpoint frequency: {checkpoint}")
-        print(f"\tParameters filename: {params_filename}")
+        print(f"\tParameters filename: {get_params_path('<iteration>')}")
         print(f"\tTracker filename: {tracker_filename}")
         print(f"\tTrain iteration filename: {train_iter_filename}")
         print()
@@ -922,16 +929,11 @@ class AlchemicalModel(WeightedLinearModel):
                 fitted_params = lu_factorization(gram, ordinate)
 
                 if param_to_fit == "coeff":
-                    coeff_1b = fitted_params[:self.n_elements]
-                    coeff_2b = fitted_params[self.n_elements:].reshape(self.n_pseudo, self.n_basis).T
-                    max_change_1b = np.max(np.abs(coeff_1b - self.coeff_1b))
-                    max_change_2b = np.max(np.abs(coeff_2b[self.frozen_2b_data_coverage] - self.coeff_2b[self.frozen_2b_data_coverage]))
-                    change_1b_tracker[i] = max_change_1b
-                    change_2b_tracker[i] = max_change_2b
-                    print(f"\tMax change in 1-body coefficients: {max_change_1b:.3E}")
-                    print(f"\tMax change in 2-body coefficients: {max_change_2b:.3E}")  # TODO: take into account normalization factor from W training
-                    self.coeff_1b = coeff_1b
-                    self.coeff_2b = coeff_2b
+                    old_coeff_1b = self.coeff_1b
+                    old_coeff_2b = self.coeff_2b
+                    self.coeff_1b = fitted_params[:self.n_elements]
+                    self.coeff_2b = fitted_params[self.n_elements:].\
+                        reshape(self.n_pseudo, self.n_basis).T
                 elif param_to_fit == "pseudo_weights":
                     pseudo_weights = fitted_params.reshape(self.n_pairtypes, self.n_pseudo)
                     # normalize all weights between -1 and 1
@@ -939,7 +941,16 @@ class AlchemicalModel(WeightedLinearModel):
                     pseudo_weights /= normalization_factor
                     self.coeff_2b *= normalization_factor  # not necessary if coeffs are trained again
                     max_change_pseudo = np.max(np.abs(pseudo_weights - self.pseudo_weights))
+                    max_change_1b = np.max(np.abs(old_coeff_1b - self.coeff_1b))
+                    max_change_2b = np.max(np.abs(
+                        old_coeff_2b[self.frozen_2b_data_coverage] - 
+                        self.coeff_2b[self.frozen_2b_data_coverage]
+                        ))
+                    change_1b_tracker[i] = max_change_1b
+                    change_2b_tracker[i] = max_change_2b
                     change_pseudo_tracker[i] = max_change_pseudo
+                    print(f"\tMax change in 1-body coefficients: {max_change_1b:.3E}")
+                    print(f"\tMax change in 2-body coefficients: {max_change_2b:.3E}")
                     print(f"\tMax change in pseudo weights: {max_change_pseudo:.3E}")
                     self.pseudo_weights = pseudo_weights
                 print()
@@ -969,18 +980,20 @@ class AlchemicalModel(WeightedLinearModel):
                     rmse_e_tracker[-1] = rmse_e
                     rmse_f_tracker[-1] = rmse_f
 
-                np.savez(params_filename,
+                os.makedirs(get_params_dir(i+1), exist_ok=True)
+                np.savez(get_params_path(i+1),
                          coeff_1b=self.coeff_1b,
                          coeff_2b=self.coeff_2b,
                          pseudo_weights=self.pseudo_weights)
 
                 np.savez(tracker_filename,
-                            change_pseudo=change_pseudo_tracker,
-                            change_1b=change_1b_tracker,
-                            change_2b=change_2b_tracker,
-                            rmse_e=rmse_e_tracker,
-                            rmse_f=rmse_f_tracker,
-                            time=time_tracker)
+                         change_pseudo=change_pseudo_tracker,
+                         change_1b=change_1b_tracker,
+                         change_2b=change_2b_tracker,
+                         rmse_e=rmse_e_tracker,
+                         rmse_f=rmse_f_tracker,
+                         frozen_2b_data_coverage=self.frozen_2b_data_coverage,
+                         time=time_tracker)
 
                 with open(train_iter_filename, "w") as f:
                     f.write(f"{i+1}\n")
@@ -1303,6 +1316,7 @@ class AlchemicalModelTorch(AlchemicalModel, torch.nn.Module):
                         max_epochs: int = 1,
                         optimizer: torch.optim.Optimizer = None,
                         checkpoint: int = 10,
+                        checkpoint_dir: str = ".",
                         shuffle: bool = True,
                         drop_last: bool = False,
                         dataloader_n_workers: int = 0,
@@ -1336,6 +1350,7 @@ class AlchemicalModelTorch(AlchemicalModel, torch.nn.Module):
                 defaults to Adam.
             checkpoint (int): frequency of checkpointing the training RMSE and
                 saving parameters to disk.
+            checkpoint_dir (str): directory for saving checkpoints.
             shuffle (bool): shuffle the dataset during training.
             drop_last (bool): drop the last incomplete batch during training.
             dataloader_n_workers (int): number of workers for PyTorch DataLoader.
@@ -1346,10 +1361,15 @@ class AlchemicalModelTorch(AlchemicalModel, torch.nn.Module):
             train_iter_filename (str): filename for writing current iteration
                 number during checkpoints.
         """
-        if os.path.exists(params_filename):
-            print(f"Warning: {params_filename} already exists. It will be overwritten")
+        os.makedirs(checkpoint_dir, exist_ok=True)  # no error if exists
+        get_params_dir = lambda i: os.path.join(checkpoint_dir, str(i))
+        get_params_path = lambda i: os.path.join(get_params_dir(i), params_filename)
+        tracker_filename = os.path.join(checkpoint_dir, tracker_filename)
+        train_iter_filename = os.path.join(checkpoint_dir, train_iter_filename)
+        if os.path.exists( get_params_path(1) ):
+            warnings.warn(f"Warning: {get_params_path(1)} already exists. It will be overwritten")
         if os.path.exists(tracker_filename):
-            print(f"Warning: {tracker_filename} already exists. It will be overwritten")
+            warnings.warn(f"Warning: {tracker_filename} already exists. It will be overwritten")
 
         self.frozen_2b_data_coverage = np.zeros(self.n_basis, dtype=bool)
         change_pseudo_tracker = np.full((max_epochs,), np.nan)
@@ -1394,7 +1414,7 @@ class AlchemicalModelTorch(AlchemicalModel, torch.nn.Module):
         print(f"\tDrop last: {drop_last}")
         print(f"\tOptimizer: {optimizer}")
         print(f"\tCheckpoint frequency: {checkpoint}")
-        print(f"\tParameters filename: {params_filename}")
+        print(f"\tParameters filename: {get_params_path('<iteration>')}")
         print(f"\tTracker filename: {tracker_filename}")
         print(f"\tTrain iteration filename: {train_iter_filename}")
         print()
@@ -1515,8 +1535,9 @@ class AlchemicalModelTorch(AlchemicalModel, torch.nn.Module):
                     rmse_e_tracker[-1] = rmse_e
                     rmse_f_tracker[-1] = rmse_f
 
-                #torch.save(self.state_dict(), params_filename)
-                np.savez(params_filename,
+                os.makedirs(get_params_dir(i+1), exist_ok=True)
+                #torch.save(self.state_dict(), get_params_path(i+1))
+                np.savez(get_params_path(i+1),
                          coeff_1b=self.coeff_1b.detach().cpu().numpy(),
                          coeff_2b=self.coeff_2b.detach().cpu().numpy(),
                          pseudo_weights=self.pseudo_weights.detach().cpu().numpy())
