@@ -768,6 +768,8 @@ class AlchemicalModel(WeightedLinearModel):
                       filename: str,
                       subset: Collection,
                       weight: float = 0.5,
+                      sparsity_reg: float = 0.0,
+                      sparsity_epsilon: float = 1e-12,
                       batch_size=2500,
                       sample_weights: Dict = None,
                       energy_key="energy",
@@ -792,6 +794,10 @@ class AlchemicalModel(WeightedLinearModel):
             subset (list): list of keys for training.
             weight (float): parameter balancing contribution from energies
                 vs. forces. Higher values favor energies; defaults to 0.5.
+            sparse_reg (float): regularization strength for sparsity of
+                pseudo-weights (L1 penalty). Defaults to 0.0.
+            sparsity_epsilon (float): small value for L1 penalty to avoid
+                division by zero. Defaults to 1e-12.
             batch_size (int): batch size, in rows, for matrix multiplication
                 operations in constructing gram matrices.
             sample_weights (dict):
@@ -922,10 +928,16 @@ class AlchemicalModel(WeightedLinearModel):
                                                             force_weight,
                                                             weight)
 
+                # Add regularization
                 if param_to_fit == "coeff":
-                    # add regularization
                     regularizer = np.dot(self.regularizer.T, self.regularizer)
-                    gram += regularizer
+                elif param_to_fit == "pseudo_weights":
+                    regularizer = sparsity_reg_matrix(self.pseudo_weights.flatten(),
+                                                      strength=sparsity_reg,
+                                                      epsilon=sparsity_epsilon)
+                else:
+                    raise ValueError("Something went wrong.")
+                gram += regularizer
                 fitted_params = lu_factorization(gram, ordinate)
 
                 if param_to_fit == "coeff":
@@ -1290,9 +1302,14 @@ class AlchemicalModelTorch(AlchemicalModel, torch.nn.Module):
         self.pseudo_weights /= normalization_factor
         self.coeff_2b *= normalization_factor
 
-    def regularization_loss(self):
+    def regularization_loss(self,
+                            sparse_reg: float = 0.0):
         """
         Compute the regularization loss for the alchemical model.
+
+        Args:
+            sparse_reg (float): regularization strength for sparsity of
+                pseudo-weights (L1 penalty). Defaults to 0.0.
 
         Returns:
             loss (torch.Tensor): regularization loss
@@ -1301,12 +1318,14 @@ class AlchemicalModelTorch(AlchemicalModel, torch.nn.Module):
         alchemical_coeffs = torch.cat([self.coeff_1b, alchemical_coeffs])
         loss = torch.matmul(self.regularizer, alchemical_coeffs)
         loss = torch.sum(loss**2)
+        loss += sparse_reg * torch.sum(torch.abs(self.pseudo_weights))
         return loss
 
     def train_from_file(self,
                         filename: str,
                         subset: Collection,
                         weight: float = 0.5,
+                        sparsity_reg: float = 0.0,
                         batch_size=1,
                         sample_weights: Dict = None,
                         energy_key="energy",
@@ -1334,6 +1353,8 @@ class AlchemicalModelTorch(AlchemicalModel, torch.nn.Module):
             subset (list): list of keys for training.
             weight (float): parameter balancing contribution from energies
                 vs. forces. Higher values favor energies; defaults to 0.5.
+            sparse_reg (float): regularization strength for sparsity of
+                pseudo-weights (L1 penalty). Defaults to 0.0.
             batch_size (int): batch size, in number of tables from HDF5 file,
                 for PyTorch DataLoader.
             sample_weights (dict):
@@ -1488,7 +1509,7 @@ class AlchemicalModelTorch(AlchemicalModel, torch.nn.Module):
                                                            f_variance.std)
             loss, _ = self.combine_weighted_gram(loss_e, loss_f, 0, 0,
                                                  energy_weight, force_weight, weight)
-            loss += self.regularization_loss()
+            loss += self.regularization_loss(sparsity_reg)
 
             # Backpropagation
             loss.backward()
@@ -2242,6 +2263,23 @@ def broad_row_krp_sum(A, B):
             ]
         )
     return result
+
+
+def sparsity_reg_matrix(params, strength, epsilon=1e-12):
+    """
+    Generate a sparsity regularization matrix for given parameters (L1 reg).
+
+    Args:
+        params (np.ndarray): parameters to be regularized.
+        strength (float): regularization strength.
+        epsilon (float): small value to prevent division by zero.
+
+    Returns:
+        reg_matrix (np.ndarray): regularization matrix.
+    """
+    params = np.where(params < epsilon, epsilon, params)
+    reg_matrix = np.diag(1/params) * strength
+    return reg_matrix
 
 
 def expand_alchemical_init_params(params_dict, n_pseudo):
