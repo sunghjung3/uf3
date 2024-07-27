@@ -2044,6 +2044,8 @@ def batched_prediction_parallel(model: WeightedLinearModel,
     if parallel.USE_DASK:
         client_info = client.scheduler_info()
         n_jobs = client_info['workers'] * client_info['nthreads']
+    elif client is None:
+        n_jobs = 1
     else:
         n_jobs = client._max_workers
 
