@@ -764,6 +764,97 @@ class AlchemicalModel(WeightedLinearModel):
                                   f"\tExpected: ({self.n_pairtypes}, {self.n_pseudo})\n"
                                   f"\tProvided: {self.pseudo_weights.shape}")
 
+    def initialize_training(self,
+                            filename: str,
+                            subset: Collection,
+                            sparse_hdf5: bool,
+                            max_iter: int,
+                            checkpoint: int,
+                            checkpoint_dir: str,
+                            params_filename: str,
+                            tracker_filename: str,
+                            train_iter_filename: str,
+                            client,
+                            resume: bool,
+                            ):
+        """
+        Initialization for training.
+        """
+        os.makedirs(checkpoint_dir, exist_ok=True)  # no error if exists
+        get_params_dir = lambda i: os.path.join(checkpoint_dir, str(i))
+        get_params_path = lambda i: os.path.join(get_params_dir(i), params_filename)
+        tracker_filename = os.path.join(checkpoint_dir, tracker_filename)
+        train_iter_filename = os.path.join(checkpoint_dir, train_iter_filename)
+
+        if resume:
+            try:
+                train_tracker = np.load(tracker_filename)
+            except FileNotFoundError:
+                raise FileNotFoundError(f"Could not find {tracker_filename}.\n"
+                                        "Set `resume=False` to start from scratch.\n"
+                                        "Exiting...")
+            self.frozen_2b_data_coverage = train_tracker["frozen_2b_data_coverage"]
+            change_pseudo_tracker = train_tracker["change_pseudo"]
+            assert len(change_pseudo_tracker) == max_iter
+            change_1b_tracker = train_tracker["change_1b"]
+            assert len(change_1b_tracker) == max_iter
+            change_2b_tracker = train_tracker["change_2b"]
+            assert len(change_2b_tracker) == max_iter
+            rmse_e_tracker = train_tracker["rmse_e"]
+            assert len(rmse_e_tracker) == max_iter + 1
+            rmse_f_tracker = train_tracker["rmse_f"]
+            assert len(rmse_f_tracker) == max_iter + 1
+            time_tracker = train_tracker["time"]
+            assert len(time_tracker) == max_iter + 1
+
+            # find iteration to resume from
+            init_iter = np.where(np.isnan(time_tracker))[0][0] - 1
+            init_iter = (init_iter // checkpoint) * checkpoint
+            if init_iter < checkpoint:
+                raise ValueError(f"Tried to resume from iteration {init_iter+1}"
+                                 f" but this is before the first checkpoint.\n"
+                                 f"Please set `resume=False` to start from scratch.\n"
+                                 "Exiting...")
+
+            try:
+                alchemical_params = np.load(get_params_path(init_iter))
+            except:
+                raise FileNotFoundError(f"Tried to resume from iteration{init_iter+1}"
+                                        f" but could not find {get_params_path(init_iter)}.\n"
+                                        "Exiting...")
+            self.initialize_parameters(alchemical_params)
+            
+        else:  # initialize from scratch
+            init_iter = 0
+            if os.path.exists( get_params_path(1) ):
+                warnings.warn(f"Warning: {get_params_path(1)} already exists. It will be overwritten")
+            if os.path.exists(tracker_filename):
+                warnings.warn(f"Warning: {tracker_filename} already exists. It will be overwritten")
+
+            self.frozen_2b_data_coverage = np.zeros(self.n_basis, dtype=bool)
+            change_pseudo_tracker = np.full(max_iter, np.nan)
+            change_1b_tracker = np.full(max_iter, np.nan)
+            change_2b_tracker = np.full(max_iter, np.nan)
+            rmse_e_tracker = np.full((max_iter+1,), np.nan)  # +1 for initial RMSE
+            rmse_f_tracker = np.full((max_iter+1,), np.nan)  # +1 for initial RMSE
+            time_tracker = np.full((max_iter+1,), np.nan)
+            time_tracker[0] = 0
+
+        # initial RMSE check
+        print(f"Initial RMSE check before iteration {init_iter+1}:")
+        self.decompress_alchemical_parameters()
+        _, _, _, _, rmse_e, rmse_f = self.batched_predict(filename,
+                                                keys=subset,
+                                                sparse_hdf5=sparse_hdf5,
+                                                client=client,
+                                                )
+        print()
+
+        return init_iter, get_params_dir, get_params_path, tracker_filename, \
+               train_iter_filename, change_pseudo_tracker, change_1b_tracker, \
+               change_2b_tracker, rmse_e_tracker, rmse_f_tracker, time_tracker, \
+               rmse_e, rmse_f
+
     def fit_from_file(self,
                       filename: str,
                       subset: Collection,
@@ -783,6 +874,7 @@ class AlchemicalModel(WeightedLinearModel):
                       tracker_filename: str = "train_tracker.npz",
                       train_iter_filename: str = ".train_iter",
                       client = None,
+                      resume: bool = False,
                       ):
         """
         Accumulate inputs and outputs from batched parsing of HDF5 file
@@ -820,35 +912,24 @@ class AlchemicalModel(WeightedLinearModel):
             train_iter_filename (str): filename for writing current iteration
                 number during checkpoints. Will be saved to `checkpoint_dir/`.
             client (concurrent.futures.Executor, dask.distributed.Client)
+            resume (bool): whether to resume training from a previous checkpoint.
         """
-        os.makedirs(checkpoint_dir, exist_ok=True)  # no error if exists
-        get_params_dir = lambda i: os.path.join(checkpoint_dir, str(i))
-        get_params_path = lambda i: os.path.join(get_params_dir(i), params_filename)
-        tracker_filename = os.path.join(checkpoint_dir, tracker_filename)
-        train_iter_filename = os.path.join(checkpoint_dir, train_iter_filename)
-        if os.path.exists( get_params_path(1) ):
-            warnings.warn(f"Warning: {get_params_path(1)} already exists. It will be overwritten")
-        if os.path.exists(tracker_filename):
-            warnings.warn(f"Warning: {tracker_filename} already exists. It will be overwritten")
-
-        self.frozen_2b_data_coverage = np.zeros(self.n_basis, dtype=bool)
-        change_pseudo_tracker = np.full(max_iter, np.nan)
-        change_1b_tracker = np.full(max_iter, np.nan)
-        change_2b_tracker = np.full(max_iter, np.nan)
-        rmse_e_tracker = np.full((max_iter+1,), np.nan)  # +1 for initial RMSE
-        rmse_f_tracker = np.full((max_iter+1,), np.nan)  # +1 for initial RMSE
-        time_tracker = np.full((max_iter+1,), np.nan)
-        time_tracker[0] = 0
-
-        # Initial RMSE check
-        print("Initial RMSE check.")
-        self.decompress_alchemical_parameters()
-        _, _, _, _, rmse_e, rmse_f = self.batched_predict(filename,
-                                                keys=subset,
-                                                sparse_hdf5=sparse_hdf5,
-                                                client=client,
-                                                )
-        print()
+        init_iter, get_params_dir, get_params_path, tracker_filename, \
+        train_iter_filename, change_pseudo_tracker, change_1b_tracker, \
+        change_2b_tracker, rmse_e_tracker, rmse_f_tracker, time_tracker, \
+        rmse_e, rmse_f = \
+            self.initialize_training(filename=filename,
+                                     subset=subset,
+                                     sparse_hdf5=sparse_hdf5,
+                                     max_iter=max_iter,
+                                     checkpoint=checkpoint,
+                                     checkpoint_dir=checkpoint_dir,
+                                     params_filename=params_filename,
+                                     tracker_filename=tracker_filename,
+                                     train_iter_filename=train_iter_filename,
+                                     client=client,
+                                     resume=resume,
+                                     )
 
         if not os.path.isfile(filename):
             raise FileNotFoundError(filename)
@@ -856,13 +937,14 @@ class AlchemicalModel(WeightedLinearModel):
 
         # Outer-most ALS loop
         print(f"Beginning alternating least-squares optimization:")
+        print(f"\tResume: {resume}")
         print(f"\tMax iterations: {max_iter}")
         print(f"\tCheckpoint frequency: {checkpoint}")
         print(f"\tParameters filename: {get_params_path('<iteration>')}")
         print(f"\tTracker filename: {tracker_filename}")
         print(f"\tTrain iteration filename: {train_iter_filename}")
         print()
-        for i in range(max_iter):
+        for i in range(init_iter, max_iter):
             print(f"Iteration {i+1}/{max_iter}")
             starttime = time.time()
 
