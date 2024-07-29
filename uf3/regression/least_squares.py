@@ -765,16 +765,12 @@ class AlchemicalModel(WeightedLinearModel):
                                   f"\tProvided: {self.pseudo_weights.shape}")
 
     def initialize_training(self,
-                            filename: str,
-                            subset: Collection,
-                            sparse_hdf5: bool,
                             max_iter: int,
                             checkpoint: int,
                             checkpoint_dir: str,
                             params_filename: str,
                             tracker_filename: str,
                             train_iter_filename: str,
-                            client,
                             resume: bool,
                             ):
         """
@@ -840,20 +836,9 @@ class AlchemicalModel(WeightedLinearModel):
             time_tracker = np.full((max_iter+1,), np.nan)
             time_tracker[0] = 0
 
-        # initial RMSE check
-        print(f"Initial RMSE check before iteration {init_iter+1}:")
-        self.decompress_alchemical_parameters()
-        _, _, _, _, rmse_e, rmse_f = self.batched_predict(filename,
-                                                keys=subset,
-                                                sparse_hdf5=sparse_hdf5,
-                                                client=client,
-                                                )
-        print()
-
         return init_iter, get_params_dir, get_params_path, tracker_filename, \
                train_iter_filename, change_pseudo_tracker, change_1b_tracker, \
-               change_2b_tracker, rmse_e_tracker, rmse_f_tracker, time_tracker, \
-               rmse_e, rmse_f
+               change_2b_tracker, rmse_e_tracker, rmse_f_tracker, time_tracker
 
     def fit_from_file(self,
                       filename: str,
@@ -916,20 +901,25 @@ class AlchemicalModel(WeightedLinearModel):
         """
         init_iter, get_params_dir, get_params_path, tracker_filename, \
         train_iter_filename, change_pseudo_tracker, change_1b_tracker, \
-        change_2b_tracker, rmse_e_tracker, rmse_f_tracker, time_tracker, \
-        rmse_e, rmse_f = \
-            self.initialize_training(filename=filename,
-                                     subset=subset,
-                                     sparse_hdf5=sparse_hdf5,
-                                     max_iter=max_iter,
+        change_2b_tracker, rmse_e_tracker, rmse_f_tracker, time_tracker = \
+            self.initialize_training(max_iter=max_iter,
                                      checkpoint=checkpoint,
                                      checkpoint_dir=checkpoint_dir,
                                      params_filename=params_filename,
                                      tracker_filename=tracker_filename,
                                      train_iter_filename=train_iter_filename,
-                                     client=client,
                                      resume=resume,
                                      )
+        
+        # initial RMSE check
+        print(f"Initial RMSE check before iteration {init_iter+1}:")
+        self.decompress_alchemical_parameters()
+        _, _, _, _, rmse_e, rmse_f = self.batched_predict(filename,
+                                                keys=subset,
+                                                sparse_hdf5=sparse_hdf5,
+                                                client=client,
+                                                )
+        print()
 
         if not os.path.isfile(filename):
             raise FileNotFoundError(filename)
@@ -1424,6 +1414,7 @@ class AlchemicalModelTorch(AlchemicalModel, torch.nn.Module):
                         params_filename: str = "alchemical_model_params.npz",
                         tracker_filename: str = "train_tracker.npz",
                         train_iter_filename: str = ".train_iter",
+                        resume: bool = False,
                         ):
         """
         Accumulate inputs and outputs from batched parsing of HDF5 file
@@ -1463,26 +1454,19 @@ class AlchemicalModelTorch(AlchemicalModel, torch.nn.Module):
                 checkpoints.
             train_iter_filename (str): filename for writing current iteration
                 number during checkpoints.
+            resume (bool): whether to resume training from a previous checkpoint.
         """
-        os.makedirs(checkpoint_dir, exist_ok=True)  # no error if exists
-        get_params_dir = lambda i: os.path.join(checkpoint_dir, str(i))
-        get_params_path = lambda i: os.path.join(get_params_dir(i), params_filename)
-        tracker_filename = os.path.join(checkpoint_dir, tracker_filename)
-        train_iter_filename = os.path.join(checkpoint_dir, train_iter_filename)
-        if os.path.exists( get_params_path(1) ):
-            warnings.warn(f"Warning: {get_params_path(1)} already exists. It will be overwritten")
-        if os.path.exists(tracker_filename):
-            warnings.warn(f"Warning: {tracker_filename} already exists. It will be overwritten")
-
-        self.frozen_2b_data_coverage = np.zeros(self.n_basis, dtype=bool)
-        change_pseudo_tracker = np.full((max_epochs,), np.nan)
-        change_1b_tracker = np.full((max_epochs,), np.nan)
-        change_2b_tracker = np.full((max_epochs,), np.nan)
-        # RMSE at the beginning of the epoch is recorded
-        rmse_e_tracker = np.full((max_epochs+1,), np.nan)  # +1 for initial RMSE
-        rmse_f_tracker = np.full((max_epochs+1,), np.nan)  # +1 for initial RMSE
-        time_tracker = np.full((max_epochs+1,), np.nan)
-        time_tracker[0] = 0
+        init_epoch, get_params_dir, get_params_path, tracker_filename, \
+        train_iter_filename, change_pseudo_tracker, change_1b_tracker, \
+        change_2b_tracker, rmse_e_tracker, rmse_f_tracker, time_tracker = \
+            self.initialize_training(max_iter=max_epochs,
+                                     checkpoint=checkpoint,
+                                     checkpoint_dir=checkpoint_dir,
+                                     params_filename=params_filename,
+                                     tracker_filename=tracker_filename,
+                                     train_iter_filename=train_iter_filename,
+                                     resume=resume,
+                                     )
 
         # Optimizer
         if optimizer is None:
@@ -1521,7 +1505,7 @@ class AlchemicalModelTorch(AlchemicalModel, torch.nn.Module):
         print(f"\tTracker filename: {tracker_filename}")
         print(f"\tTrain iteration filename: {train_iter_filename}")
         print()
-        for i in range(max_epochs):
+        for i in range(init_epoch, max_epochs):
             print(f"Iteration {i+1}/{max_epochs}")
             starttime = time.time()
 
