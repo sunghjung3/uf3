@@ -770,6 +770,7 @@ class AlchemicalModel(WeightedLinearModel):
                             checkpoint_dir: str,
                             params_filename: str,
                             tracker_filename: str,
+                            metadata_filename: str,
                             train_iter_filename: str,
                             resume: bool,
                             ):
@@ -780,16 +781,28 @@ class AlchemicalModel(WeightedLinearModel):
         get_params_dir = lambda i: os.path.join(checkpoint_dir, str(i))
         get_params_path = lambda i: os.path.join(get_params_dir(i), params_filename)
         tracker_filename = os.path.join(checkpoint_dir, tracker_filename)
+        metadata_filename = os.path.join(checkpoint_dir, metadata_filename)
         train_iter_filename = os.path.join(checkpoint_dir, train_iter_filename)
 
         if resume:
+            try:
+                metadata = np.load(metadata_filename)
+            except FileNotFoundError:
+                raise FileNotFoundError(f"Could not find {metadata_filename}.\n"
+                                        "Set `resume=False` to start from scratch.\n"
+                                        "Exiting...")
+            latest_rmse_e = metadata["latest_rmse_e"]
+            latest_rmse_f = metadata["latest_rmse_f"]
+            self.frozen_2b_data_coverage = metadata["frozen_2b_data_coverage"]
+            energy_weight = metadata["energy_weight"]
+            force_weight = metadata["force_weight"]
+
             try:
                 train_tracker = np.load(tracker_filename)
             except FileNotFoundError:
                 raise FileNotFoundError(f"Could not find {tracker_filename}.\n"
                                         "Set `resume=False` to start from scratch.\n"
                                         "Exiting...")
-            self.frozen_2b_data_coverage = train_tracker["frozen_2b_data_coverage"]
             change_pseudo_tracker = train_tracker["change_pseudo"]
             assert len(change_pseudo_tracker) == max_iter
             change_1b_tracker = train_tracker["change_1b"]
@@ -828,6 +841,8 @@ class AlchemicalModel(WeightedLinearModel):
                 warnings.warn(f"Warning: {tracker_filename} already exists. It will be overwritten")
 
             self.frozen_2b_data_coverage = np.zeros(self.n_basis, dtype=bool)
+            energy_weight = np.nan
+            force_weight = np.nan
             change_pseudo_tracker = np.full(max_iter, np.nan)
             change_1b_tracker = np.full(max_iter, np.nan)
             change_2b_tracker = np.full(max_iter, np.nan)
@@ -835,10 +850,59 @@ class AlchemicalModel(WeightedLinearModel):
             rmse_f_tracker = np.full((max_iter+1,), np.nan)  # +1 for initial RMSE
             time_tracker = np.full((max_iter+1,), np.nan)
             time_tracker[0] = 0
+            latest_rmse_e = np.nan
+            latest_rmse_f = np.nan
 
         return init_iter, get_params_dir, get_params_path, tracker_filename, \
-               train_iter_filename, change_pseudo_tracker, change_1b_tracker, \
-               change_2b_tracker, rmse_e_tracker, rmse_f_tracker, time_tracker
+               metadata_filename, train_iter_filename, change_pseudo_tracker, \
+               change_1b_tracker, change_2b_tracker, rmse_e_tracker, \
+               rmse_f_tracker, time_tracker, latest_rmse_e, latest_rmse_f, \
+               energy_weight, force_weight
+
+    def update_dataset_metadata(self,
+                                df: pd.DataFrame,
+                                keys: Collection,
+                                e_variance: VarianceRecorder = None,
+                                f_variance: VarianceRecorder = None,
+                                sample_weights: Dict = None,
+                                energy_key: str = "energy",
+                                ):
+        """
+        Extract metadata from a Pandas DataFrame for training, including means,
+        variances, and frozen data coverage. Internally modifies `e_variance`,
+        `f_variance`, and `self.frozen_2b_data_coverage`.
+
+        Args:
+            df (pd.DataFrame): DataFrame of features and true labels.
+            keys (list): keys to query from df (e.g. training subset).
+            e_variance (VarianceRecorder): handler for accumulating
+                statistics for energies (mean and variance).
+            f_variance (VarianceRecorder): handler for accumulating
+                statistics for forces (mean and variance).
+            sample_weights (dict):
+            energy_key (str): column name for energies, default "energy".
+        """
+        x_e, y_e, x_f, y_f = freeze_columns_from_df(df,
+                                                    keys,
+                                                    self.n_elements,
+                                                    self.mask,
+                                                    self.frozen_c,
+                                                    self.col_idx,
+                                                    energy_key=energy_key,
+                                                    sample_weights=sample_weights,
+                                                    )
+        if e_variance is not None and f_variance is not None:
+            e_variance.update(y_e)
+            f_variance.update(y_f)
+
+        data_coverage_2b_e = (np.sum(x_e[:, self.n_elements:], axis=0) != 0).reshape(self.n_pairtypes, self.n_basis)
+        data_coverage_2b_e = np.any(data_coverage_2b_e, axis=0)
+        data_coverage_2b_f = (np.sum(x_f[:, self.n_elements:], axis=0) != 0).reshape(self.n_pairtypes, self.n_basis)
+        data_coverage_2b_f = np.any(data_coverage_2b_f, axis=0)
+        self.frozen_2b_data_coverage = np.logical_or(self.frozen_2b_data_coverage,
+                                                    data_coverage_2b_e)
+        self.frozen_2b_data_coverage = np.logical_or(self.frozen_2b_data_coverage,
+                                                    data_coverage_2b_f)
 
     def fit_from_file(self,
                       filename: str,
@@ -857,6 +921,7 @@ class AlchemicalModel(WeightedLinearModel):
                       checkpoint_dir: str = ".",
                       params_filename: str = "alchemical_model_params.npz",
                       tracker_filename: str = "train_tracker.npz",
+                      metadata_filename: str = "metadata.npz",
                       train_iter_filename: str = ".train_iter",
                       client = None,
                       resume: bool = False,
@@ -894,32 +959,40 @@ class AlchemicalModel(WeightedLinearModel):
                 checkpoints. Will be saved to `checkpoint_dir/<iteration>/`.
             train_tracker (str): filename for saving training tracker during
                 checkpoints. Will be saved to `checkpoint_dir/`.
+            metadata_filename (str): filename for saving metadata during
+                checkpoints. Will be saved to `checkpoint_dir/`.
             train_iter_filename (str): filename for writing current iteration
                 number during checkpoints. Will be saved to `checkpoint_dir/`.
             client (concurrent.futures.Executor, dask.distributed.Client)
             resume (bool): whether to resume training from a previous checkpoint.
         """
         init_iter, get_params_dir, get_params_path, tracker_filename, \
-        train_iter_filename, change_pseudo_tracker, change_1b_tracker, \
-        change_2b_tracker, rmse_e_tracker, rmse_f_tracker, time_tracker = \
+        metadata_filename, train_iter_filename, change_pseudo_tracker, \
+        change_1b_tracker, change_2b_tracker, rmse_e_tracker, \
+        rmse_f_tracker, time_tracker, rmse_e, rmse_f, \
+        energy_weight, force_weight = \
             self.initialize_training(max_iter=max_iter,
                                      checkpoint=checkpoint,
                                      checkpoint_dir=checkpoint_dir,
                                      params_filename=params_filename,
                                      tracker_filename=tracker_filename,
+                                     metadata_filename=metadata_filename,
                                      train_iter_filename=train_iter_filename,
                                      resume=resume,
                                      )
         
         # initial RMSE check
-        print(f"Initial RMSE check before iteration {init_iter+1}:")
-        self.decompress_alchemical_parameters()
-        _, _, _, _, rmse_e, rmse_f = self.batched_predict(filename,
-                                                keys=subset,
-                                                sparse_hdf5=sparse_hdf5,
-                                                client=client,
-                                                )
-        print()
+        if init_iter == 0:
+            e_variance = VarianceRecorder()
+            f_variance = VarianceRecorder()
+            print(f"Initial RMSE check:")
+            self.decompress_alchemical_parameters()
+            _, _, _, _, rmse_e, rmse_f = self.batched_predict(filename,
+                                                    keys=subset,
+                                                    sparse_hdf5=sparse_hdf5,
+                                                    client=client,
+                                                    )
+            print()
 
         if not os.path.isfile(filename):
             raise FileNotFoundError(filename)
@@ -939,9 +1012,6 @@ class AlchemicalModel(WeightedLinearModel):
             starttime = time.time()
 
             for param_to_fit in ("coeff", "pseudo_weights"):
-                e_variance = VarianceRecorder()
-                f_variance = VarianceRecorder()
-
                 if param_to_fit == "coeff":
                     print(f"\tFitting alchemical spline coefficients.")
                     gram_e, gram_f, ord_e, ord_f = self.initialize_gramC_ordinateC()
@@ -968,16 +1038,20 @@ class AlchemicalModel(WeightedLinearModel):
                     if param_to_fit == "coeff":
                         intermediates = self.gramC_from_df(df,
                                                          keys,
-                                                         e_variance=e_variance,
-                                                         f_variance=f_variance,
                                                          sample_weights=sample_weights,
                                                          energy_key=energy_key,
                                                          batch_size=batch_size)
+                        if i == 0:
+                            self.update_dataset_metadata(df,
+                                                         keys,
+                                                         e_variance,
+                                                         f_variance,
+                                                         sample_weights,
+                                                         energy_key=energy_key,
+                                                         )
                     elif param_to_fit == "pseudo_weights":
                         intermediates = self.gramW_from_df(df,
                                                          keys,
-                                                         e_variance=e_variance,
-                                                         f_variance=f_variance,
                                                          sample_weights=sample_weights,
                                                          energy_key=energy_key,
                                                          batch_size=batch_size)
@@ -988,10 +1062,12 @@ class AlchemicalModel(WeightedLinearModel):
                     gram_f += g_f
                     ord_e += o_e
                     ord_f += o_f
-                energy_weight, force_weight = calc_E_F_weights(e_variance.n,
-                                                            f_variance.n,
-                                                            e_variance.std,
-                                                            f_variance.std)
+
+                if i == 0 and param_to_fit == "coeff":
+                    energy_weight, force_weight = calc_E_F_weights(e_variance.n,
+                                                                f_variance.n,
+                                                                e_variance.std,
+                                                                f_variance.std)
                 gram, ordinate = self.combine_weighted_gram(gram_e,
                                                             gram_f,
                                                             ord_e,
@@ -1002,7 +1078,7 @@ class AlchemicalModel(WeightedLinearModel):
 
                 # Add regularization
                 if param_to_fit == "coeff":
-                    regularizer = np.dot(self.regularizer.T, self.regularizer)
+                    regularizer = np.dot(self.regularizer.T, self.regularizer)  # XXX: can be precomputed at the beginning
                 elif param_to_fit == "pseudo_weights":
                     regularizer = sparsity_reg_matrix(self.pseudo_weights.flatten(),
                                                       strength=sparsity_reg,
@@ -1076,8 +1152,16 @@ class AlchemicalModel(WeightedLinearModel):
                          change_2b=change_2b_tracker,
                          rmse_e=rmse_e_tracker,
                          rmse_f=rmse_f_tracker,
+                         time=time_tracker,
+                         )
+
+                np.savez(metadata_filename,
+                         latest_rmse_e=rmse_e,
+                         latest_rmse_f=rmse_f,
                          frozen_2b_data_coverage=self.frozen_2b_data_coverage,
-                         time=time_tracker)
+                         energy_weight=energy_weight,
+                         force_weight=force_weight,
+                         )
 
                 with open(train_iter_filename, "w") as f:
                     f.write(f"{i+1}\n")
@@ -1107,8 +1191,6 @@ class AlchemicalModel(WeightedLinearModel):
     def gramC_from_df(self,
                       df: pd.DataFrame,
                       keys: Collection,
-                      e_variance: VarianceRecorder = None,
-                      f_variance: VarianceRecorder = None,
                       sample_weights: Dict = None,
                       energy_key: str = "energy",
                       batch_size: int = 2500):
@@ -1120,10 +1202,6 @@ class AlchemicalModel(WeightedLinearModel):
         Args:
             df (pd.DataFrame): DataFrame of energy/force features.
             keys (list): keys to query from df (e.g. training subset).
-            e_variance (VarianceRecorder): handler for accumulating
-                statistics for energies (mean and variance).
-            f_variance (VarianceRecorder): handler for accumulating
-                statistics for forces (mean and variance).
             sample_weights (dict):
             energy_key (str): column name for energies, default "energy".
             batch_size (int): batch size, in rows, for matrix multiplication
@@ -1138,17 +1216,6 @@ class AlchemicalModel(WeightedLinearModel):
                                                     energy_key=energy_key,
                                                     sample_weights=sample_weights,
                                                     )
-        if e_variance is not None and f_variance is not None:
-            e_variance.update(y_e)
-            f_variance.update(y_f)
-        data_coverage_2b_e = (np.sum(x_e[:, self.n_elements:], axis=0) != 0).reshape(self.n_pairtypes, self.n_basis)
-        data_coverage_2b_e = np.any(data_coverage_2b_e, axis=0)
-        data_coverage_2b_f = (np.sum(x_f[:, self.n_elements:], axis=0) != 0).reshape(self.n_pairtypes, self.n_basis)
-        data_coverage_2b_f = np.any(data_coverage_2b_f, axis=0)
-        self.frozen_2b_data_coverage = np.logical_or(self.frozen_2b_data_coverage,
-                                                    data_coverage_2b_e)
-        self.frozen_2b_data_coverage = np.logical_or(self.frozen_2b_data_coverage,
-                                                    data_coverage_2b_f)
         
         WX_e = self.feature_matrixC(x_e, self.pseudo_weights)
         WX_f = self.feature_matrixC(x_f, self.pseudo_weights)
@@ -1198,8 +1265,6 @@ class AlchemicalModel(WeightedLinearModel):
     def gramW_from_df(self,
                       df: pd.DataFrame,
                       keys: Collection,
-                      e_variance: VarianceRecorder = None,
-                      f_variance: VarianceRecorder = None,
                       sample_weights: Dict = None,
                       energy_key: str = "energy",
                       batch_size: int = 2500):
@@ -1211,10 +1276,6 @@ class AlchemicalModel(WeightedLinearModel):
         Args:
             df (pd.DataFrame): DataFrame of energy/force features.
             keys (list): keys to query from df (e.g. training subset).
-            e_variance (VarianceRecorder): handler for accumulating
-                statistics for energies (mean and variance).
-            f_variance (VarianceRecorder): handler for accumulating
-                statistics for forces (mean and variance).
             sample_weights (dict):
             energy_key (str): column name for energies, default "energy".
             batch_size (int): batch size, in rows, for matrix multiplication
@@ -1229,9 +1290,6 @@ class AlchemicalModel(WeightedLinearModel):
                                                     energy_key=energy_key,
                                                     sample_weights=sample_weights,
                                                     )
-        if e_variance is not None and f_variance is not None:
-            e_variance.update(y_e)
-            f_variance.update(y_f)
         
         XC_e, yhat_e_1b = self.feature_matrixW(x_e, self.coeff_2b, self.coeff_1b)
         XC_f = self.feature_matrixW(x_f, self.coeff_2b)
@@ -1457,13 +1515,16 @@ class AlchemicalModelTorch(AlchemicalModel, torch.nn.Module):
             resume (bool): whether to resume training from a previous checkpoint.
         """
         init_epoch, get_params_dir, get_params_path, tracker_filename, \
-        train_iter_filename, change_pseudo_tracker, change_1b_tracker, \
-        change_2b_tracker, rmse_e_tracker, rmse_f_tracker, time_tracker = \
+        metadata_filename, train_iter_filename, change_pseudo_tracker, \
+        change_1b_tracker, change_2b_tracker, rmse_e_tracker, \
+        rmse_f_tracker, time_tracker, rmse_e, rmse_f, \
+        energy_weight, force_weight = \
             self.initialize_training(max_iter=max_epochs,
                                      checkpoint=checkpoint,
                                      checkpoint_dir=checkpoint_dir,
                                      params_filename=params_filename,
                                      tracker_filename=tracker_filename,
+                                     metadata_filename=metadata_filename,
                                      train_iter_filename=train_iter_filename,
                                      resume=resume,
                                      )
