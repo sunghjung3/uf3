@@ -1,4 +1,4 @@
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Union
 import os
 import re
 import warnings
@@ -138,3 +138,28 @@ def generate_handlers(settings: Dict) -> Dict:
         except (KeyError, ValueError):
             pass
     return handlers
+
+
+def process_order_dict(user_input: Union[None, int, Dict],
+                       default_val: Dict[int, int]):
+    """
+    Process user input for a dictionary of interaction order keys and integer
+    values.
+
+    Args:
+        user_input (None | int | dict): User input for trimming values.
+        default_trim: Default trimming values. {interaction_order: trim_value}
+    """
+    if user_input is None:
+        return default_val.copy()
+    elif isinstance(user_input, int):  # same value for all interaction orders
+        return {key: user_input for key in default_val}
+    elif isinstance(user_input, dict):
+        if not all(isinstance(key, int) for key in user_input.keys()):
+            raise ValueError("Keys of the input dict (order of interaction)"
+                             " must be integers.")
+        if not all(isinstance(value, int) for value in user_input.values()):
+            raise ValueError("Values of the input dict must be integers.")
+        return user_input.copy()
+    else:
+        raise ValueError("Invalid input. Must be None, int, or a dict.")

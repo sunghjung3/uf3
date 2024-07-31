@@ -3,7 +3,7 @@ This module provides the WeightedLinearModel class for fitting UF potentials
 from featurized DataFrames using regularized least squares.
 """
 
-from typing import List, Dict, Collection, Tuple
+from typing import List, Dict, Collection, Tuple, Union
 import os
 import copy
 import time
@@ -18,6 +18,7 @@ from uf3.data import io
 from uf3.data import composition
 from uf3.util import json_io
 from uf3.util import parallel
+from uf3.util import user_config
 from uf3.util import torch_util
 
 
@@ -678,31 +679,45 @@ class AlchemicalModel(WeightedLinearModel):
     Alchemical learning ("pseudo-interaction") model for fitting energies and
     forces.
 
-    XXX: currently only 2-body interactions and all pseudo-interactions
-    must have the same spline construction and offsets are fit.
+    XXX: all pseudo-interactions must have the same spline construction and
+    offsets are fit.
 
     XXX: self.data_coverage is not implemented yet.
     
     XXX: the regularizer matrix should already have frozen coefficients removed.
 
+    Args:
+        bspline_config (bspline.BSplineBasis): basis set configuration.
+        n_pseudo (int | dict): number of pseudo-interactions to fit.
+            If int, the same n_pseudo is used for all interaction order.
+            If dict, the keys are interaction orders and values are n_pseudo.
+        regularizer (np.ndarray): regularization matrix.
+            The regularizer should already have frozen coefficients removed.
+        data_coverage (np.ndarray): boolean array for data coverage.
+        init_params (dict | np.lib.npyio.NpzFile ): initial parameters for training.
+            Should be an object with keys 'coeff_1b', 'coeff_2b', 'pseudo_weights_2b'
+            (2b) and 'coeff_3b', 'pseudo_weights_3b' (3b).
     """
     def __init__(self,
                  bspline_config,
-                 n_pseudo,
-                 regularizer=None,
-                 data_coverage=None,
-                 init_params=None,
-                 **params):
-        super().__init__(bspline_config, regularizer, data_coverage, **params)
-        if self.bspline_config.degree != 2:
-            raise ValueError("Only 2-body interactions supported.")
-        self.n_pseudo = n_pseudo
+                 n_pseudo: Union[int, Dict[int, int]],
+                 regularizer: np.ndarray = None,
+                 data_coverage: np.ndarray = None,
+                 init_params: Union[dict, np.lib.npyio.NpzFile] = None,
+                 **args):
+        super().__init__(bspline_config, regularizer, data_coverage, **args)
+        default_n_pseudo = {2: 3, 3: 2}
+        self.n_pseudo = user_config.process_order_dict(n_pseudo, default_n_pseudo)
         component_sizes = self.bspline_config.get_interaction_partitions()[0]
 
         # temporary sanity checks
         for pair in self.bspline_config.interactions_map[2]:
-            if not component_sizes[pair] == self.n_basis + self.bspline_config.leading_trim + self.bspline_config.trailing_trim:
+            if not component_sizes[pair] == self.n_basis[2] + self.bspline_config.leading_trim + self.bspline_config.trailing_trim:
                 raise ValueError("Inconsistent component sizes.")
+        for i in range(3, self.degree+1):
+            for ituple in self.bspline_config.interactions_map[i]:
+                if not component_sizes[ituple] == self.n_basis[i]:
+                    raise ValueError("Inconsistent component sizes.")
         assert self.bspline_config.offset_1b  # fit 1-body
 
         # Parameter arrays for training.
@@ -710,19 +725,35 @@ class AlchemicalModel(WeightedLinearModel):
         self.initialize_parameters(init_params)
 
     @property
+    def degree(self):
+        return self.bspline_config.degree
+
+    @property
     def n_basis(self):
         component_sizes = self.bspline_config.get_interaction_partitions()[0]
-        n_basis = component_sizes[self.bspline_config.interactions_map[2][0]]
-        return n_basis - self.bspline_config.leading_trim - \
+        n_basis = {i: component_sizes[self.bspline_config.interactions_map[i][0]]
+                   for i in range(2, self.degree+1)}
+        n_basis[2] = n_basis[2] - self.bspline_config.leading_trim - \
                 self.bspline_config.trailing_trim
+        return n_basis
 
     @property
     def n_elements(self):
         return len(self.bspline_config.element_list)
     
     @property
-    def n_pairtypes(self):
-        return len(self.bspline_config.interactions_map[2])
+    def n_ituples(self):
+        return {i: len(self.bspline_config.interactions_map[i]) for i in
+                range(2, self.degree+1)}
+
+    @property
+    def body_order_offsets(self):
+        body_order_sizes = np.array([self.n_basis[i] * self.n_ituples[i]
+                                     for i in range(2, self.degree+1)])
+        body_order_offsets = np.cumsum(body_order_sizes)
+        body_order_offsets = np.insert(body_order_offsets, 0, 0) + self.n_elements
+        return {i: body_order_offsets[i-2] for i in range(2, self.degree+2)}
+        
 
     def __repr__(self):
         if self.coefficients is None:
@@ -744,25 +775,30 @@ class AlchemicalModel(WeightedLinearModel):
         """Initialize parameters for training."""
         # TODO: need to figure out best way to initialize these
         if init_params is None:
-            self.coeff_1b = np.zeros(self.n_elements)
-            self.coeff_2b = np.zeros((self.n_basis, self.n_pseudo))
-            self.pseudo_weights = np.random.rand(self.n_pairtypes, self.n_pseudo)*2-1
+            self.coeff = {1: np.zeros(self.n_elements)}
+            self.coeff.update({ i: np.zeros((self.n_basis[i], self.n_pseudo[i]))
+                               for i in range(2, self.degree+1)})
+            self.pseudo_weights = { i: np.random.rand(self.n_ituples[i], self.n_pseudo[i])*2-1
+                                   for i in range(2, self.degree+1)}
         else:
-            self.coeff_1b = init_params['coeff_1b']
-            if self.coeff_1b.shape != (self.n_elements,):
+            self.coeff = dict()
+            self.pseudo_weights = dict()
+            self.coeff[1] = init_params['coeff_1b']
+            if self.coeff[1].shape != (self.n_elements,):
                 raise ValueError("Incorrect shape for 1-body coefficients.\n"
                                  f"\tExpected: ({self.n_elements},)\n"
-                                 f"\tProvided: {self.coeff_1b.shape}")
-            self.coeff_2b = init_params['coeff_2b']
-            if self.coeff_2b.shape != (self.n_basis, self.n_pseudo):
-                raise ValueError("Incorrect shape for 2-body coefficients.\n"
-                                  f"\tExpected: ({self.n_basis}, {self.n_pseudo})\n"
-                                  f"\tProvided: {self.coeff_2b.shape}")
-            self.pseudo_weights = init_params['pseudo_weights']
-            if self.pseudo_weights.shape != (self.n_pairtypes, self.n_pseudo):
-                raise ValueError("Incorrect shape for pseudo weights.\n"
-                                  f"\tExpected: ({self.n_pairtypes}, {self.n_pseudo})\n"
-                                  f"\tProvided: {self.pseudo_weights.shape}")
+                                 f"\tProvided: {self.coeff[1].shape}")
+            for i in range(2, self.degree+1):
+                self.coeff[i] = init_params[f'coeff_{i}b']
+                if self.coeff[i].shape != (self.n_basis[i], self.n_pseudo[i]):
+                    raise ValueError(f"Incorrect shape for {i}-body coefficients.\n"
+                                     f"\tExpected: ({self.n_basis[i]}, {self.n_pseudo[i]})\n"
+                                     f"\tProvided: {self.coeff[i].shape}")
+                self.pseudo_weights[i] = init_params[f'pseudo_weights_{i}b']
+                if self.pseudo_weights[i].shape != (self.n_ituples[i], self.n_pseudo[i]):
+                    raise ValueError(f"Incorrect shape for pseudo weights.\n"
+                                     f"\tExpected: ({self.n_ituples[i]}, {self.n_pseudo[i]})\n"
+                                     f"\tProvided: {self.pseudo_weights[i].shape}")
 
     def initialize_training(self,
                             max_iter: int,
@@ -789,13 +825,18 @@ class AlchemicalModel(WeightedLinearModel):
                 raise FileNotFoundError(f"Could not find {tracker_filename}.\n"
                                         "Set `resume=False` to start from scratch.\n"
                                         "Exiting...")
-            self.frozen_2b_data_coverage = train_tracker["frozen_2b_data_coverage"]
-            change_pseudo_tracker = train_tracker["change_pseudo"]
-            assert len(change_pseudo_tracker) == max_iter
-            change_1b_tracker = train_tracker["change_1b"]
-            assert len(change_1b_tracker) == max_iter
-            change_2b_tracker = train_tracker["change_2b"]
-            assert len(change_2b_tracker) == max_iter
+            self.frozen_data_coverage = {i: train_tracker[f'frozen_{i}b_data_coverage']
+                                            for i in range(2, self.degree+1)}
+            assert all([len(self.frozen_data_coverage[i]) == self.n_basis[i]
+                        for i in range(2, self.degree+1)])
+            change_pw_tracker = {i: train_tracker[f'change_pw_{i}b']
+                                 for i in range(2, self.degree+1)}
+            assert all([len(change_pw_tracker[i]) == max_iter
+                        for i in range(2, self.degree+1)])
+            change_coeff_tracker = {i: train_tracker[f'change_coeff_{i}b']
+                                    for i in range(1, self.degree+1)}
+            assert all([len(change_coeff_tracker[i]) == max_iter
+                        for i in range(1, self.degree+1)])
             rmse_e_tracker = train_tracker["rmse_e"]
             assert len(rmse_e_tracker) == max_iter + 1
             rmse_f_tracker = train_tracker["rmse_f"]
@@ -827,18 +868,18 @@ class AlchemicalModel(WeightedLinearModel):
             if os.path.exists(tracker_filename):
                 warnings.warn(f"Warning: {tracker_filename} already exists. It will be overwritten")
 
-            self.frozen_2b_data_coverage = np.zeros(self.n_basis, dtype=bool)
-            change_pseudo_tracker = np.full(max_iter, np.nan)
-            change_1b_tracker = np.full(max_iter, np.nan)
-            change_2b_tracker = np.full(max_iter, np.nan)
+            self.frozen_data_coverage = {i: np.zeros(self.n_basis[i], dtype=bool)
+                                         for i in range(2, self.degree+1)}
+            change_pw_tracker = {i: np.full(max_iter, np.nan) for i in range(2, self.degree+1)}
+            change_coeff_tracker = {i: np.full(max_iter, np.nan) for i in range(1, self.degree+1)}
             rmse_e_tracker = np.full((max_iter+1,), np.nan)  # +1 for initial RMSE
             rmse_f_tracker = np.full((max_iter+1,), np.nan)  # +1 for initial RMSE
             time_tracker = np.full((max_iter+1,), np.nan)
             time_tracker[0] = 0
 
         return init_iter, get_params_dir, get_params_path, tracker_filename, \
-               train_iter_filename, change_pseudo_tracker, change_1b_tracker, \
-               change_2b_tracker, rmse_e_tracker, rmse_f_tracker, time_tracker
+               train_iter_filename, change_pw_tracker, change_coeff_tracker, \
+               rmse_e_tracker, rmse_f_tracker, time_tracker
 
     def fit_from_file(self,
                       filename: str,
@@ -900,8 +941,8 @@ class AlchemicalModel(WeightedLinearModel):
             resume (bool): whether to resume training from a previous checkpoint.
         """
         init_iter, get_params_dir, get_params_path, tracker_filename, \
-        train_iter_filename, change_pseudo_tracker, change_1b_tracker, \
-        change_2b_tracker, rmse_e_tracker, rmse_f_tracker, time_tracker = \
+        train_iter_filename, change_pw_tracker, change_coeff_tracker, \
+        rmse_e_tracker, rmse_f_tracker, time_tracker = \
             self.initialize_training(max_iter=max_iter,
                                      checkpoint=checkpoint,
                                      checkpoint_dir=checkpoint_dir,
@@ -1085,8 +1126,10 @@ class AlchemicalModel(WeightedLinearModel):
 
     def decompress_alchemical_parameters(self):
         """Decompress the alchemical spline coefficients and store to self.coefficients."""
-        coefficients = (self.coeff_2b @ self.pseudo_weights.T).flatten(order="F")
-        coefficients = np.concatenate([self.coeff_1b, coefficients])
+        coefficients = [self.coeff[1]]
+        for i in range(2, self.degree+1):
+            coefficients.append( (self.coeff[i] @ self.pseudo_weights[i].T).flatten(order="F") )
+        coefficients = np.concatenate(coefficients)
         coefficients = revert_frozen_coefficients(coefficients,
                                                 self.n_feats,
                                                 self.mask,
@@ -1097,7 +1140,9 @@ class AlchemicalModel(WeightedLinearModel):
     def initialize_gramC_ordinateC(self):
         """Initialize empty matrices for gram matrices and ordinates for fitting
         the alchemical spline coefficients."""
-        n_columns = self.n_elements + self.n_basis * self.n_pseudo
+        #n_columns = self.n_elements + self.n_basis * self.n_pseudo
+        n_columns = self.n_elements + sum(self.n_basis[i] * self.n_pseudo[i]
+                                          for i in range(2, self.degree+1))
         gram_e = np.zeros((n_columns, n_columns))
         ord_e = np.zeros(n_columns)
         gram_f = np.zeros((n_columns, n_columns))
@@ -1188,7 +1233,7 @@ class AlchemicalModel(WeightedLinearModel):
     def initialize_gramW_ordinateW(self):
         """Initialize empty matrices for gram matrices and ordinates for fitting
         the pseudo_weights."""
-        n_columns = self.n_pairtypes * self.n_pseudo
+        n_columns = sum(self.n_ituples[i] * self.n_pseudo[i] for i in range(2, self.degree+1))
         gram_e = np.zeros((n_columns, n_columns))
         ord_e = np.zeros(n_columns)
         gram_f = np.zeros((n_columns, n_columns))
@@ -1298,14 +1343,14 @@ class AlchemicalModelTorch(AlchemicalModel, torch.nn.Module):
                  data_coverage=None,
                  init_params=None,
                  dtype=torch.float64,
-                 **params):
+                 **args):
         AlchemicalModel.__init__(self,
                                  bspline_config,
                                  n_pseudo,
                                  regularizer,
                                  data_coverage,
                                  init_params,
-                                 **params)
+                                 **args)
         torch.nn.Module.__init__(self)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.to(self.device)
@@ -1457,8 +1502,8 @@ class AlchemicalModelTorch(AlchemicalModel, torch.nn.Module):
             resume (bool): whether to resume training from a previous checkpoint.
         """
         init_epoch, get_params_dir, get_params_path, tracker_filename, \
-        train_iter_filename, change_pseudo_tracker, change_1b_tracker, \
-        change_2b_tracker, rmse_e_tracker, rmse_f_tracker, time_tracker = \
+        train_iter_filename, change_pw_tracker, change_coeff_tracker, \
+        rmse_e_tracker, rmse_f_tracker, time_tracker = \
             self.initialize_training(max_iter=max_epochs,
                                      checkpoint=checkpoint,
                                      checkpoint_dir=checkpoint_dir,
