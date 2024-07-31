@@ -796,6 +796,14 @@ class AlchemicalModel(WeightedLinearModel):
             self.frozen_2b_data_coverage = metadata["frozen_2b_data_coverage"]
             energy_weight = metadata["energy_weight"]
             force_weight = metadata["force_weight"]
+            energy_n = metadata["energy_n"]
+            energy_mean = metadata["energy_mean"]
+            energy_std = metadata["energy_std"]
+            force_n = metadata["force_n"]
+            force_mean = metadata["force_mean"]
+            force_std = metadata["force_std"]
+            e_variance = VarianceRecorder(energy_mean, energy_std, energy_n)
+            f_variance = VarianceRecorder(force_mean, force_std, force_n)
 
             try:
                 train_tracker = np.load(tracker_filename)
@@ -817,7 +825,12 @@ class AlchemicalModel(WeightedLinearModel):
             assert len(time_tracker) == max_iter + 1
 
             # find iteration to resume from
-            init_iter = np.where(np.isnan(time_tracker))[0][0] - 1
+            try:
+                init_iter = np.where(np.isnan(time_tracker))[0][0] - 1
+            except IndexError:
+                raise ValueError(f"Could not find a NaN in {time_tracker}.\n"
+                                 f"Please set `resume=False` to start from scratch.\n"
+                                    "Exiting...")
             init_iter = (init_iter // checkpoint) * checkpoint
             if init_iter < checkpoint:
                 raise ValueError(f"Tried to resume from iteration {init_iter+1}"
@@ -843,6 +856,8 @@ class AlchemicalModel(WeightedLinearModel):
             self.frozen_2b_data_coverage = np.zeros(self.n_basis, dtype=bool)
             energy_weight = np.nan
             force_weight = np.nan
+            e_variance = VarianceRecorder()
+            f_variance = VarianceRecorder()
             change_pseudo_tracker = np.full(max_iter, np.nan)
             change_1b_tracker = np.full(max_iter, np.nan)
             change_2b_tracker = np.full(max_iter, np.nan)
@@ -857,7 +872,7 @@ class AlchemicalModel(WeightedLinearModel):
                metadata_filename, train_iter_filename, change_pseudo_tracker, \
                change_1b_tracker, change_2b_tracker, rmse_e_tracker, \
                rmse_f_tracker, time_tracker, latest_rmse_e, latest_rmse_f, \
-               energy_weight, force_weight
+               e_variance, f_variance, energy_weight, force_weight
 
     def update_dataset_metadata(self,
                                 df: pd.DataFrame,
@@ -970,7 +985,7 @@ class AlchemicalModel(WeightedLinearModel):
         metadata_filename, train_iter_filename, change_pseudo_tracker, \
         change_1b_tracker, change_2b_tracker, rmse_e_tracker, \
         rmse_f_tracker, time_tracker, rmse_e, rmse_f, \
-        energy_weight, force_weight = \
+        e_variance, f_variance, energy_weight, force_weight = \
             self.initialize_training(max_iter=max_iter,
                                      checkpoint=checkpoint,
                                      checkpoint_dir=checkpoint_dir,
@@ -983,8 +998,6 @@ class AlchemicalModel(WeightedLinearModel):
         
         # initial RMSE check
         if init_iter == 0:
-            e_variance = VarianceRecorder()
-            f_variance = VarianceRecorder()
             print(f"Initial RMSE check:")
             self.decompress_alchemical_parameters()
             _, _, _, _, rmse_e, rmse_f = self.batched_predict(filename,
@@ -1161,6 +1174,12 @@ class AlchemicalModel(WeightedLinearModel):
                          frozen_2b_data_coverage=self.frozen_2b_data_coverage,
                          energy_weight=energy_weight,
                          force_weight=force_weight,
+                         energy_n=e_variance.n,
+                         energy_mean=e_variance.mean,
+                         energy_std=e_variance.std,
+                         force_n=f_variance.n,
+                         force_mean=f_variance.mean,
+                         force_std=f_variance.std,
                          )
 
                 with open(train_iter_filename, "w") as f:
@@ -1368,7 +1387,6 @@ class AlchemicalModelTorch(AlchemicalModel, torch.nn.Module):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.to(self.device)
         self.dtype = dtype
-        self.convert2torch()
 
     def __repr__(self):
         if self.coefficients is None:
@@ -1463,7 +1481,8 @@ class AlchemicalModelTorch(AlchemicalModel, torch.nn.Module):
                         drop_columns: List[str] = None,
                         sparse_hdf5: bool = False,
                         max_epochs: int = 1,
-                        optimizer: torch.optim.Optimizer = None,
+                        optimizer_class: torch.optim.Optimizer = None,
+                        optimizer_kwargs: dict = {},
                         checkpoint: int = 10,
                         checkpoint_dir: str = ".",
                         shuffle: bool = True,
@@ -1471,6 +1490,7 @@ class AlchemicalModelTorch(AlchemicalModel, torch.nn.Module):
                         dataloader_n_workers: int = 0,
                         params_filename: str = "alchemical_model_params.npz",
                         tracker_filename: str = "train_tracker.npz",
+                        metadata_filename: str = "metadata.npz",
                         train_iter_filename: str = ".train_iter",
                         resume: bool = False,
                         ):
@@ -1498,8 +1518,9 @@ class AlchemicalModelTorch(AlchemicalModel, torch.nn.Module):
             sparse_hdf5 (bool): whether the HDF5 features file is in sparse format.
             max_epochs (int): maximum number of iterations for alternating
                 least-squares optimization.
-            optimizer (torch.optim.Optimizer): optimizer for training. If None,
-                defaults to Adam.
+            optimizer_class (torch.optim.Optimizer): optimizer class for training.
+                If None, defaults to Adam.
+            optimizer_kwargs (dict): keyword arguments for the optimizer.
             checkpoint (int): frequency of checkpointing the training RMSE and
                 saving parameters to disk.
             checkpoint_dir (str): directory for saving checkpoints.
@@ -1510,6 +1531,8 @@ class AlchemicalModelTorch(AlchemicalModel, torch.nn.Module):
                 checkpoints.
             train_tracker (str): filename for saving training tracker during
                 checkpoints.
+            metadata_filename (str): filename for saving metadata during
+                checkpoints.
             train_iter_filename (str): filename for writing current iteration
                 number during checkpoints.
             resume (bool): whether to resume training from a previous checkpoint.
@@ -1518,7 +1541,7 @@ class AlchemicalModelTorch(AlchemicalModel, torch.nn.Module):
         metadata_filename, train_iter_filename, change_pseudo_tracker, \
         change_1b_tracker, change_2b_tracker, rmse_e_tracker, \
         rmse_f_tracker, time_tracker, rmse_e, rmse_f, \
-        energy_weight, force_weight = \
+        e_variance, f_variance, energy_weight, force_weight = \
             self.initialize_training(max_iter=max_epochs,
                                      checkpoint=checkpoint,
                                      checkpoint_dir=checkpoint_dir,
@@ -1528,12 +1551,13 @@ class AlchemicalModelTorch(AlchemicalModel, torch.nn.Module):
                                      train_iter_filename=train_iter_filename,
                                      resume=resume,
                                      )
+        self.convert2torch()
 
         # Optimizer
-        if optimizer is None:
-            optimizer = torch.optim.Adam(self.parameters(), lr=0.1)
+        if optimizer_class is None:
+            optimizer = torch.optim.Adam(self.parameters(), lr=0.01)
         else:
-            optimizer = optimizer
+            optimizer = optimizer_class(self.parameters(), **optimizer_kwargs)
 
         # Create PyTorch DataLoader
         if not os.path.isfile(filename):
@@ -1570,10 +1594,6 @@ class AlchemicalModelTorch(AlchemicalModel, torch.nn.Module):
             print(f"Iteration {i+1}/{max_epochs}")
             starttime = time.time()
 
-            # if doing stochastic optimization, we need to do these each time
-            # the parameters are updated
-            e_variance = VarianceRecorder()
-            f_variance = VarianceRecorder()
             optimizer.zero_grad()
             loss_e = 0.0
             loss_f = 0.0
@@ -1594,6 +1614,15 @@ class AlchemicalModelTorch(AlchemicalModel, torch.nn.Module):
                 if drop_columns != None:
                     df.drop(columns=drop_columns,inplace=True)
                 
+                if i == 0:
+                    self.update_dataset_metadata(df,
+                                                 keys,
+                                                 e_variance,
+                                                 f_variance,
+                                                 sample_weights,
+                                                 energy_key=energy_key,
+                                                 )
+                
                 x_e, y_e, x_f, y_f = freeze_columns_from_df(df,
                                                 keys,
                                                 self.n_elements,
@@ -1603,17 +1632,6 @@ class AlchemicalModelTorch(AlchemicalModel, torch.nn.Module):
                                                 energy_key=energy_key,
                                                 sample_weights=sample_weights,
                                                 )    
-                # if we allowed more than one batch, we would need to stack them here
-                e_variance.update(y_e)
-                f_variance.update(y_f)
-                data_coverage_2b_e = (np.sum(x_e[:, self.n_elements:], axis=0) != 0).reshape(self.n_pairtypes, self.n_basis)
-                data_coverage_2b_e = np.any(data_coverage_2b_e, axis=0)
-                data_coverage_2b_f = (np.sum(x_f[:, self.n_elements:], axis=0) != 0).reshape(self.n_pairtypes, self.n_basis)
-                data_coverage_2b_f = np.any(data_coverage_2b_f, axis=0)
-                self.frozen_2b_data_coverage = np.logical_or(self.frozen_2b_data_coverage,
-                                                            data_coverage_2b_e)
-                self.frozen_2b_data_coverage = np.logical_or(self.frozen_2b_data_coverage,
-                                                            data_coverage_2b_f)
                 
                 # Accumulate losses
                 x_e = torch.tensor(x_e, device=self.device, dtype=self.dtype,
@@ -1630,10 +1648,11 @@ class AlchemicalModelTorch(AlchemicalModel, torch.nn.Module):
                 loss_f += torch.nn.functional.mse_loss(p_f, y_f, reduction="sum")
                 
             # Compute total loss
-            energy_weight, force_weight = calc_E_F_weights(e_variance.n,
-                                                           f_variance.n,
-                                                           e_variance.std,
-                                                           f_variance.std)
+            if i == 0:
+                energy_weight, force_weight = calc_E_F_weights(e_variance.n,
+                                                            f_variance.n,
+                                                            e_variance.std,
+                                                            f_variance.std)
             loss, _ = self.combine_weighted_gram(loss_e, loss_f, 0, 0,
                                                  energy_weight, force_weight, weight)
             loss += self.regularization_loss(sparsity_reg)
@@ -1691,12 +1710,26 @@ class AlchemicalModelTorch(AlchemicalModel, torch.nn.Module):
                          pseudo_weights=self.pseudo_weights.detach().cpu().numpy())
 
                 np.savez(tracker_filename,
-                            change_pseudo=change_pseudo_tracker,
-                            change_1b=change_1b_tracker,
-                            change_2b=change_2b_tracker,
-                            rmse_e=rmse_e_tracker,
-                            rmse_f=rmse_f_tracker,
-                            time=time_tracker)
+                         change_pseudo=change_pseudo_tracker,
+                         change_1b=change_1b_tracker,
+                         change_2b=change_2b_tracker,
+                         rmse_e=rmse_e_tracker,
+                         rmse_f=rmse_f_tracker,
+                         time=time_tracker)
+
+                np.savez(metadata_filename,
+                         latest_rmse_e=rmse_e,
+                         latest_rmse_f=rmse_f,
+                         frozen_2b_data_coverage=self.frozen_2b_data_coverage,
+                         energy_weight=energy_weight,
+                         force_weight=force_weight,
+                         energy_n=e_variance.n,
+                         energy_mean=e_variance.mean,
+                         energy_std=e_variance.std,
+                         force_n=f_variance.n,
+                         force_mean=f_variance.mean,
+                         force_std=f_variance.std,
+                         )
 
                 with open(train_iter_filename, "w") as f:
                     f.write(f"{i+1}\n")
