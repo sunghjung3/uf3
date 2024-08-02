@@ -747,11 +747,22 @@ class AlchemicalModel(WeightedLinearModel):
                 range(2, self.degree+1)}
 
     @property
-    def coeff_offsets(self):
+    def real_coeff_offsets(self):
         """
         Offset indices for coefficients of different interaction orders.
         """
         body_order_sizes = np.array([self.n_basis[i] * self.n_ituples[i]
+                                     for i in range(2, self.degree+1)])
+        body_order_offsets = np.cumsum(body_order_sizes)
+        body_order_offsets = np.insert(body_order_offsets, 0, 0) + self.n_elements
+        return {i: body_order_offsets[i-2] for i in range(2, self.degree+2)}
+
+    @property
+    def alchemical_coeff_offsets(self):
+        """
+        Offset indices for alchemical coefficients of different interaction orders.
+        """
+        body_order_sizes = np.array([self.n_pseudo[i] * self.n_basis[i]
                                      for i in range(2, self.degree+1)])
         body_order_offsets = np.cumsum(body_order_sizes)
         body_order_offsets = np.insert(body_order_offsets, 0, 0) + self.n_elements
@@ -967,8 +978,8 @@ class AlchemicalModel(WeightedLinearModel):
             f_variance.update(y_f)
 
         for i in range(2, self.degree+1):
-            idx_lo = self.coeff_offsets[i]
-            idx_hi = self.coeff_offsets[i+1]
+            idx_lo = self.real_coeff_offsets[i]
+            idx_hi = self.real_coeff_offsets[i+1]
             data_coverage_e = np.any(np.abs(x_e[:, idx_lo:idx_hi]) > epsilon, axis=0)
             data_coverage_e = data_coverage_e.reshape(self.n_ituples[i], self.n_basis[i])
             data_coverage_e = np.any(data_coverage_e, axis=0)
@@ -1168,8 +1179,8 @@ class AlchemicalModel(WeightedLinearModel):
                     old_coeff = self.coeff
                     self.coeff = {1: fitted_params[:self.n_elements]}
                     for k in range(2, self.degree+1):
-                        idx_lo = self.coeff_offsets[k]
-                        idx_hi = self.coeff_offsets[k+1]
+                        idx_lo = self.alchemical_coeff_offsets[k]
+                        idx_hi = self.alchemical_coeff_offsets[k+1]
                         self.coeff[k] = fitted_params[idx_lo:idx_hi].\
                              reshape(self.n_pseudo[k], self.n_basis[k]).T
                 elif param_to_fit == "pseudo_weights":
@@ -1347,8 +1358,8 @@ class AlchemicalModel(WeightedLinearModel):
         X_1 = X[:, :self.n_elements]  # 1-body features
         WXs = [X_1]
         for i in range(2, self.degree+1):
-            idx_lo = self.coeff_offsets[i]
-            idx_hi = self.coeff_offsets[i+1]
+            idx_lo = self.real_coeff_offsets[i]
+            idx_hi = self.real_coeff_offsets[i+1]
             X_i = X[:, idx_lo:idx_hi]
             X_i_tensor = X_i.reshape(n_data, self.n_ituples[i], self.n_basis[i])
             WX_i = broad_row_krp_sum(Ws[i], X_i_tensor)
@@ -1431,8 +1442,8 @@ class AlchemicalModel(WeightedLinearModel):
         n_data, _ = np.shape(X)
         XCs = []
         for i in range(2, self.degree+1):
-            idx_lo = self.coeff_offsets[i]
-            idx_hi = self.coeff_offsets[i+1]
+            idx_lo = self.real_coeff_offsets[i]
+            idx_hi = self.real_coeff_offsets[i+1]
             X_i = X[:, idx_lo:idx_hi]
             X_i_tensor = X_i.reshape(n_data, self.n_ituples[i], self.n_basis[i])
             XC_i = X_i_tensor @ Cs[i]
