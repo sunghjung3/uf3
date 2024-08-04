@@ -2557,7 +2557,7 @@ def sparsity_reg_matrix(params, strength, epsilon=1e-12):
     Returns:
         reg_matrix (np.ndarray): regularization matrix.
     """
-    params = np.where(params < epsilon, epsilon, params)
+    params = np.where(np.abs(params) < epsilon, epsilon, params)
     reg_matrix = np.diag(1/params) * strength
     return reg_matrix
 
