@@ -121,7 +121,8 @@ def reg_loss(beta: np.ndarray | torch.Tensor,
     """
     Calculate the regularization loss for the coefficients.
     """
-    return ((reg_matrix @ beta) ** 2).sum()
+    #return ((reg_matrix @ beta) ** 2).sum()  # same as below
+    return ((reg_matrix.T * beta).sum((0)) ** 2).sum()
 
 def total_loss(X: np.ndarray | torch.Tensor,
                Y: np.ndarray | torch.Tensor,

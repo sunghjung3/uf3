@@ -75,7 +75,7 @@ def alchemy_als(X: np.ndarray,
         WX = least_squares.broad_row_krp_sum(W, X)
         gram = WX.T @ WX
         ordinate = WX.T @ Y
-        regularizer = C_reg_matrix.T.reshape(n_reg_C, n_pseudo * n_basis)
+        regularizer = C_reg_matrix.transpose(0, 2, 1).reshape(n_reg_C, n_pseudo * n_basis)
         gram += regularizer.T @ regularizer
         C = np.linalg.solve(gram, ordinate).reshape(n_pseudo, n_basis).T
         Cs.append(C.copy())
@@ -244,6 +244,24 @@ def loss_grad(X: np.ndarray | torch.Tensor,
     grad_C = C.grad.clone().detach().numpy()
     grad_W = W.grad.clone().detach().numpy()
     return loss, grad_C, grad_W
+
+def decompress_alchemical_coefficients(C: np.ndarray | torch.Tensor,
+                                       W: np.ndarray | torch.Tensor,
+                                       ):
+    """
+    Decompress the alchemical coefficients from the compressed form.
+
+    Args:
+        C: np.ndarray
+            The coefficient matrix of shape (n_basis, n_pseudo)
+        W: np.ndarray
+            The weight matrix of shape (n_ituples, n_pseudo)
+
+    Returns:
+        Cs: np.ndarray
+            The decompressed coefficient matrix of shape (n_basis, n_ituples)
+    """
+    return C @ W.T
 
 def get_C_reg_matrix(n_pseudo: int,
                      n_basis: int,
