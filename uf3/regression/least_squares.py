@@ -833,6 +833,7 @@ class AlchemicalModel(WeightedLinearModel):
                             metadata_filename: str,
                             train_iter_filename: str,
                             resume: bool,
+                            fit_first: str,
                             ):
         """
         Initialization for training.
@@ -933,11 +934,19 @@ class AlchemicalModel(WeightedLinearModel):
             latest_rmse_e = np.nan
             latest_rmse_f = np.nan
 
+            if fit_first == "C":
+                params_fit_order = ("coeff", "pseudo_weights")
+            elif fit_first == "W":
+                params_fit_order = ("pseudo_weights", "coeff")
+            else:
+                raise ValueError(f"Unrecognized value for `fit_first`: {fit_first}\n"
+                                 "Expected 'C' or 'W'.")
+
         return init_iter, get_params_dir, get_params_path, tracker_filename, \
                metadata_filename, train_iter_filename, change_pw_tracker, \
                change_coeff_tracker, rmse_e_tracker, rmse_f_tracker, \
                time_tracker, latest_rmse_e, latest_rmse_f, \
-               e_variance, f_variance, energy_weight, force_weight
+               e_variance, f_variance, energy_weight, force_weight, params_fit_order
 
     def update_dataset_metadata(self,
                                 df: pd.DataFrame,
@@ -1012,6 +1021,7 @@ class AlchemicalModel(WeightedLinearModel):
                       train_iter_filename: str = ".train_iter",
                       client = None,
                       resume: bool = False,
+                      fit_first: str = "C",
                       ):
         """
         Accumulate inputs and outputs from batched parsing of HDF5 file
@@ -1052,12 +1062,15 @@ class AlchemicalModel(WeightedLinearModel):
                 number during checkpoints. Will be saved to `checkpoint_dir/`.
             client (concurrent.futures.Executor, dask.distributed.Client)
             resume (bool): whether to resume training from a previous checkpoint.
+            fit_first (str): which parameters to fit first. Options are "C" for
+                coefficients and "W" for pseudo-weights. Defaults to "C".
         """
         init_iter, get_params_dir, get_params_path, tracker_filename, \
         metadata_filename, train_iter_filename, change_pw_tracker, \
         change_coeff_tracker, rmse_e_tracker, rmse_f_tracker, \
         time_tracker, rmse_e, rmse_f, \
-        e_variance, f_variance, energy_weight, force_weight = \
+        e_variance, f_variance, energy_weight, force_weight, \
+        params_fit_order = \
             self.initialize_training(max_iter=max_iter,
                                      checkpoint=checkpoint,
                                      checkpoint_dir=checkpoint_dir,
@@ -1066,6 +1079,7 @@ class AlchemicalModel(WeightedLinearModel):
                                      metadata_filename=metadata_filename,
                                      train_iter_filename=train_iter_filename,
                                      resume=resume,
+                                     fit_first=fit_first,
                                      )
         
         # initial RMSE check
@@ -1096,7 +1110,7 @@ class AlchemicalModel(WeightedLinearModel):
             print(f"Iteration {i+1}/{max_iter}")
             starttime = time.time()
 
-            for param_to_fit in ("coeff", "pseudo_weights"):
+            for param_to_fit in params_fit_order:
                 if param_to_fit == "coeff":
                     print(f"\tFitting alchemical spline coefficients.")
                     gram_e, gram_f, ord_e, ord_f = self.initialize_gramC_ordinateC()
@@ -1126,14 +1140,6 @@ class AlchemicalModel(WeightedLinearModel):
                                                          sample_weights=sample_weights,
                                                          energy_key=energy_key,
                                                          batch_size=batch_size)
-                        if i == 0:
-                            self.update_dataset_metadata(df,
-                                                         keys,
-                                                         e_variance,
-                                                         f_variance,
-                                                         sample_weights,
-                                                         energy_key=energy_key,
-                                                         )
                     elif param_to_fit == "pseudo_weights":
                         intermediates = self.gramW_from_df(df,
                                                          keys,
@@ -1148,7 +1154,16 @@ class AlchemicalModel(WeightedLinearModel):
                     ord_e += o_e
                     ord_f += o_f
 
-                if i == 0 and param_to_fit == "coeff":
+                    if i == 0 and param_to_fit == params_fit_order[0]:
+                        self.update_dataset_metadata(df,
+                                                        keys,
+                                                        e_variance,
+                                                        f_variance,
+                                                        sample_weights,
+                                                        energy_key=energy_key,
+                                                        )
+
+                if i == 0 and param_to_fit == params_fit_order[0]:
                     energy_weight, force_weight = calc_E_F_weights(e_variance.n,
                                                                 f_variance.n,
                                                                 e_variance.std,
@@ -1175,8 +1190,14 @@ class AlchemicalModel(WeightedLinearModel):
                 gram += regularizer
                 fitted_params = lu_factorization(gram, ordinate)
 
-                if param_to_fit == "coeff":
+                # Update.
+                # NOTE: self.coeff and self.pseudo_weights must be updated every
+                # half iteration because the updated values are used in the next
+                # half iteration.
+                if param_to_fit == params_fit_order[0]:
                     old_coeff = self.coeff
+                    old_pseudo_weights = self.pseudo_weights
+                if param_to_fit == "coeff":
                     self.coeff = {1: fitted_params[:self.n_elements]}
                     for k in range(2, self.degree+1):
                         idx_lo = self.alchemical_coeff_offsets[k]
@@ -1184,28 +1205,31 @@ class AlchemicalModel(WeightedLinearModel):
                         self.coeff[k] = fitted_params[idx_lo:idx_hi].\
                              reshape(self.n_pseudo[k], self.n_basis[k]).T
                 elif param_to_fit == "pseudo_weights":
-                    pseudo_weights = {}
+                    self.pseudo_weights = {}
                     for k in range(2, self.degree+1):
                         idx_lo = self.pseudo_offsets[k]
                         idx_hi = self.pseudo_offsets[k+1]
-                        pseudo_weights[k] = fitted_params[idx_lo:idx_hi].\
+                        self.pseudo_weights[k] = fitted_params[idx_lo:idx_hi].\
                                 reshape(self.n_ituples[k], self.n_pseudo[k])
                         # normalize weights s.t. each column is between -1 and 1
-                        normalization_factor = np.max(np.abs(pseudo_weights[k]), axis=0)
-                        pseudo_weights[k] /= normalization_factor  # broadcasted over columns
+                        normalization_factor = np.max(np.abs(self.pseudo_weights[k]), axis=0)
+                        self.pseudo_weights[k] /= normalization_factor
                         self.coeff[k] *= normalization_factor  # not necessary if coeffs are trained again
-                        max_change_pseudo = np.max(np.abs(pseudo_weights[k] - self.pseudo_weights[k]))
+                
+                # Record change at the end of every whole iteration
+                if param_to_fit == params_fit_order[-1]:
+                    for k in range(2, self.degree+1):
+                        max_change_pseudo = np.max(np.abs(self.pseudo_weights[k] - old_pseudo_weights[k]))
                         max_change_coeff = np.max(np.abs(
-                            old_coeff[k][self.frozen_data_coverage[k]] - 
-                            self.coeff[k][self.frozen_data_coverage[k]]
+                            self.coeff[k][self.frozen_data_coverage[k]] - 
+                            old_coeff[k][self.frozen_data_coverage[k]]
                             ))
                         change_coeff_tracker[k][i] = max_change_coeff
                         change_pw_tracker[k][i] = max_change_pseudo
                         print(f"\tMax change in {k}-body coefficients: {max_change_coeff:.3E}")
                         print(f"\tMax change in {k}-body pseudo weights: {max_change_pseudo:.3E}")
-                    self.pseudo_weights = pseudo_weights
                     # 1b
-                    max_change_coeff = np.max(np.abs(old_coeff[1] - self.coeff[1]))
+                    max_change_coeff = np.max(np.abs(self.coeff[1] - old_coeff[1]))
                     change_coeff_tracker[1][i] = max_change_coeff
                     print(f"\tMax change in 1-body coefficients: {max_change_coeff:.3E}")
                 print()
