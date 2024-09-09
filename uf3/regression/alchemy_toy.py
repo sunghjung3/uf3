@@ -37,8 +37,8 @@ def alchemy_als(X: np.ndarray,
         n_iter: int
             The number of iterations to run the ALS algorithm
         normalize: bool
-            Whether to normalize each column of C and W by the maximum absolute
-            value of the W column.
+            Whether to normalize each column of C and W by the scaled L2 norm of
+            each column of W
         
     Returns:
         Cs: List[np.ndarray]
@@ -60,6 +60,9 @@ def alchemy_als(X: np.ndarray,
     assert W_init.shape[0] == n_ituples and W_init.shape[1] == n_pseudo
     assert C_reg_matrix.shape[1] == n_basis and C_reg_matrix.shape[2] == n_pseudo
     n_reg_C = C_reg_matrix.shape[0]
+    tmp = np.sum(np.abs(C_reg_matrix), axis=1)
+    reg_row_idx, reg_col_idx = np.where(tmp > 0)
+    assert len(np.unique(reg_row_idx)) == len(reg_row_idx)
 
     # initialize
     C = C_init.copy()
@@ -75,7 +78,10 @@ def alchemy_als(X: np.ndarray,
         WX = least_squares.broad_row_krp_sum(W, X)
         gram = WX.T @ WX
         ordinate = WX.T @ Y
-        regularizer = C_reg_matrix.transpose(0, 2, 1).reshape(n_reg_C, n_pseudo * n_basis)
+        L2_norm_W = np.linalg.norm(W, axis=0)
+        regularizer = C_reg_matrix * L2_norm_W
+        regularizer = regularizer.transpose(0, 2, 1).reshape(n_reg_C, n_pseudo * n_basis)
+        #regularizer = C_reg_matrix.transpose(0, 2, 1).reshape(n_reg_C, n_pseudo * n_basis)
         gram += regularizer.T @ regularizer
         C = np.linalg.solve(gram, ordinate).reshape(n_pseudo, n_basis).T
         Cs.append(C.copy())
@@ -85,13 +91,19 @@ def alchemy_als(X: np.ndarray,
         XC = (X @ C).reshape(n_data, n_ituples * n_pseudo)
         gram = XC.T @ XC
         ordinate = XC.T @ Y
+        DC = np.sum(C_reg_matrix * C, axis=1)
+        DC_nonzero_sq = DC[reg_row_idx, reg_col_idx] ** 2
+        for i_reg in range(len(reg_row_idx)):
+            reg_gram_contrib = np.ones(n_ituples) * DC_nonzero_sq[i_reg]
+            gram_contrib_idx = reg_col_idx[i_reg] + n_pseudo * np.arange(n_ituples)
+            gram[gram_contrib_idx, gram_contrib_idx] += reg_gram_contrib
         W = np.linalg.solve(gram, ordinate).reshape(n_ituples, n_pseudo)
         Cs.append(C.copy())
         Ws.append(W.copy())
 
         # normalize
         if normalize:
-            normalization_factor = np.max(np.abs(W), axis=0)
+            normalization_factor = np.linalg.norm(W, axis=0) / np.sqrt(n_ituples)
             W /= normalization_factor
             C *= normalization_factor
         Cs.append(C.copy())
@@ -199,12 +211,15 @@ def calc_sse(Y: np.ndarray | torch.Tensor,
     return ((Y - Y_hat) ** 2).sum()
 
 def reg_loss(C: np.ndarray | torch.Tensor,
+             W: np.ndarray | torch.Tensor,
              C_reg_matrix: np.ndarray | torch.Tensor,
              ):
     """
     Calculate the regularization loss for the coefficient matrix.
     """
-    return ((C_reg_matrix * C).sum((1, 2)) ** 2).sum()
+    L2_norm_W = torch.norm(W, dim=0) if isinstance(W, torch.Tensor) else np.linalg.norm(W, axis=0)
+    return ((C_reg_matrix * C * L2_norm_W).sum((1, 2)) ** 2).sum()
+    #return ((C_reg_matrix * C).sum((1, 2)) ** 2).sum()
 
 def total_loss(X: np.ndarray | torch.Tensor,
                Y: np.ndarray | torch.Tensor,
@@ -217,7 +232,7 @@ def total_loss(X: np.ndarray | torch.Tensor,
     """
     Y_hat = forward(X, C, W)
     mse = calc_sse(Y, Y_hat)
-    reg = reg_loss(C, C_reg_matrix)
+    reg = reg_loss(C, W, C_reg_matrix)
     return mse + reg
 
 def loss_grad(X: np.ndarray | torch.Tensor,
