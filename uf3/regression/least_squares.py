@@ -10,6 +10,7 @@ import time
 import warnings
 import numpy as np
 import pandas as pd
+from numba import jit
 import torch
 import scipy
 import ndsplines
@@ -2546,7 +2547,7 @@ def calc_E_F_weights(n_e, n_f, std_e, std_f):
     return energy_weight, force_weight
 
 
-def broad_row_krp_sum(A, B):
+def legacy_broad_row_krp_sum(A, B):
     """
     Broadcasted Khatri-Rao product of rows between A and slices of B along its
     0-th axis, with a summation along the 1st axis and a squeeze at the end.
@@ -2566,6 +2567,32 @@ def broad_row_krp_sum(A, B):
             for i in range(B.shape[0])
             ]
         )
+    return result
+
+
+@jit(nopython=True, nogil=True)
+def broad_row_krp_sum(A, B):
+    """
+    Broadcasted Khatri-Rao product of rows between A and slices of B along its
+    0-th axis, with a summation along the 1st axis and a squeeze at the end.
+    Used in the AlchemicalModel for computating the feature matrix for the
+    alchemical spline coefficient fitting.
+
+    Args:
+        A (np.ndarray): first matrix of shape (m, n).
+        B (np.ndarray): second matrix of shape (r, m, s).
+
+    Returns:
+        result (np.ndarray): the result of shape (r, n * s).
+    """
+    r, m, s = B.shape
+    n = A.shape[1]  # will assume that A.shape[0] == m
+    result = np.zeros((r, n * s))
+    for i in range(r):
+        tmp = np.zeros(n * s)
+        for j in range(m):
+            tmp += np.kron(A[j], B[i, j])
+        result[i] = tmp
     return result
 
 
