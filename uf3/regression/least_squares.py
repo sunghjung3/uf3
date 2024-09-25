@@ -683,8 +683,6 @@ class AlchemicalModel(WeightedLinearModel):
     XXX: all pseudo-interactions must have the same spline construction and
     offsets are fit.
 
-    XXX: self.data_coverage is not implemented yet.
-    
     XXX: the regularizer matrix should already have frozen coefficients removed.
 
     Args:
@@ -824,6 +822,196 @@ class AlchemicalModel(WeightedLinearModel):
                     raise ValueError(f"Incorrect shape for pseudo weights.\n"
                                      f"\tExpected: ({self.n_ituples[i]}, {self.n_pseudo[i]})\n"
                                      f"\tProvided: {self.pseudo_weights[i].shape}")
+
+    def preprocess_for_training(self,
+                                filename: str,
+                                subset: Collection,
+                                weight: float = 0.5,
+                                e_variance: VarianceRecorder = None,
+                                f_variance: VarianceRecorder = None,
+                                sample_weights: Dict = None,
+                                energy_key: str = "energy",
+                                progress: str = "bar",
+                                drop_columns: List[str] = None,
+                                sparse_hdf5: bool = False,
+                                epsilon: float = 1e-12,
+                                preprocessed_file: str = 'preprocessed.h5'
+                                ):
+        """
+        Preprocess data and collect metadata for efficient training, including:
+            - extracting only the training subset
+            - removing/freezing appropriate feature columns to remove them from
+                the dataset
+            - splitting dataset according to interaction order
+            - ensuring C-style contiguous arrays
+            - accumulating statistics for energies and forces, including means
+                and variances, and calculating weights for energy and forces
+            - combining energies and forces with appropriate weights
+            - accumulating data coverage and frozen data coverage for each
+                interaction order
+            - XXX: append real regularizer to dataset (do later)
+            - saving preprocessed data to disk (data as CSR arrays)
+
+        Does 2 complete passes through the dataset:
+            1. Metadata collection and everything else except energy-force
+                combination.
+            2. Energy-force combination.
+
+        Args:
+            filename (str): path to HDF5 file.
+            subset (list): list of keys for training.
+            weight (float): parameter balancing contribution from energies
+                vs. forces. Higher values favor energies; defaults to 0.5.
+            e_variance (VarianceRecorder): handler for accumulating
+                statistics for energies (mean and variance).
+            f_variance (VarianceRecorder): handler for accumulating
+                statistics for forces (mean and variance).
+            sample_weights (dict):
+            energy_key (str): column name for energies, default "energy".
+            progress (str): style for progress indicators.
+            drop_columns (list): list of columns to drop. Used when modifying
+                the cutoffs of the feature vectors from HDF5 file. No internal
+                checks are performed to see if dropping provided columns produce
+                features of the intended cutoffs. Use with Caution.
+            sparse_hdf5 (bool): whether the HDF5 features file is in sparse format.
+            epsilon (float): small value for filtering frozen data coverage.
+            preprocessed_file (str): filename to save preprocessed data.
+        """
+        ### FIRST PASS ###
+        # initialize variables
+        if e_variance is None:
+            e_variance = VarianceRecorder()
+        if f_variance is None:
+            f_variance = VarianceRecorder()
+        frozen_data_coverage = {i: np.zeros(self.n_basis[i], dtype=bool)
+                                for i in range(2, self.degree+1)}
+        frozen_data_coverage[1] = np.zeros(self.n_elements, dtype=bool)
+        # total number of columns after removing unused columns
+        # contrast with self.n_feats, which is before removing unused columns
+        n_columns_total = self.n_elements + sum([self.n_basis[i] * self.n_ituples[i]
+                                                 for i in range(2, self.degree+1)])
+        data_coverage = np.zeros(n_columns_total, dtype=bool)
+
+
+        # loop over batches
+        if not os.path.isfile(filename):
+            raise FileNotFoundError(filename)
+        n_tables, _, table_names, _ = io.analyze_hdf_tables(filename)
+        table_iterator = parallel.progress_iter(np.arange(n_tables),
+                                                style=progress,
+                                                total=n_tables,
+                                                leave=True)
+        for j in table_iterator:
+            table_name = table_names[j]
+            df = process.load_feature_db(filename, table_name, sparse_hdf5=sparse_hdf5)
+            keys = df.index.unique(level=0).intersection(subset)
+            if len(keys) == 0:
+                continue
+            if drop_columns != None:
+                df.drop(columns=drop_columns,inplace=True)
+
+            x_e, y_e, x_f, y_f = dataframe_to_tuples(df.loc[keys],
+                                                    n_elements=self.n_elements,
+                                                    energy_key=energy_key,
+                                                    sample_weights=sample_weights,
+                                                    )
+            x_e, y_e = freeze_columns(x_e,
+                                      y_e,
+                                      self.mask,
+                                      self.frozen_c,
+                                      self.col_idx)
+            x_f, y_f = freeze_columns(x_f,
+                                      y_f,
+                                      self.mask,
+                                      self.frozen_c,
+                                      self.col_idx)
+            e_variance.update(y_e)
+            f_variance.update(y_f)
+
+            x_es = {1: x_e[:, :self.n_elements]}
+            data_coverage_e = np.any(np.abs(x_es[1]) > epsilon, axis=0)
+            frozen_data_coverage[1] = np.logical_or(frozen_data_coverage[1],
+                                                    data_coverage_e)
+            data_coverage[:self.n_elements] = np.logical_or(data_coverage[:self.n_elements],
+                                                            data_coverage_e)
+            x_fs = dict()
+
+            for i in range(2, self.degree+1):
+                idx_lo = self.real_coeff_offsets[i]
+                idx_hi = self.real_coeff_offsets[i+1]
+                x_es[i] = x_e[:, idx_lo:idx_hi]
+                x_fs[i] = x_f[:, idx_lo:idx_hi]
+
+                data_coverage_e = np.any(np.abs(x_es[i]) > epsilon, axis=0)
+                data_coverage[idx_lo:idx_hi] = np.logical_or(data_coverage[idx_lo:idx_hi],
+                                                             data_coverage_e)
+                data_coverage_e = data_coverage_e.reshape(self.n_ituples[i], self.n_basis[i])
+                data_coverage_e = np.any(data_coverage_e, axis=0)
+                data_coverage_f = np.any(np.abs(x_fs[i]) > epsilon, axis=0)
+                data_coverage[idx_lo:idx_hi] = np.logical_or(data_coverage[idx_lo:idx_hi],
+                                                             data_coverage_f)
+                data_coverage_f = data_coverage_f.reshape(self.n_ituples[i], self.n_basis[i])
+                data_coverage_f = np.any(data_coverage_f, axis=0)
+                frozen_data_coverage[i] = np.logical_or(frozen_data_coverage[i],
+                                                        data_coverage_e)
+                frozen_data_coverage[i] = np.logical_or(frozen_data_coverage[i],
+                                                        data_coverage_f)
+
+            # save preprocessed energy and force features (will be combined in 2nd pass)
+            process.save_preprocessed_db(x_es, y_e, preprocessed_file+".tmp",
+                                         degree=self.degree,
+                                         batch_name=table_name+"_e",
+                                         )
+            process.save_preprocessed_db(x_fs, y_f, preprocessed_file+".tmp",
+                                         degree=self.degree,
+                                         batch_name=table_name+"_f",
+                                         )
+
+        # set data coverages as class attributes
+        data_coverage = revert_frozen_coefficients(data_coverage,
+                                                    self.n_feats,
+                                                    self.mask,
+                                                    self.frozen_c,
+                                                    self.col_idx)
+        self.data_coverage = np.logical_or(self.data_coverage, data_coverage)
+        self.frozen_data_coverage = frozen_data_coverage
+
+        ### SECOND PASS ###
+        # calculate energy and force weights
+        energy_weight, force_weight = calc_E_F_weights(e_variance.n,
+                                                       f_variance.n,
+                                                       e_variance.std,
+                                                       f_variance.std)
+        energy_weight *= np.sqrt(weight)
+        force_weight *= np.sqrt(1 - weight)
+
+        # loop over batches and combine energies and forces
+        table_iterator = parallel.progress_iter(np.arange(n_tables),
+                                                style=progress,
+                                                total=n_tables,
+                                                leave=True)
+        for j in table_iterator:
+            table_name = table_names[j]
+            x_es, y_e = process.load_preprocessed_db(preprocessed_file+".tmp",
+                                                     table_name+"_e",
+                                                     load_sparse=False,
+                                                     )
+            x_es = {i: x_es[i] * energy_weight for i in x_es}
+            y_e = y_e * energy_weight
+            x_fs, y_f = process.load_preprocessed_db(preprocessed_file+".tmp",
+                                                     table_name+"_f",
+                                                     load_sparse=False,
+                                                     )
+            x_fs = {i: x_fs[i] * force_weight for i in x_fs}
+            y_f = y_f * force_weight
+            x_s = {i: np.vstack((x_es[i], x_fs[i])) for i in x_fs}
+            x_s[1] = x_es[1]
+            y_s = np.concatenate((y_e, y_f))
+            process.save_preprocessed_db(x_s, y_s, preprocessed_file,
+                                         degree=self.degree,
+                                         batch_name=table_name,
+                                         )
+        os.remove(preprocessed_file+".tmp")
 
     def initialize_training(self,
                             max_iter: int,
@@ -1230,7 +1418,8 @@ class AlchemicalModel(WeightedLinearModel):
                         print(f"\tMax change in {k}-body coefficients: {max_change_coeff:.3E}")
                         print(f"\tMax change in {k}-body pseudo weights: {max_change_pseudo:.3E}")
                     # 1b
-                    max_change_coeff = np.max(np.abs(self.coeff[1] - old_coeff[1]))
+                    max_change_coeff = np.max(np.abs(self.coeff[1][self.frozen_data_coverage[1]] -
+                                                     old_coeff[1][self.frozen_data_coverage[1]]))
                     change_coeff_tracker[1][i] = max_change_coeff
                     print(f"\tMax change in 1-body coefficients: {max_change_coeff:.3E}")
                 print()
@@ -2547,7 +2736,7 @@ def calc_E_F_weights(n_e, n_f, std_e, std_f):
     return energy_weight, force_weight
 
 
-def legacy_broad_row_krp_sum(A, B):
+def broad_row_krp_sum(A, B):
     """
     Broadcasted Khatri-Rao product of rows between A and slices of B along its
     0-th axis, with a summation along the 1st axis and a squeeze at the end.
@@ -2571,7 +2760,7 @@ def legacy_broad_row_krp_sum(A, B):
 
 
 @jit(nopython=True, nogil=True)
-def broad_row_krp_sum(A, B):
+def new_broad_row_krp_sum(A, B):
     """
     Broadcasted Khatri-Rao product of rows between A and slices of B along its
     0-th axis, with a summation along the 1st axis and a squeeze at the end.

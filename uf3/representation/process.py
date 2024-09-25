@@ -559,7 +559,7 @@ class BasisFeaturizer:
 
 def save_feature_db(dataframe, filename, table_name='features', sparse_hdf5=False):
     """
-    Save dataframe with sqlite.
+    Save dataframe with HDF5.
 
     Args:
         dataframe (pd.DataFrame)
@@ -568,13 +568,14 @@ def save_feature_db(dataframe, filename, table_name='features', sparse_hdf5=Fals
         sparse_hdf5 (bool): whether to save as sparse matrix (CSC format).
     """
     if sparse_hdf5:
-        # Pandas can't save sparse dataframes to HDF5 yet. So we do this manually.
-        csc_arr = scipy.sparse.csc_matrix(dataframe.values)
         with tables.open_file(filename, mode='a') as f:
             if ('/' + table_name) in f:
                 warnings.warn(f"Table {table_name} already exists in {filename}. Skipping...")
             else:
                 group = f.create_group("/", table_name, '')
+
+                # Pandas can't save sparse dataframes to HDF5 yet. So we do this manually.
+                csc_arr = scipy.sparse.csc_array(dataframe.values)
 
                 # Store the CSC matrix components
                 f.create_array(group, 'data', csc_arr.data)
@@ -596,7 +597,7 @@ def save_feature_db(dataframe, filename, table_name='features', sparse_hdf5=Fals
 
 def load_feature_db(filename, table_name='features', sparse_hdf5=False):
     """
-    Load dataframe with sqlite.
+    Load dataframe with HDF5.
 
     Args:
         filename (str)
@@ -711,3 +712,84 @@ def flatten_by_interactions(vector_map, pair_tuples):
             in order of occurrence in pair_tuples.
     """
     return np.concatenate([vector_map[pair] for pair in pair_tuples], axis=-1)
+
+
+def save_preprocessed_db(feature_dict: dict,
+                         y: np.ndarray,
+                         filename: str,
+                         degree: int,
+                         batch_name: str = 'batch',
+                         ):
+    """
+    Save preprocessed database to HDF5 file in a sparse CSR matrix format.
+    Used during alchemical model fitting.
+
+    Args:
+        arr_dict (dict): dictionary of feature matrices for each
+            interaction order (1, 2, ..., degree).
+        y (np.ndarray): target vector.
+        filename (str): path to HDF5 file.
+        degree (int): maximum interaction order.
+        batch_name (str): name of batch group in HDF5 file.
+    """
+    # sanity checks
+    expected_keys = range(1, degree + 1)
+    assert set(feature_dict.keys()).issubset(expected_keys)
+
+    # save to HDF5
+    with tables.open_file(filename, mode='a') as f:
+        if ('/' + batch_name) in f:
+            warnings.warn(f"Table {batch_name} already exists in {filename}. Skipping...")
+        else:
+            group = f.create_group("/", batch_name, batch_name)
+
+            for key, arr in feature_dict.items():
+                subgroup_name = f"_{key}"
+                subgroup = f.create_group(group, subgroup_name, subgroup_name)
+                csr_arr = scipy.sparse.csr_array(arr)
+                f.create_array(subgroup, 'data', csr_arr.data)
+                f.create_array(subgroup, 'indices', csr_arr.indices)
+                f.create_array(subgroup, 'indptr', csr_arr.indptr)
+                f.create_array(subgroup, 'shape', np.array(csr_arr.shape))
+            f.create_array(group, 'y', y)
+
+
+def load_preprocessed_db(filename: str,
+                         batch_name: str = 'batch',
+                         load_sparse: bool = False,
+                         ):
+    """
+    Load preprocessed database from HDF5 file in an array.
+    Used during alchemical model fitting.
+
+    Args:
+        filename (str): path to HDF5 file.
+        batch_name (str): name of batch group in HDF5 file.
+        load_sparse (bool): whether to load as sparse matrix (CSR format).
+
+    Returns:
+        arr_dict (dict): dictionary of feature matrices for each
+            interaction order (1, 2, ..., degree).
+        y (np.ndarray): target vector.
+    """
+    arr_dict = {}
+    with tables.open_file(filename, mode='r') as f:
+        group = f.get_node("/" + batch_name)
+        group_names = [node._v_name for node in group._f_list_nodes() if node._v_name != 'y']
+        for subgroup_name in group_names:
+            subgroup = f.get_node(group, subgroup_name)
+            data = f.get_node(subgroup, 'data')[:]
+            indices = f.get_node(subgroup, 'indices')[:]
+            indptr = f.get_node(subgroup, 'indptr')[:]
+            shape = f.get_node(subgroup, 'shape')[:]
+
+            arr = scipy.sparse.csr_array((data, indices, indptr),
+                                         shape=shape)
+            if not load_sparse:
+                arr = arr.toarray()
+            key = int(subgroup_name[1:])
+            arr_dict[int(key)] = arr
+
+        y = f.get_node(group, 'y')[:]
+
+    return arr_dict, y
