@@ -14,7 +14,6 @@ from numba import jit
 import torch
 import scipy
 import ndsplines
-import tables
 from uf3.representation import bspline, process
 from uf3.data import io
 from uf3.data import composition
@@ -470,21 +469,15 @@ class WeightedLinearModel(BasicLinearModel):
                 operations in constructing gram matrices.
         """
         n_elements = len(self.bspline_config.element_list)
-        x_e, y_e, x_f, y_f = dataframe_to_tuples(df.loc[keys],
-                                                 n_elements=n_elements,
-                                                 energy_key=energy_key,
-                                                 sample_weights=sample_weights,
-                                                 )
-        x_e, y_e = freeze_columns(x_e,
-                                  y_e,
-                                  self.mask,
-                                  self.frozen_c,
-                                  self.col_idx)
-        x_f, y_f = freeze_columns(x_f,
-                                  y_f,
-                                  self.mask,
-                                  self.frozen_c,
-                                  self.col_idx)
+        x_e, y_e, x_f, y_f = freeze_columns_from_df(df,
+                                                    keys,
+                                                    n_elements,
+                                                    self.mask,
+                                                    self.frozen_c,
+                                                    self.col_idx,
+                                                    energy_key=energy_key,
+                                                    sample_weights=sample_weights,
+                                                    )
         if e_variance is not None and f_variance is not None:
             e_variance.update(y_e)
             f_variance.update(y_f)
@@ -690,11 +683,7 @@ class AlchemicalModel(WeightedLinearModel):
     XXX: all pseudo-interactions must have the same spline construction and
     offsets are fit.
 
-    XXX: the C regularizer matrix (for pseudo-interactions) should already have
-    frozen coefficients removed.
-
-    XXX: the C regularizer matrix (for pseudo-interactions) should have no
-    cross-coupling between different pseudo-interactions.
+    XXX: the regularizer matrix should already have frozen coefficients removed.
 
     Args:
         bspline_config (bspline.BSplineBasis): basis set configuration.
@@ -711,10 +700,10 @@ class AlchemicalModel(WeightedLinearModel):
     def __init__(self,
                  bspline_config,
                  n_pseudo: Union[int, Dict[int, int]],
+                 regularizer: np.ndarray = None,
                  data_coverage: np.ndarray = None,
                  init_params: Union[dict, np.lib.npyio.NpzFile] = None,
                  **args):
-        regularizer = 'n/a'  # loaded during training
         super().__init__(bspline_config, regularizer, data_coverage, **args)
         default_n_pseudo = {2: 3, 3: 2}
         self.n_pseudo = user_config.process_order_dict(n_pseudo, default_n_pseudo)
@@ -834,204 +823,7 @@ class AlchemicalModel(WeightedLinearModel):
                                      f"\tExpected: ({self.n_ituples[i]}, {self.n_pseudo[i]})\n"
                                      f"\tProvided: {self.pseudo_weights[i].shape}")
 
-    def preprocess_for_training(self,
-                                filename: str,
-                                subset: Collection,
-                                weight: float = 0.5,
-                                e_variance: VarianceRecorder = None,
-                                f_variance: VarianceRecorder = None,
-                                sample_weights: Dict = None,
-                                energy_key: str = "energy",
-                                progress: str = "bar",
-                                drop_columns: List[str] = None,
-                                sparse_hdf5: bool = False,
-                                epsilon: float = 1e-12,
-                                preprocessed_file: str = 'preprocessed.h5'
-                                ):
-        """
-        Preprocess data and collect metadata for efficient training, including:
-            - extracting only the training subset
-            - removing/freezing appropriate feature columns to remove them from
-                the dataset
-            - splitting dataset according to interaction order
-            - ensuring C-style contiguous arrays
-            - accumulating statistics for energies and forces, including means
-                and variances, and calculating weights for energy and forces
-            - combining energies and forces with appropriate weights
-            - accumulating data coverage and frozen data coverage for each
-                interaction order
-            - XXX: append real regularizer to dataset (do later)
-            - saving preprocessed data to disk (data as CSR arrays)
-
-        Does 2 complete passes through the dataset:
-            1. Metadata collection and everything else except energy-force
-                combination.
-            2. Energy-force combination.
-
-        Args:
-            filename (str): path to HDF5 file.
-            subset (list): list of keys for training.
-            weight (float): parameter balancing contribution from energies
-                vs. forces. Higher values favor energies; defaults to 0.5.
-            e_variance (VarianceRecorder): handler for accumulating
-                statistics for energies (mean and variance).
-            f_variance (VarianceRecorder): handler for accumulating
-                statistics for forces (mean and variance).
-            sample_weights (dict):
-            energy_key (str): column name for energies, default "energy".
-            progress (str): style for progress indicators.
-            drop_columns (list): list of columns to drop. Used when modifying
-                the cutoffs of the feature vectors from HDF5 file. No internal
-                checks are performed to see if dropping provided columns produce
-                features of the intended cutoffs. Use with Caution.
-            sparse_hdf5 (bool): whether the HDF5 features file is in sparse format.
-            epsilon (float): small value for filtering frozen data coverage.
-            preprocessed_file (str): filename to save preprocessed data.
-        """
-        ### FIRST PASS ###
-        # initialize variables
-        if e_variance is None:
-            e_variance = VarianceRecorder()
-        if f_variance is None:
-            f_variance = VarianceRecorder()
-        frozen_data_coverage = {i: np.zeros(self.n_basis[i], dtype=bool)
-                                for i in range(2, self.degree+1)}
-        frozen_data_coverage[1] = np.zeros(self.n_elements, dtype=bool)
-        # total number of columns after removing unused columns
-        # contrast with self.n_feats, which is before removing unused columns
-        n_columns_total = self.n_elements + sum([self.n_basis[i] * self.n_ituples[i]
-                                                 for i in range(2, self.degree+1)])
-        data_coverage = np.zeros(n_columns_total, dtype=bool)
-
-
-        # loop over batches
-        if not os.path.isfile(filename):
-            raise FileNotFoundError(filename)
-        n_tables, _, table_names, _ = io.analyze_hdf_tables(filename)
-        table_iterator = parallel.progress_iter(np.arange(n_tables),
-                                                style=progress,
-                                                total=n_tables,
-                                                leave=True)
-        skip_tables = []
-        for j in table_iterator:
-            table_name = table_names[j]
-            df = process.load_feature_db(filename, table_name, sparse_hdf5=sparse_hdf5)
-            keys = df.index.unique(level=0).intersection(subset)
-            if len(keys) == 0:
-                skip_tables.append(table_name)
-                continue
-            if drop_columns != None:
-                df.drop(columns=drop_columns,inplace=True)
-
-            x_e, y_e, x_f, y_f = dataframe_to_tuples(df.loc[keys],
-                                                    n_elements=self.n_elements,
-                                                    energy_key=energy_key,
-                                                    sample_weights=sample_weights,
-                                                    )
-            x_e, y_e = freeze_columns(x_e,
-                                      y_e,
-                                      self.mask,
-                                      self.frozen_c,
-                                      self.col_idx)
-            x_f, y_f = freeze_columns(x_f,
-                                      y_f,
-                                      self.mask,
-                                      self.frozen_c,
-                                      self.col_idx)
-            e_variance.update(y_e)
-            f_variance.update(y_f)
-
-            x_es = {1: x_e[:, :self.n_elements]}
-            data_coverage_e = np.any(np.abs(x_es[1]) > epsilon, axis=0)
-            frozen_data_coverage[1] = np.logical_or(frozen_data_coverage[1],
-                                                    data_coverage_e)
-            data_coverage[:self.n_elements] = np.logical_or(data_coverage[:self.n_elements],
-                                                            data_coverage_e)
-            x_fs = {1: x_f[:, :self.n_elements]}  # should be all zeros, but leave here for readability
-
-            for i in range(2, self.degree+1):
-                idx_lo = self.real_coeff_offsets[i]
-                idx_hi = self.real_coeff_offsets[i+1]
-                x_es[i] = x_e[:, idx_lo:idx_hi]
-                x_fs[i] = x_f[:, idx_lo:idx_hi]
-
-                data_coverage_e = np.any(np.abs(x_es[i]) > epsilon, axis=0)
-                data_coverage[idx_lo:idx_hi] = np.logical_or(data_coverage[idx_lo:idx_hi],
-                                                             data_coverage_e)
-                data_coverage_e = data_coverage_e.reshape(self.n_ituples[i], self.n_basis[i])
-                data_coverage_e = np.any(data_coverage_e, axis=0)
-                data_coverage_f = np.any(np.abs(x_fs[i]) > epsilon, axis=0)
-                data_coverage[idx_lo:idx_hi] = np.logical_or(data_coverage[idx_lo:idx_hi],
-                                                             data_coverage_f)
-                data_coverage_f = data_coverage_f.reshape(self.n_ituples[i], self.n_basis[i])
-                data_coverage_f = np.any(data_coverage_f, axis=0)
-                frozen_data_coverage[i] = np.logical_or(frozen_data_coverage[i],
-                                                        data_coverage_e)
-                frozen_data_coverage[i] = np.logical_or(frozen_data_coverage[i],
-                                                        data_coverage_f)
-
-            # save preprocessed energy and force features (will be combined in 2nd pass)
-            process.save_preprocessed_db(x_es, y_e, preprocessed_file+".tmp",
-                                         degree=self.degree,
-                                         batch_name=table_name+"_e",
-                                         )
-            process.save_preprocessed_db(x_fs, y_f, preprocessed_file+".tmp",
-                                         degree=self.degree,
-                                         batch_name=table_name+"_f",
-                                         )
-
-        # set data coverages as class attributes
-        data_coverage = revert_frozen_coefficients(data_coverage,
-                                                    self.n_feats,
-                                                    self.mask,
-                                                    self.frozen_c,
-                                                    self.col_idx)
-        self.data_coverage = np.logical_or(self.data_coverage, data_coverage)
-        self.frozen_data_coverage = frozen_data_coverage
-
-        ### SECOND PASS ###
-        # calculate energy and force weights
-        energy_weight, force_weight = calc_E_F_weights(e_variance.n,
-                                                       f_variance.n,
-                                                       e_variance.std,
-                                                       f_variance.std)
-        energy_weight *= np.sqrt(weight)
-        force_weight *= np.sqrt(1 - weight)
-
-        # loop over batches and combine energies and forces
-        table_iterator = parallel.progress_iter(np.arange(n_tables),
-                                                style=progress,
-                                                total=n_tables,
-                                                leave=True)
-        for j in table_iterator:
-            table_name = table_names[j]
-            if table_name in skip_tables:
-                continue
-            x_es, y_e = process.load_preprocessed_db(preprocessed_file+".tmp",
-                                                     table_name+"_e",
-                                                     load_sparse=False,
-                                                     )
-            x_es = {i: x_es[i] * energy_weight for i in x_es}
-            y_e = y_e * energy_weight
-            x_fs, y_f = process.load_preprocessed_db(preprocessed_file+".tmp",
-                                                     table_name+"_f",
-                                                     load_sparse=False,
-                                                     )
-            x_fs = {i: x_fs[i] * force_weight for i in x_fs}
-            y_f = y_f * force_weight
-            x_s = {i: np.vstack((x_es[i], x_fs[i])) for i in x_es}
-            y_s = np.concatenate((y_e, y_f))
-            process.save_preprocessed_db(x_s, y_s, preprocessed_file,
-                                         degree=self.degree,
-                                         batch_name=table_name,
-                                         )
-        os.remove(preprocessed_file+".tmp")
-        #import pickle
-        #with open("coverages.pkl", "wb") as f:
-        #    pickle.dump((self.data_coverage, self.frozen_data_coverage), f)
-
     def initialize_training(self,
-                            preprocessed_file: str,
                             max_iter: int,
                             checkpoint: int,
                             checkpoint_dir: str,
@@ -1045,15 +837,6 @@ class AlchemicalModel(WeightedLinearModel):
         """
         Initialization for training.
         """
-        # check if preprocessed file exists
-        if not os.path.isfile(preprocessed_file):
-            raise FileNotFoundError(f"'{preprocessed_file}' not found.\n"
-                "Please ensure that `preprocess_for_training()` has been run.\n"
-                "Exiting...")
-        
-        with tables.open_file(preprocessed_file, mode="r") as f:
-            table_names = [group._v_name for group in f.list_nodes("/")]
-
         os.makedirs(checkpoint_dir, exist_ok=True)  # no error if exists
         get_params_dir = lambda i: os.path.join(checkpoint_dir, str(i))
         get_params_path = lambda i: os.path.join(get_params_dir(i), params_filename)
@@ -1070,12 +853,20 @@ class AlchemicalModel(WeightedLinearModel):
                                         "Exiting...")
             latest_rmse_e = metadata["latest_rmse_e"]
             latest_rmse_f = metadata["latest_rmse_f"]
-            self.data_coverage = metadata["data_coverage"]
             self.frozen_data_coverage = {i: metadata[f'frozen_{i}b_data_coverage']
-                                         for i in range(1, self.degree+1)}
+                                         for i in range(2, self.degree+1)}
             assert all([len(self.frozen_data_coverage[i]) == self.n_basis[i]
                         for i in range(2, self.degree+1)])
-            assert len(self.frozen_data_coverage[1]) == self.n_elements
+            energy_weight = metadata["energy_weight"]
+            force_weight = metadata["force_weight"]
+            energy_n = metadata["energy_n"]
+            energy_mean = metadata["energy_mean"]
+            energy_std = metadata["energy_std"]
+            force_n = metadata["force_n"]
+            force_mean = metadata["force_mean"]
+            force_std = metadata["force_std"]
+            e_variance = VarianceRecorder(energy_mean, energy_std, energy_n)
+            f_variance = VarianceRecorder(force_mean, force_std, force_n)
 
             try:
                 train_tracker = np.load(tracker_filename)
@@ -1127,6 +918,12 @@ class AlchemicalModel(WeightedLinearModel):
             if os.path.exists(tracker_filename):
                 warnings.warn(f"Warning: {tracker_filename} already exists. It will be overwritten")
 
+            self.frozen_data_coverage = {i: np.zeros(self.n_basis[i], dtype=bool)
+                                         for i in range(2, self.degree+1)}
+            energy_weight = np.nan
+            force_weight = np.nan
+            e_variance = VarianceRecorder()
+            f_variance = VarianceRecorder()
             change_pw_tracker = {i: np.full(max_iter, np.nan) for i in range(2, self.degree+1)}
             change_coeff_tracker = {i: np.full(max_iter, np.nan) for i in range(1, self.degree+1)}
             rmse_e_tracker = np.full((max_iter+1,), np.nan)  # +1 for initial RMSE
@@ -1147,16 +944,73 @@ class AlchemicalModel(WeightedLinearModel):
         return init_iter, get_params_dir, get_params_path, tracker_filename, \
                metadata_filename, train_iter_filename, change_pw_tracker, \
                change_coeff_tracker, rmse_e_tracker, rmse_f_tracker, \
-               time_tracker, latest_rmse_e, latest_rmse_f, params_fit_order, \
-               table_names
+               time_tracker, latest_rmse_e, latest_rmse_f, \
+               e_variance, f_variance, energy_weight, force_weight, params_fit_order
+
+    def update_dataset_metadata(self,
+                                df: pd.DataFrame,
+                                keys: Collection,
+                                e_variance: VarianceRecorder = None,
+                                f_variance: VarianceRecorder = None,
+                                sample_weights: Dict = None,
+                                energy_key: str = "energy",
+                                epsilon: float = 1e-12,
+                                ):
+        """
+        Extract metadata from a Pandas DataFrame for training, including means,
+        variances, and frozen data coverage. Internally modifies `e_variance`,
+        `f_variance`, and `self.frozen_2b_data_coverage`.
+
+        Args:
+            df (pd.DataFrame): DataFrame of features and true labels.
+            keys (list): keys to query from df (e.g. training subset).
+            e_variance (VarianceRecorder): handler for accumulating
+                statistics for energies (mean and variance).
+            f_variance (VarianceRecorder): handler for accumulating
+                statistics for forces (mean and variance).
+            sample_weights (dict):
+            energy_key (str): column name for energies, default "energy".
+            epsilon (float): small value for filtering frozen data coverage.
+        """
+        x_e, y_e, x_f, y_f = freeze_columns_from_df(df,
+                                                    keys,
+                                                    self.n_elements,
+                                                    self.mask,
+                                                    self.frozen_c,
+                                                    self.col_idx,
+                                                    energy_key=energy_key,
+                                                    sample_weights=sample_weights,
+                                                    )
+        if e_variance is not None and f_variance is not None:
+            e_variance.update(y_e)
+            f_variance.update(y_f)
+
+        for i in range(2, self.degree+1):
+            idx_lo = self.real_coeff_offsets[i]
+            idx_hi = self.real_coeff_offsets[i+1]
+            data_coverage_e = np.any(np.abs(x_e[:, idx_lo:idx_hi]) > epsilon, axis=0)
+            data_coverage_e = data_coverage_e.reshape(self.n_ituples[i], self.n_basis[i])
+            data_coverage_e = np.any(data_coverage_e, axis=0)
+            data_coverage_f = np.any(np.abs(x_f[:, idx_lo:idx_hi]) > epsilon, axis=0)
+            data_coverage_f = data_coverage_f.reshape(self.n_ituples[i], self.n_basis[i])
+            data_coverage_f = np.any(data_coverage_f, axis=0)
+            self.frozen_data_coverage[i] = np.logical_or(self.frozen_data_coverage[i],
+                                                            data_coverage_e)
+            self.frozen_data_coverage[i] = np.logical_or(self.frozen_data_coverage[i],
+                                                            data_coverage_f)
 
     def fit_from_file(self,
-                      preprocessed_file: str,
-                      C_regularizer: np.ndarray = None,
-                      W_sparsity_reg: float = 0.0,
-                      W_sparsity_epsilon: float = 1e-12,
+                      filename: str,
+                      subset: Collection,
+                      weight: float = 0.5,
+                      sparsity_reg: float = 0.0,
+                      sparsity_epsilon: float = 1e-12,
                       batch_size=2500,
+                      sample_weights: Dict = None,
+                      energy_key="energy",
                       progress: str = "bar",
+                      drop_columns: List[str] = None,
+                      sparse_hdf5: bool = False,
                       max_iter: int = 1,
                       checkpoint: int = 10,
                       checkpoint_dir: str = ".",
@@ -1167,7 +1021,6 @@ class AlchemicalModel(WeightedLinearModel):
                       client = None,
                       resume: bool = False,
                       fit_first: str = "C",
-                      filename=None, subset=None, sparse_hdf5=False,
                       ):
         """
         Accumulate inputs and outputs from batched parsing of HDF5 file
@@ -1175,16 +1028,24 @@ class AlchemicalModel(WeightedLinearModel):
         of the alchemical spline coefficients and weighting factors.
 
         Args:
-            preprocessed_file (str): path to preprocessed HDF5 data file created
-                by `preprocess_for_training()`.
-            C_regularizer (np.ndarray): regularization matrix for spline coefficients.
-            W_sparse_reg (float): regularization strength for sparsity of
+            filename (str): path to HDF5 file.
+            subset (list): list of keys for training.
+            weight (float): parameter balancing contribution from energies
+                vs. forces. Higher values favor energies; defaults to 0.5.
+            sparse_reg (float): regularization strength for sparsity of
                 pseudo-weights (L1 penalty). Defaults to 0.0.
-            W_sparsity_epsilon (float): small value for L1 penalty to avoid
+            sparsity_epsilon (float): small value for L1 penalty to avoid
                 division by zero. Defaults to 1e-12.
             batch_size (int): batch size, in rows, for matrix multiplication
                 operations in constructing gram matrices.
+            sample_weights (dict):
+            energy_key (str): column name for energies, default "energy".
             progress (str): style for progress indicators.
+            drop_columns (list): list of columns to drop. Used when modifying
+                the cutoffs of the feature vectors from HDF5 file. No internal
+                checks are performed to see if dropping provided columns produce
+                features of the intended cutoffs. Use with Caution.
+            sparse_hdf5 (bool): whether the HDF5 features file is in sparse format.
             max_iter (int): maximum number of iterations for alternating
                 least-squares optimization.
             checkpoint (int): frequency of checkpointing the training RMSE and
@@ -1206,9 +1067,10 @@ class AlchemicalModel(WeightedLinearModel):
         init_iter, get_params_dir, get_params_path, tracker_filename, \
         metadata_filename, train_iter_filename, change_pw_tracker, \
         change_coeff_tracker, rmse_e_tracker, rmse_f_tracker, \
-        time_tracker, rmse_e, rmse_f, params_fit_order, table_names = \
-            self.initialize_training(preprocessed_file=preprocessed_file,
-                                     max_iter=max_iter,
+        time_tracker, rmse_e, rmse_f, \
+        e_variance, f_variance, energy_weight, force_weight, \
+        params_fit_order = \
+            self.initialize_training(max_iter=max_iter,
                                      checkpoint=checkpoint,
                                      checkpoint_dir=checkpoint_dir,
                                      params_filename=params_filename,
@@ -1230,6 +1092,10 @@ class AlchemicalModel(WeightedLinearModel):
             #                                        )
             print()
 
+        if not os.path.isfile(filename):
+            raise FileNotFoundError(filename)
+        n_tables, _, table_names, _ = io.analyze_hdf_tables(filename)
+
         # Outer-most ALS loop
         print(f"Beginning alternating least-squares optimization:")
         print(f"\tResume: {resume}")
@@ -1246,36 +1112,82 @@ class AlchemicalModel(WeightedLinearModel):
             for param_to_fit in params_fit_order:
                 if param_to_fit == "coeff":
                     print(f"\tFitting alchemical spline coefficients.")
-                    gram, ordinate = self.initialize_gramC_ordinateC(C_regularizer)
+                    gram_e, gram_f, ord_e, ord_f = self.initialize_gramC_ordinateC()
                 elif param_to_fit == "pseudo_weights":
                     print(f"\tFitting pseudo weights.")
-                    gram, ordinate = self.initialize_gramW_ordinateW(C_regularizer,
-                                                                     W_sparsity_reg,
-                                                                     W_sparsity_epsilon)
-                    gram += np.eye(gram.shape[0]) * 1e-7  # XXX: temporary
+                    gram_e, gram_f, ord_e, ord_f = self.initialize_gramW_ordinateW()
+                    gram_e += np.eye(gram_e.shape[0]) * 1e-7
                 else:
                     raise ValueError("Something went wrong.")
 
-                table_iterator = parallel.progress_iter(table_names,
+                table_iterator = parallel.progress_iter(np.arange(n_tables),
                                                         style=progress,
+                                                        total=n_tables,
                                                         leave=False)
-                for table_name in table_iterator:
-                    xs, y = process.load_preprocessed_db(preprocessed_file,
-                                                         table_name,
-                                                         load_sparse=False)
+                for j in table_iterator:
+                    table_name = table_names[j]
+                    df = process.load_feature_db(filename, table_name, sparse_hdf5=sparse_hdf5)
+                    keys = df.index.unique(level=0).intersection(subset)
+                    if len(keys) == 0:
+                        continue
+
+                    if drop_columns != None:
+                        df.drop(columns=drop_columns,inplace=True)
 
                     if param_to_fit == "coeff":
-                        intermediates = self.gramC_from_df(xs, y,
-                                                           batch_size=batch_size)
+                        intermediates = self.gramC_from_df(df,
+                                                         keys,
+                                                         sample_weights=sample_weights,
+                                                         energy_key=energy_key,
+                                                         batch_size=batch_size)
                     elif param_to_fit == "pseudo_weights":
-                        intermediates = self.gramW_from_df(xs, y,
-                                                           batch_size=batch_size)
+                        intermediates = self.gramW_from_df(df,
+                                                         keys,
+                                                         sample_weights=sample_weights,
+                                                         energy_key=energy_key,
+                                                         batch_size=batch_size)
                     else:
                         raise ValueError("Something went wrong.")
-                    g, o = intermediates
-                    gram += g
-                    ordinate += o
+                    g_e, g_f, o_e, o_f = intermediates
+                    gram_e += g_e
+                    gram_f += g_f
+                    ord_e += o_e
+                    ord_f += o_f
 
+                    if i == 0 and param_to_fit == params_fit_order[0]:
+                        self.update_dataset_metadata(df,
+                                                        keys,
+                                                        e_variance,
+                                                        f_variance,
+                                                        sample_weights,
+                                                        energy_key=energy_key,
+                                                        )
+
+                if i == 0 and param_to_fit == params_fit_order[0]:
+                    energy_weight, force_weight = calc_E_F_weights(e_variance.n,
+                                                                f_variance.n,
+                                                                e_variance.std,
+                                                                f_variance.std)
+                gram, ordinate = self.combine_weighted_gram(gram_e,
+                                                            gram_f,
+                                                            ord_e,
+                                                            ord_f,
+                                                            energy_weight,
+                                                            force_weight,
+                                                            weight)
+
+                # Add regularization
+                if param_to_fit == "coeff":
+                    regularizer = np.dot(self.regularizer.T, self.regularizer)  # XXX: can be precomputed at the beginning
+                elif param_to_fit == "pseudo_weights":
+                    pseudo_weights_flat = np.concatenate([self.pseudo_weights[k].flatten()
+                                                            for k in range(2, self.degree+1)])
+                    regularizer = sparsity_reg_matrix(pseudo_weights_flat,
+                                                      strength=sparsity_reg,
+                                                      epsilon=sparsity_epsilon)
+                else:
+                    raise ValueError("Something went wrong.")
+                gram += regularizer
                 fitted_params = lu_factorization(gram, ordinate)
 
                 # Update.
@@ -1317,8 +1229,7 @@ class AlchemicalModel(WeightedLinearModel):
                         print(f"\tMax change in {k}-body coefficients: {max_change_coeff:.3E}")
                         print(f"\tMax change in {k}-body pseudo weights: {max_change_pseudo:.3E}")
                     # 1b
-                    max_change_coeff = np.max(np.abs(self.coeff[1][self.frozen_data_coverage[1]] -
-                                                     old_coeff[1][self.frozen_data_coverage[1]]))
+                    max_change_coeff = np.max(np.abs(self.coeff[1] - old_coeff[1]))
                     change_coeff_tracker[1][i] = max_change_coeff
                     print(f"\tMax change in 1-body coefficients: {max_change_coeff:.3E}")
                 print()
@@ -1368,9 +1279,16 @@ class AlchemicalModel(WeightedLinearModel):
                 np.savez(metadata_filename,
                          latest_rmse_e=rmse_e,
                          latest_rmse_f=rmse_f,
-                         data_coverage=self.data_coverage,
                          **{f'frozen_{k}b_data_coverage': self.frozen_data_coverage[k]
                             for k in range(2, self.degree+1)},
+                         energy_weight=energy_weight,
+                         force_weight=force_weight,
+                         energy_n=e_variance.n,
+                         energy_mean=e_variance.mean,
+                         energy_std=e_variance.std,
+                         force_n=f_variance.n,
+                         force_mean=f_variance.mean,
+                         force_std=f_variance.std,
                          )
 
                 with open(train_iter_filename, "w") as f:
@@ -1390,139 +1308,177 @@ class AlchemicalModel(WeightedLinearModel):
                                                 self.col_idx)
         self.coefficients = coefficients
 
-    def initialize_gramC_ordinateC(self, C_regularizer):
-        """Initialize gram matrices and ordinates for fitting
-        the alchemical spline coefficients with regularizer."""
+    def initialize_gramC_ordinateC(self):
+        """Initialize empty matrices for gram matrices and ordinates for fitting
+        the alchemical spline coefficients."""
+        #n_columns = self.n_elements + self.n_basis * self.n_pseudo
         n_columns = self.n_elements + sum(self.n_basis[i] * self.n_pseudo[i]
                                           for i in range(2, self.degree+1))
-        if C_regularizer is None:
-            gram = np.zeros((n_columns, n_columns))
-        else:
-            assert C_regularizer.shape[1] == n_columns
-            gram = C_regularizer.T @ C_regularizer
-        ordinate = np.zeros(n_columns)
-        return gram, ordinate
+        gram_e = np.zeros((n_columns, n_columns))
+        ord_e = np.zeros(n_columns)
+        gram_f = np.zeros((n_columns, n_columns))
+        ord_f = np.zeros(n_columns)
+        return gram_e, gram_f, ord_e, ord_f
 
     def gramC_from_df(self,
-                      xs: Dict[int, np.ndarray],
-                      y: np.ndarray,
+                      df: pd.DataFrame,
+                      keys: Collection,
+                      sample_weights: Dict = None,
+                      energy_key: str = "energy",
                       batch_size: int = 2500):
         """
-        Take preprocessed features and compute moore-penrose components
-        (gram matrices and ordinates) for training the alchemical spline
-        coefficients.
+        Extract inputs and outputs from dataframe and compute
+        moore-penrose components (gram matrices and ordinates) for
+        training the alchemical spline coefficients.
 
         Args:
-            xs (Dict[int, np.ndarray]): preprocessed dataset with keys
-                corresponding to interaction order and values as feature
-                matrices.
-            y (np.ndarray): target values.
+            df (pd.DataFrame): DataFrame of energy/force features.
+            keys (list): keys to query from df (e.g. training subset).
+            sample_weights (dict):
+            energy_key (str): column name for energies, default "energy".
             batch_size (int): batch size, in rows, for matrix multiplication
                 operations in constructing gram matrices.
         """
-        WX = self.feature_matrixC(xs, self.pseudo_weights)
-        gram, ordinate = batched_moore_penrose(WX,
-                                               y,
-                                               batch_size=batch_size)
-        return gram, ordinate
+        x_e, y_e, x_f, y_f = freeze_columns_from_df(df,
+                                                    keys,
+                                                    self.n_elements,
+                                                    self.mask,
+                                                    self.frozen_c,
+                                                    self.col_idx,
+                                                    energy_key=energy_key,
+                                                    sample_weights=sample_weights,
+                                                    )
+        
+        WX_e = self.feature_matrixC(x_e, self.pseudo_weights)
+        WX_f = self.feature_matrixC(x_f, self.pseudo_weights)
+
+        gram_e, ordinate_e = batched_moore_penrose(WX_e,
+                                                   y_e,
+                                                   batch_size=batch_size)
+        gram_f, ordinate_f = batched_moore_penrose(WX_f,
+                                                   y_f,
+                                                   batch_size=batch_size)
+        return gram_e, gram_f, ordinate_e, ordinate_f
     
-    def feature_matrixC(self, Xs, Ws):
+    def feature_matrixC(self, X, Ws):
         """
-        Given the preprocessed feature dictionary Xs with feature matrices of
-        shape (n_data, n_basis[i] * n_ituples[i] for valid i>1) and
-        (n_elements for i==1) for each interaction order, and the pseudo_weights
-        dictionary Ws with pseudo_weight arrays of shape
+        Given the frozen UF3 feature matrix X of shape
+        (n_data, n_e + sum(n_basis[i] * n_ituples[i] for valid i>1)) and the
+        pseudo_weights dictionary Ws with pseudo_weight arrays of shape
         (n_ituples[i], n_pseudo[i]) for each interaction order, compute the
         feature matrix WX for training the alchemical spline coefficients C.
 
         Args:
-            Xs (Dict[int, np.ndarray]): preprocessed feature dictionary with integer
-                keys (interaction order, >=1) and feature matrices
-            Ws (Dict[int, np.ndarray]): pseudo_weights dictionary with integer keys
+            X (np.ndarray): frozen UF3 feature matrix of shape 
+                (n_data, n_e + n_basis * n_pairtypes)
+            Ws (Dict[np.ndarray]): pseudo_weights dictionary with integer keys
                 (interaction order, >=2) and pseudo_weight arrays
 
         Returns:
             WX (np.ndarray): feature matrix for training the alchemical spline
                 coefficients C
         """
-        n_data, _ = np.shape(Xs[2])
-        WXs = [Xs[1]]
+        n_data, _ = np.shape(X)
+        X_1 = X[:, :self.n_elements]  # 1-body features
+        WXs = [X_1]
         for i in range(2, self.degree+1):
-            X_i_tensor = Xs[i].reshape(n_data, self.n_ituples[i], self.n_basis[i])
+            idx_lo = self.real_coeff_offsets[i]
+            idx_hi = self.real_coeff_offsets[i+1]
+            X_i = X[:, idx_lo:idx_hi]
+            X_i_tensor = X_i.reshape(n_data, self.n_ituples[i], self.n_basis[i])
             WX_i = broad_row_krp_sum(Ws[i], X_i_tensor)
             WXs.append(WX_i)
         WX = np.hstack(WXs)
         return WX
 
-    def initialize_gramW_ordinateW(self, C_regularizer, W_sparsity_reg, W_sparsity_epsilon):
-        """Initialize gram matrices and ordinates for fitting
-        the pseudo_weights with regularizer."""
+    def initialize_gramW_ordinateW(self):
+        """Initialize empty matrices for gram matrices and ordinates for fitting
+        the pseudo_weights."""
         n_columns = sum(self.n_ituples[i] * self.n_pseudo[i] for i in range(2, self.degree+1))
-        # TODO: add L2 C regularizer stuff
-        gram = np.zeros((n_columns, n_columns))
-        ordinate = np.zeros(n_columns)
-        if W_sparsity_reg > 0:
-            pseudo_weights_flat = np.concatenate([self.pseudo_weights[k].flatten()
-                                                for k in range(2, self.degree+1)])
-            gram += sparsity_reg_matrix(pseudo_weights_flat,
-                                        strength=W_sparsity_reg,
-                                        epsilon=W_sparsity_epsilon)
-        return gram, ordinate
+        gram_e = np.zeros((n_columns, n_columns))
+        ord_e = np.zeros(n_columns)
+        gram_f = np.zeros((n_columns, n_columns))
+        ord_f = np.zeros(n_columns)
+        return gram_e, gram_f, ord_e, ord_f
 
     def gramW_from_df(self,
-                      xs: Dict[int, np.ndarray],
-                      y: np.ndarray,
+                      df: pd.DataFrame,
+                      keys: Collection,
+                      sample_weights: Dict = None,
+                      energy_key: str = "energy",
                       batch_size: int = 2500):
         """
-        Take preprocessed features and compute moore-penrose components
-        (gram matrices and ordinates) for training the pseudo_weights.
+        Extract inputs and outputs from dataframe and compute
+        moore-penrose components (gram matrices and ordinates) for
+        training the pseudo_weights.
 
         Args:
-            xs (Dict[int, np.ndarray]): preprocessed dataset with keys
-                corresponding to interaction order and values as feature
-                matrices.
-            y (np.ndarray): target values.
+            df (pd.DataFrame): DataFrame of energy/force features.
+            keys (list): keys to query from df (e.g. training subset).
+            sample_weights (dict):
+            energy_key (str): column name for energies, default "energy".
             batch_size (int): batch size, in rows, for matrix multiplication
                 operations in constructing gram matrices.
         """
-        XC, yhat_e_1b = self.feature_matrixW(xs, self.coeff)
-        y -= yhat_e_1b  # subtract 1-body contribution
-        gram, ordinate = batched_moore_penrose(XC,
-                                               y,
-                                               batch_size=batch_size)
-        return gram, ordinate
+        x_e, y_e, x_f, y_f = freeze_columns_from_df(df,
+                                                    keys,
+                                                    self.n_elements,
+                                                    self.mask,
+                                                    self.frozen_c,
+                                                    self.col_idx,
+                                                    energy_key=energy_key,
+                                                    sample_weights=sample_weights,
+                                                    )
+        
+        XC_e, yhat_e_1b = self.feature_matrixW(x_e, self.coeff, subtract_1b=True)
+        XC_f = self.feature_matrixW(x_f, self.coeff, subtract_1b=False)
 
-    def feature_matrixW(self, Xs, Cs):
+        gram_e, ordinate_e = batched_moore_penrose(XC_e,
+                                                   y_e - yhat_e_1b,
+                                                   batch_size=batch_size)
+        gram_f, ordinate_f = batched_moore_penrose(XC_f,
+                                                   y_f,
+                                                   batch_size=batch_size)
+        return gram_e, gram_f, ordinate_e, ordinate_f
+
+    def feature_matrixW(self, X, Cs, subtract_1b=False):
         """
-        Given the preprocessed feature dictionary Xs with feature matrices of
-        shape (n_data, n_basis[i] * n_ituples[i] for valid i>1) and
-        (n_elements for i==1) for each interaction order, and the coefficient
-        dictionary Cs with coefficient arrays of shape (n_basis[i], n_pseudo[i])
-        for each interaction order, compute the feature matrix XC for training
+        Given the frozen UF3 feature matrix X of shape
+        (n_data, n_e + sum(n_basis[i] * n_ituples[i]) for valid i>1) and the
+        dictionary Cs of i-body alchemical spline coefficients of shape
+        (n_basis[i], n_pseudo[i]), compute the feature matrix XC for training
         the pseudo_weights W.
 
-        Also computes the 1-body contribution to be subtracted off.
+        If `subtract_1b` is True, the 1-body contribution is also returned to
+        be subtracted from the target values. Necessary for energies if the
+        1-body offset is being fit. Not necessary for forces.
 
         Args:
-            Xs (Dict[int, np.ndarray]): preprocessed feature dictionary with integer
-                keys (interaction order, >=1) and feature matrices
-            Cs (Dict[int, np.ndarray]): i-body alchemical spline coefficients of
+            X (np.ndarray): frozen UF3 feature matrix of shape 
+                (n_data, n_e + sum(n_basis * n_pairtypes for valid i>1))
+            Cs (Dict[np.ndarray]): i-body alchemical spline coefficients of
                 shape (n_basis[i], n_pseudo[i]), for valid i>=1
+            subtract_1b (bool): Whether to subtract the 1-body contribution
 
         Returns:
             XC (np.ndarray): feature matrix for training the pseudo_weights W
-            Y_hat_1b (np.ndarray): 1-body contribution
         """
-        n_data, _ = np.shape(Xs[2])
+        n_data, _ = np.shape(X)
         XCs = []
         for i in range(2, self.degree+1):
-            X_i_tensor = Xs[i].reshape(n_data, self.n_ituples[i], self.n_basis[i])
+            idx_lo = self.real_coeff_offsets[i]
+            idx_hi = self.real_coeff_offsets[i+1]
+            X_i = X[:, idx_lo:idx_hi]
+            X_i_tensor = X_i.reshape(n_data, self.n_ituples[i], self.n_basis[i])
             XC_i = X_i_tensor @ Cs[i]
             XC_i = XC_i.reshape(n_data, self.n_ituples[i] * self.n_pseudo[i])
             XCs.append(XC_i)
         XC = np.hstack(XCs)
-        Y_hat_1b = Xs[1] @ Cs[1]
-        return XC, Y_hat_1b
+        if subtract_1b:
+            X_1 = X[:, :self.n_elements]
+            return XC, X_1 @ Cs[1]
+        else:
+            return XC
 
 
 class AlchemicalModelTorch(AlchemicalModel, torch.nn.Module):
@@ -1802,22 +1758,16 @@ class AlchemicalModelTorch(AlchemicalModel, torch.nn.Module):
                                                  energy_key=energy_key,
                                                  )
                 
-                x_e, y_e, x_f, y_f = dataframe_to_tuples(df.loc[keys],
-                                                        n_elements=self.n_elements,
-                                                        energy_key=energy_key,
-                                                        sample_weights=sample_weights,
-                                                        )
-                x_e, y_e = freeze_columns(x_e,
-                                          y_e,
-                                          self.mask,
-                                          self.frozen_c,
-                                          self.col_idx)
-                x_f, y_f = freeze_columns(x_f,
-                                          y_f,
-                                          self.mask,
-                                          self.frozen_c,
-                                          self.col_idx)
-
+                x_e, y_e, x_f, y_f = freeze_columns_from_df(df,
+                                                keys,
+                                                self.n_elements,
+                                                self.mask,
+                                                self.frozen_c,
+                                                self.col_idx,
+                                                energy_key=energy_key,
+                                                sample_weights=sample_weights,
+                                                )    
+                
                 # Accumulate losses
                 x_e = torch.tensor(x_e, device=self.device, dtype=self.dtype,
                                    requires_grad=False)
@@ -2149,6 +2099,54 @@ def freeze_columns(x: np.ndarray,
     x = x[:, mask]
     y = np.subtract(y, np.dot(x_fixed, frozen_c))
     return x, y
+
+
+def freeze_columns_from_df(df: pd.DataFrame,
+                           keys: Collection,
+                           n_elements: int,
+                           mask: np.ndarray,
+                           frozen_c: np.ndarray,
+                           col_idx: np.ndarray,
+                           energy_key: str = "energy",
+                           sample_weights: Dict = None,
+                           ) -> Tuple[np.ndarray, np.ndarray,
+                                      np.ndarray, np.ndarray]:
+    """
+    Convenience function for freezing columns from DataFrame.
+
+    Args:
+        df (pd.DataFrame): DataFrame of energy/force features.
+        keys (list): keys to query from df (e.g. training subset).
+        n_elements (int): number of leading columns to consider for size
+            normalization.
+        mask (np.ndarray): set of non-frozen indices.
+        frozen_c (np.ndarray): values of coefficients to be frozen.
+        col_idx (np.ndarray): indices of coefficients to be frozen.
+        energy_key (str): column name for energies, default "energy".
+        sample_weights (dict): sample weights (optional).
+
+    Returns:
+        x_e (np.ndarray): input energy matrix without frozen columns.
+        y_e (np.ndarray): output energy vector, minus frozen contributions.
+        x_f (np.ndarray): input force matrix without frozen columns.
+        y_f (np.ndarray): output force vector, minus frozen contributions.
+    """
+    x_e, y_e, x_f, y_f = dataframe_to_tuples(df.loc[keys],
+                                             n_elements=n_elements,
+                                             energy_key=energy_key,
+                                             sample_weights=sample_weights,
+                                             )
+    x_e, y_e = freeze_columns(x_e,
+                              y_e,
+                              mask,
+                              frozen_c,
+                              col_idx)
+    x_f, y_f = freeze_columns(x_f,
+                              y_f,
+                              mask,
+                              frozen_c,
+                              col_idx)
+    return x_e, y_e, x_f, y_f
 
 
 def freeze_regularizer(regularizer: np.ndarray,
