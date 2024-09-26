@@ -2548,7 +2548,7 @@ def calc_E_F_weights(n_e, n_f, std_e, std_f):
     return energy_weight, force_weight
 
 
-def broad_row_krp_sum(A, B):
+def legacy_broad_row_krp_sum(A, B):
     """
     Broadcasted Khatri-Rao product of rows between A and slices of B along its
     0-th axis, with a summation along the 1st axis and a squeeze at the end.
@@ -2572,7 +2572,7 @@ def broad_row_krp_sum(A, B):
 
 
 @jit(nopython=True, nogil=True)
-def new_broad_row_krp_sum(A, B):
+def broad_row_krp_sum(A, B):
     """
     Broadcasted Khatri-Rao product of rows between A and slices of B along its
     0-th axis, with a summation along the 1st axis and a squeeze at the end.
