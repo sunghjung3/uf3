@@ -15,28 +15,23 @@ from uf3.util import user_config, torch_util, parallel
 class AlchemicalModel(ls.WeightedLinearModel):
     """
     Alchemical learning ("pseudo-interaction") model for fitting energies and
-    forces.
-
-    XXX: all pseudo-interactions must have the same spline construction and
+    forces. All pseudo-interactions must have the same spline construction and
     offsets are fit.
 
-    XXX: the C regularizer matrix (for pseudo-interactions) should already have
-    frozen coefficients removed.
-
-    XXX: the C regularizer matrix (for pseudo-interactions) should have no
-    cross-coupling between different pseudo-interactions.
+    Note about spline coefficient regularization:
+    * Alchemical spline coefficient regularizers ("C_regularizers"):
+        * Should be in the form of a dictionary with keys as interaction orders
+            (1, 2, ..., degree) and values as matrices.
+        * The regularizer matrices should already have frozen coefficients removed.
+        * The regularizer matrices should have no cross-coupling between different
+            pseudo-interactions.
 
     Args:
         bspline_config (bspline.BSplineBasis): basis set configuration.
         n_pseudo (int | dict): number of pseudo-interactions to fit.
             If int, the same n_pseudo is used for all interaction order.
             If dict, the keys are interaction orders and values are n_pseudo.
-        regularizer (np.ndarray): regularization matrix.
-            The regularizer should already have frozen coefficients removed.
         data_coverage (np.ndarray): boolean array for data coverage.
-        init_params (dict | np.lib.npyio.NpzFile ): initial parameters for training.
-            Should be an object with keys 'coeff_1b', 'coeff_2b', 'pseudo_weights_2b'
-            (2b) and 'coeff_3b', 'pseudo_weights_3b' (3b).
     """
     def __init__(self,
                  bspline_config: bspline.BSplineBasis,
@@ -516,7 +511,7 @@ class AlchemicalModel(ls.WeightedLinearModel):
                       preprocessed_file: str = "preprocessed.h5",
                       coverage_file: str = "coverage.npz",
                       init_params: Union[dict, np.lib.npyio.NpzFile] = None,
-                      C_regularizer: np.ndarray = None,
+                      C_regularizers: Dict = None,
                       W_sparsity_reg: float = 0.0,
                       W_sparsity_epsilon: float = 1e-12,
                       batch_size=2500,
@@ -544,7 +539,9 @@ class AlchemicalModel(ls.WeightedLinearModel):
             init_params (dict | np.lib.npyio.NpzFile ): initial parameters for training.
                 Should be an object with keys 'coeff_1b', 'coeff_2b', 'pseudo_weights_2b'
                 (2b) and 'coeff_3b', 'pseudo_weights_3b' (3b).
-            C_regularizer (np.ndarray): regularization matrix for spline coefficients.
+            C_regularizers (Dict): dictionary of regularization matrices for
+                alchemical spline coefficients. See the class docstring for
+                more information about the format.
             W_sparse_reg (float): regularization strength for sparsity of
                 pseudo-weights (L1 penalty). Defaults to 0.0.
             W_sparsity_epsilon (float): small value for L1 penalty to avoid
@@ -602,10 +599,10 @@ class AlchemicalModel(ls.WeightedLinearModel):
             for param_to_fit in params_fit_order:
                 if param_to_fit == "coeff":
                     print(f"\tFitting alchemical spline coefficients.")
-                    gram, ordinate = self.initialize_gramC_ordinateC(C_regularizer)
+                    gram, ordinate = self.initialize_gramC_ordinateC(C_regularizers)
                 elif param_to_fit == "pseudo_weights":
                     print(f"\tFitting pseudo weights.")
-                    gram, ordinate = self.initialize_gramW_ordinateW(C_regularizer,
+                    gram, ordinate = self.initialize_gramW_ordinateW(C_regularizers,
                                                                      W_sparsity_reg,
                                                                      W_sparsity_epsilon)
                     #gram += np.eye(gram.shape[0]) * 1e-7  # XXX: temporary
@@ -727,16 +724,23 @@ class AlchemicalModel(ls.WeightedLinearModel):
                                                      self.col_idx)
         self.coefficients = coefficients
 
-    def initialize_gramC_ordinateC(self, C_regularizer):
+    def initialize_gramC_ordinateC(self, C_regularizers):
         """Initialize gram matrices and ordinates for fitting
         the alchemical spline coefficients with regularizer."""
         n_columns = self.n_elements + sum(self.n_basis[i] * self.n_pseudo[i]
                                           for i in range(2, self.degree+1))
-        if C_regularizer is None:
-            gram = np.zeros((n_columns, n_columns))
-        else:
-            assert C_regularizer.shape[1] == n_columns
-            gram = C_regularizer.T @ C_regularizer
+        gram = np.zeros((n_columns, n_columns))
+
+        # Fill with regularizer
+        if C_regularizers is not None:
+            for i in range(1, self.degree+1):
+                if i in C_regularizers:
+                    reg = C_regularizers[i]
+                    idx_lo = 0 if i == 1 else self.alchemical_coeff_offsets[i]
+                    idx_hi = self.n_elements if i == 1 else \
+                        self.alchemical_coeff_offsets[i+1]
+                    gram[idx_lo:idx_hi, idx_lo:idx_hi] = reg.T @ reg
+
         ordinate = np.zeros(n_columns)
         return gram, ordinate
 
@@ -791,7 +795,7 @@ class AlchemicalModel(ls.WeightedLinearModel):
         WX = np.hstack(WXs)
         return WX
 
-    def initialize_gramW_ordinateW(self, C_regularizer, W_sparsity_reg, W_sparsity_epsilon):
+    def initialize_gramW_ordinateW(self, C_regularizers, W_sparsity_reg, W_sparsity_epsilon):
         """Initialize gram matrices and ordinates for fitting
         the pseudo_weights with regularizer."""
         n_columns = sum(self.n_ituples[i] * self.n_pseudo[i] for i in range(2, self.degree+1))
@@ -1400,12 +1404,11 @@ def broad_row_krp_sum(A, B):
     return result
 
 
-# temporary function for testing
-def get_alchemy_regularization_matrix(bspline_config: bspline.BSplineBasis,
-                                      n_pseudo: Union[int, Dict[int, int]],
-                                      ridge_map={},
-                                      curvature_map={},
-                                      **kwargs):
+def get_C_regularizers(bspline_config: bspline.BSplineBasis,
+                       n_pseudo: Union[int, Dict[int, int]],
+                       ridge_map={},
+                       curvature_map={},
+                       **kwargs):
     # determine AlchemicalModel structure
     n_elements = len(bspline_config.element_list)
     lead_trim = bspline_config.leading_trim
@@ -1444,9 +1447,10 @@ def get_alchemy_regularization_matrix(bspline_config: bspline.BSplineBasis,
                         **curvature_map}
     # one-body element terms
     matrix = bspline_config.get_regularization_matrix_1b(n_elements, ridge=ridge_map[1])
-    matrices = [matrix]
+    C_reg_dict = {1: matrix}
     # two- and three-body terms
     for degree in range(2, bspline_config.degree + 1):
+        matrices = []
         r = ridge_map[degree]
         c = curvature_map[degree]
         for _ in range(n_pseudo[degree]):  # each pseudo interaction
@@ -1495,9 +1499,10 @@ def get_alchemy_regularization_matrix(bspline_config: bspline.BSplineBasis,
                 raise ValueError(
                     "Four-body terms and beyond are not yet implemented.")
             matrices.append(matrix)
-    combined_matrix = regularize.combine_regularizer_matrices(matrices)
+        combined_matrix = regularize.combine_regularizer_matrices(matrices)
+        C_reg_dict[degree] = combined_matrix
 
-    return combined_matrix
+    return C_reg_dict
 
 
 def sparsity_reg_matrix(params, strength, epsilon=1e-12):
