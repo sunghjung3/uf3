@@ -1,5 +1,5 @@
-from typing import List, Dict, Collection, Union
-import os, time, warnings, re
+from typing import List, Dict, Collection, Callable, Union
+import os, time, warnings, re, gc
 import numpy as np
 import scipy
 from numba import jit
@@ -492,7 +492,7 @@ class AlchemicalModel(ls.WeightedLinearModel):
             # Parameter arrays for training.
             # After training, they will be stored to self.coefficients.
             self.initialize_parameters(init_params)
-            os.makedirs(get_params_dir(0))
+            os.makedirs(get_params_dir(0), exist_ok=True)
             self.save_alchemical_params(get_params_path(0))
 
             change_pw_tracker = {i: np.full(max_iter, np.nan) for i in range(2, self.degree+1)}
@@ -529,6 +529,7 @@ class AlchemicalModel(ls.WeightedLinearModel):
                       train_iter_filename: str = ".train_iter",
                       resume: bool = False,
                       fit_first: str = "C",
+                      solver: Callable = np.linalg.solve,
                       ):
         """
         Accumulate inputs and outputs from batched parsing of HDF5 file
@@ -565,6 +566,8 @@ class AlchemicalModel(ls.WeightedLinearModel):
             resume (bool): whether to resume training from a previous checkpoint.
             fit_first (str): which parameters to fit first. Options are "C" for
                 coefficients and "W" for pseudo-weights. Defaults to "C".
+            solver (Callable): linear algebra solver to use. Defaults to
+                `np.linalg.solve`.
         """
         # initialize training
         init_iter, get_params_dir, get_params_path, tracker_filename, \
@@ -629,7 +632,9 @@ class AlchemicalModel(ls.WeightedLinearModel):
                     gram += g
                     ordinate += o
 
-                fitted_params = ls.lu_factorization(gram, ordinate)
+                fitted_params = solver(gram, ordinate)
+                del xs, y, intermediates, g, o, gram, ordinate
+                gc.collect()
 
                 # Update.
                 # NOTE: self.coeff and self.pseudo_weights must be updated every
