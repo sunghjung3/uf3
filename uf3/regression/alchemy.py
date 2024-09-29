@@ -5,6 +5,13 @@ import scipy
 from numba import jit
 import torch
 import tables
+try:
+    from mpi4py import MPI
+    import fasteners
+    GLOBAL_USE_MPI = True
+except ImportError:
+    print("MPI not available: trouble importing mpi4py and/or fasteners.")
+    GLOBAL_USE_MPI = False
 from uf3.data import io
 from uf3.representation import bspline, process
 from uf3.regression import least_squares as ls
@@ -203,6 +210,7 @@ class AlchemicalModel(ls.WeightedLinearModel):
                                 epsilon: float = 1e-12,
                                 preprocessed_file: str = 'preprocessed.h5',
                                 coverage_file: str = 'coverage.npz',
+                                USE_MPI: bool = False,
                                 ):
         """
         Preprocess data and collect metadata for efficient training, including:
@@ -244,7 +252,18 @@ class AlchemicalModel(ls.WeightedLinearModel):
             epsilon (float): small value for filtering frozen data coverage.
             preprocessed_file (str): filename to save preprocessed data.
             coverage_file (str): filename to save data coverage arrays.
+            USE_MPI (bool): whether to use MPI for parallel processing.
         """
+        if USE_MPI and not GLOBAL_USE_MPI:
+            raise ImportError("MPI not available. Exiting...")
+        if USE_MPI:
+            comm = MPI.COMM_WORLD
+            rank = comm.Get_rank()
+            size = comm.Get_size()
+        else:
+            rank = 0
+            size = 1
+
         ### FIRST PASS ###
         # initialize variables
         if e_variance is None:
@@ -264,11 +283,22 @@ class AlchemicalModel(ls.WeightedLinearModel):
         # loop over batches
         if not os.path.isfile(filename):
             raise FileNotFoundError(filename)
-        n_tables, _, table_names, _ = io.analyze_hdf_tables(filename)
-        table_iterator = parallel.progress_iter(np.arange(n_tables),
-                                                style=progress,
-                                                total=n_tables,
-                                                leave=True)
+        _, _, table_names, _ = io.analyze_hdf_tables(filename)
+        if USE_MPI:  # distribute table names
+            if rank == 0:
+                np.random.shuffle(table_names)
+                sublists = np.array_split(table_names, size)
+            else:
+                sublists = None
+            table_names = comm.scatter(sublists, root=0)
+        n_tables = len(table_names)
+        if rank == 0:  # show progress only on rank 0
+            table_iterator = parallel.progress_iter(np.arange(n_tables),
+                                                    style=progress,
+                                                    total=n_tables,
+                                                    leave=True)
+        else:
+            table_iterator = np.arange(n_tables)
         skip_tables = []
         for j in table_iterator:
             table_name = table_names[j]
@@ -328,26 +358,45 @@ class AlchemicalModel(ls.WeightedLinearModel):
                                                         data_coverage_f)
 
             # save preprocessed energy and force features (will be combined in 2nd pass)
-            save_preprocessed_db(x_es, y_e, preprocessed_file+".tmp",
+            save_preprocessed_db(x_es, y_e, preprocessed_file+".tmp"+str(rank),
                                  degree=self.degree,
                                  batch_name=table_name+"_e",
                                  )
-            save_preprocessed_db(x_fs, y_f, preprocessed_file+".tmp",
+            save_preprocessed_db(x_fs, y_f, preprocessed_file+".tmp"+str(rank),
                                  degree=self.degree,
                                  batch_name=table_name+"_f",
                                  )
 
         # set data coverages as class attributes
-        data_coverage = ls.revert_frozen_coefficients(data_coverage,
-                                                      self.n_feats,
-                                                      self.mask,
-                                                      self.frozen_c,
-                                                      self.col_idx)
-        self.data_coverage = np.logical_or(self.data_coverage, data_coverage)
-        self.frozen_data_coverage = frozen_data_coverage
-        self.save_data_coverage(coverage_file)
+        # reduce data_coverage
+        if USE_MPI:
+            data_coverage = comm.reduce(data_coverage, op=np.logical_or, root=0)
+            for i in frozen_data_coverage:
+                frozen_data_coverage[i] = comm.reduce(frozen_data_coverage[i], op=np.logical_or, root=0)
+        if rank == 0:
+            data_coverage = ls.revert_frozen_coefficients(data_coverage,
+                                                          self.n_feats,
+                                                          self.mask,
+                                                          self.frozen_c,
+                                                          self.col_idx)
+            self.data_coverage = np.logical_or(self.data_coverage, data_coverage)
+            self.frozen_data_coverage = frozen_data_coverage
+            self.save_data_coverage(coverage_file)
 
         ### SECOND PASS ###
+        # gather n, mean, and std from e_variance and f_variance
+        if USE_MPI:
+            e_ns = np.array(comm.allgather(e_variance.n))
+            e_means = np.array(comm.allgather(e_variance.mean))
+            e_stds = np.array(comm.allgather(e_variance.std))
+            e_variance = ls.VarianceRecorder()
+            e_variance.update_with_stats(e_means, e_stds, e_ns)
+            f_ns = np.array(comm.allgather(f_variance.n))
+            f_means = np.array(comm.allgather(f_variance.mean))
+            f_stds = np.array(comm.allgather(f_variance.std))
+            f_variance = ls.VarianceRecorder()
+            f_variance.update_with_stats(f_means, f_stds, f_ns)
+
         # calculate energy and force weights
         energy_weight, force_weight = ls.calc_E_F_weights(e_variance.n,
                                                           f_variance.n,
@@ -357,21 +406,25 @@ class AlchemicalModel(ls.WeightedLinearModel):
         force_weight *= np.sqrt(1 - weight)
 
         # loop over batches and combine energies and forces
-        table_iterator = parallel.progress_iter(np.arange(n_tables),
-                                                style=progress,
-                                                total=n_tables,
-                                                leave=True)
+        if rank == 0:  # show progress only on rank 0
+            table_iterator = parallel.progress_iter(np.arange(n_tables),
+                                                    style=progress,
+                                                    total=n_tables,
+                                                    leave=True)
+        else:
+            table_iterator = np.arange(n_tables)
+        lock = fasteners.InterProcessLock(preprocessed_file+".lock")
         for j in table_iterator:
             table_name = table_names[j]
             if table_name in skip_tables:
                 continue
-            x_es, y_e = load_preprocessed_db(preprocessed_file+".tmp",
+            x_es, y_e = load_preprocessed_db(preprocessed_file+".tmp"+str(rank),
                                              table_name+"_e",
                                              load_sparse=False,
                                              )
             x_es = {i: x_es[i] * energy_weight for i in x_es}
             y_e = y_e * energy_weight
-            x_fs, y_f = load_preprocessed_db(preprocessed_file+".tmp",
+            x_fs, y_f = load_preprocessed_db(preprocessed_file+".tmp"+str(rank),
                                              table_name+"_f",
                                              load_sparse=False,
                                              )
@@ -379,11 +432,13 @@ class AlchemicalModel(ls.WeightedLinearModel):
             y_f = y_f * force_weight
             x_s = {i: np.vstack((x_es[i], x_fs[i])) for i in x_es}
             y_s = np.concatenate((y_e, y_f))
+            lock.acquire()
             save_preprocessed_db(x_s, y_s, preprocessed_file,
-                                 degree=self.degree,
-                                 batch_name=table_name,
-                                 )
-        os.remove(preprocessed_file+".tmp")
+                                degree=self.degree,
+                                batch_name=table_name,
+                                )
+            lock.release()
+        os.remove(preprocessed_file+".tmp"+str(rank))
 
     def initialize_training(self,
                             preprocessed_file: str,

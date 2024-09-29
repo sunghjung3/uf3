@@ -67,6 +67,31 @@ class VarianceRecorder:
         self.update(batch)
         return self.mean, self.std, self.n
 
+    def update_with_stats(self,
+                          means: np.ndarray,
+                          stds: np.ndarray,
+                          ns: np.ndarray,
+                          ):
+        """
+        Update mean, std, and n with statistics from many batches.
+
+        Args:
+            means (np.ndarray): mean values.
+            stds (np.ndarray): standard deviations.
+            ns (np.ndarray): counts.
+
+        Returns:
+            (current mean, current standard deviation, current entry count)
+        """
+        n = np.sum(ns)
+        f = ns / n
+        mean = np.sum(means * f, axis=0)
+        var = np.sum(stds**2 * f, axis=0) + np.sum((means - mean)**2 * f, axis=0)
+        self.n = n
+        self.mean = mean
+        self.std = np.sqrt(var)
+        return self.mean, self.std, self.n
+
 
 class BasicLinearModel:
     """
