@@ -572,7 +572,7 @@ class AlchemicalModel(ls.WeightedLinearModel):
                       progress: str = "bar",
                       max_iter: int = 1,
                       checkpoint: int = 10,
-                      checkpoint_dir: str = ".",
+                      checkpoint_dir: str = "./checkpoint",
                       params_filename: str = "alchemical_model_params.npz",
                       tracker_filename: str = "train_tracker.npz",
                       train_iter_filename: str = ".train_iter",
@@ -793,29 +793,6 @@ class AlchemicalModel(ls.WeightedLinearModel):
 
         ordinate = np.zeros(n_columns)
         return gram, ordinate
-
-    def gramC_ordinateC(self,
-                        xs: Dict[int, np.ndarray],
-                        y: np.ndarray,
-                        batch_size: int = 2500):
-        """
-        Take preprocessed features and compute moore-penrose components
-        (gram matrices and ordinates) for training the alchemical spline
-        coefficients.
-
-        Args:
-            xs (Dict[int, np.ndarray]): preprocessed dataset with keys
-                corresponding to interaction order and values as feature
-                matrices.
-            y (np.ndarray): target values.
-            batch_size (int): batch size, in rows, for matrix multiplication
-                operations in constructing gram matrices.
-        """
-        WX = self.feature_matrixC(xs, self.pseudo_weights)
-        gram, ordinate = ls.batched_moore_penrose(WX,
-                                                  y,
-                                                  batch_size=batch_size)
-        return gram, ordinate
     
     def feature_matrixC(self, Xs, Ws):
         """
@@ -858,29 +835,6 @@ class AlchemicalModel(ls.WeightedLinearModel):
             gram += sparsity_reg_matrix(pseudo_weights_flat,
                                         strength=W_sparsity_reg,
                                         epsilon=W_sparsity_epsilon)
-        return gram, ordinate
-
-    def gramW_ordinateW(self,
-                        xs: Dict[int, np.ndarray],
-                        y: np.ndarray,
-                        batch_size: int = 2500):
-        """
-        Take preprocessed features and compute moore-penrose components
-        (gram matrices and ordinates) for training the pseudo_weights.
-
-        Args:
-            xs (Dict[int, np.ndarray]): preprocessed dataset with keys
-                corresponding to interaction order and values as feature
-                matrices.
-            y (np.ndarray): target values.
-            batch_size (int): batch size, in rows, for matrix multiplication
-                operations in constructing gram matrices.
-        """
-        XC, yhat_e_1b = self.feature_matrixW(xs, self.coeff)
-        y -= yhat_e_1b  # subtract 1-body contribution
-        gram, ordinate = ls.batched_moore_penrose(XC,
-                                                  y,
-                                                  batch_size=batch_size)
         return gram, ordinate
 
     def feature_matrixW(self, Xs, Cs):
