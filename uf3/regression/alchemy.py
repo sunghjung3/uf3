@@ -569,7 +569,6 @@ class AlchemicalModel(ls.WeightedLinearModel):
                       C_regularizers: Dict = None,
                       W_sparsity_reg: float = 0.0,
                       W_sparsity_epsilon: float = 1e-12,
-                      batch_size=2500,
                       progress: str = "bar",
                       max_iter: int = 1,
                       checkpoint: int = 10,
@@ -601,8 +600,6 @@ class AlchemicalModel(ls.WeightedLinearModel):
                 pseudo-weights (L1 penalty). Defaults to 0.0.
             W_sparsity_epsilon (float): small value for L1 penalty to avoid
                 division by zero. Defaults to 1e-12.
-            batch_size (int): batch size, in rows, for matrix multiplication
-                operations in constructing gram matrices.
             progress (str): style for progress indicators.
             max_iter (int): maximum number of iterations for alternating
                 least-squares optimization.
@@ -673,19 +670,17 @@ class AlchemicalModel(ls.WeightedLinearModel):
                                                  load_sparse=False)
 
                     if param_to_fit == "coeff":
-                        intermediates = self.gramC_ordinateC(xs, y,
-                                                             batch_size=batch_size)
+                        feature_matrix = self.feature_matrixC(xs, self.pseudo_weights)
                     elif param_to_fit == "pseudo_weights":
-                        intermediates = self.gramW_ordinateW(xs, y,
-                                                             batch_size=batch_size)
+                        feature_matrix, yhat_e_1b = self.feature_matrixW(xs, self.coeff)
+                        y -= yhat_e_1b
                     else:
                         raise ValueError("Something went wrong.")
-                    g, o = intermediates
-                    gram += g
-                    ordinate += o
+                    gram += feature_matrix.T @ feature_matrix
+                    ordinate += feature_matrix.T @ y
 
                 fitted_params = solver(gram, ordinate)
-                del xs, y, intermediates, g, o, gram, ordinate
+                del xs, y, gram, ordinate
                 gc.collect()
 
                 # Update.
