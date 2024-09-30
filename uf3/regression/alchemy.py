@@ -673,11 +673,11 @@ class AlchemicalModel(ls.WeightedLinearModel):
                                                  load_sparse=False)
 
                     if param_to_fit == "coeff":
-                        intermediates = self.gramC_from_df(xs, y,
-                                                           batch_size=batch_size)
+                        intermediates = self.gramC_ordinateC(xs, y,
+                                                             batch_size=batch_size)
                     elif param_to_fit == "pseudo_weights":
-                        intermediates = self.gramW_from_df(xs, y,
-                                                           batch_size=batch_size)
+                        intermediates = self.gramW_ordinateW(xs, y,
+                                                             batch_size=batch_size)
                     else:
                         raise ValueError("Something went wrong.")
                     g, o = intermediates
@@ -799,10 +799,10 @@ class AlchemicalModel(ls.WeightedLinearModel):
         ordinate = np.zeros(n_columns)
         return gram, ordinate
 
-    def gramC_from_df(self,
-                      xs: Dict[int, np.ndarray],
-                      y: np.ndarray,
-                      batch_size: int = 2500):
+    def gramC_ordinateC(self,
+                        xs: Dict[int, np.ndarray],
+                        y: np.ndarray,
+                        batch_size: int = 2500):
         """
         Take preprocessed features and compute moore-penrose components
         (gram matrices and ordinates) for training the alchemical spline
@@ -865,10 +865,10 @@ class AlchemicalModel(ls.WeightedLinearModel):
                                         epsilon=W_sparsity_epsilon)
         return gram, ordinate
 
-    def gramW_from_df(self,
-                      xs: Dict[int, np.ndarray],
-                      y: np.ndarray,
-                      batch_size: int = 2500):
+    def gramW_ordinateW(self,
+                        xs: Dict[int, np.ndarray],
+                        y: np.ndarray,
+                        batch_size: int = 2500):
         """
         Take preprocessed features and compute moore-penrose components
         (gram matrices and ordinates) for training the pseudo_weights.
