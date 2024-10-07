@@ -651,12 +651,10 @@ class AlchemicalModel(ls.WeightedLinearModel):
             for param_to_fit in params_fit_order:
                 if param_to_fit == "coeff":
                     print(f"\tFitting alchemical spline coefficients.")
-                    gram, ordinate = self.initialize_gramC_ordinateC(C_regularizers)
+                    gram, ordinate = self.initialize_gramC_ordinateC()
                 elif param_to_fit == "pseudo_weights":
                     print(f"\tFitting pseudo weights.")
-                    gram, ordinate = self.initialize_gramW_ordinateW(C_regularizers,
-                                                                     W_sparsity_reg,
-                                                                     W_sparsity_epsilon)
+                    gram, ordinate = self.initialize_gramW_ordinateW()
                     #gram += np.eye(gram.shape[0]) * 1e-7  # XXX: temporary
                 else:
                     raise ValueError("Something went wrong.")
@@ -678,6 +676,14 @@ class AlchemicalModel(ls.WeightedLinearModel):
                         raise ValueError("Something went wrong.")
                     gram += feature_matrix.T @ feature_matrix
                     ordinate += feature_matrix.T @ y
+
+                if param_to_fit == "coeff":
+                    self.update_reg_gramC(gram, C_regularizers)
+                elif param_to_fit == "pseudo_weights":
+                    self.update_reg_gramW(gram, C_regularizers,
+                                          W_sparsity_reg, W_sparsity_epsilon)
+                else:
+                    raise ValueError("Something went wrong.")
 
                 fitted_params = solver(gram, ordinate)
                 del xs, y, gram, ordinate
@@ -774,23 +780,12 @@ class AlchemicalModel(ls.WeightedLinearModel):
                                                      self.col_idx)
         self.coefficients = coefficients
 
-    def initialize_gramC_ordinateC(self, C_regularizers):
-        """Initialize gram matrices and ordinates for fitting
-        the alchemical spline coefficients with regularizer."""
+    def initialize_gramC_ordinateC(self):
+        """Initialize empty gram matrices and ordinates for fitting the
+        alchemical spline coefficients."""
         n_columns = self.n_elements + sum(self.n_basis[i] * self.n_pseudo[i]
                                           for i in range(2, self.degree+1))
         gram = np.zeros((n_columns, n_columns))
-
-        # Fill with regularizer
-        if C_regularizers is not None:
-            for i in range(1, self.degree+1):
-                if i in C_regularizers:
-                    reg = C_regularizers[i]
-                    idx_lo = 0 if i == 1 else self.alchemical_coeff_offsets[i]
-                    idx_hi = self.n_elements if i == 1 else \
-                        self.alchemical_coeff_offsets[i+1]
-                    gram[idx_lo:idx_hi, idx_lo:idx_hi] = reg.T @ reg
-
         ordinate = np.zeros(n_columns)
         return gram, ordinate
     
@@ -822,19 +817,32 @@ class AlchemicalModel(ls.WeightedLinearModel):
         WX = np.hstack(WXs)
         return WX
 
-    def initialize_gramW_ordinateW(self, C_regularizers, W_sparsity_reg, W_sparsity_epsilon):
+    def update_reg_gramC(self, gram, C_regularizers):
+        """
+        Update the gram matrix for fitting the alchemical spline coefficients C
+        with alchemical regularizers.
+
+        Args:
+            gram (np.ndarray): current gram matrix
+            C_regularizers (Dict): dictionary of regularization matrices for
+                alchemical spline coefficients. See the class docstring for
+                more information about the format.
+        """
+        if C_regularizers is not None:
+            for i in range(1, self.degree+1):
+                if i in C_regularizers:
+                    reg = C_regularizers[i]
+                    idx_lo = 0 if i == 1 else self.alchemical_coeff_offsets[i]
+                    idx_hi = self.n_elements if i == 1 else \
+                        self.alchemical_coeff_offsets[i+1]
+                    gram[idx_lo:idx_hi, idx_lo:idx_hi] += reg.T @ reg
+
+    def initialize_gramW_ordinateW(self):
         """Initialize gram matrices and ordinates for fitting
         the pseudo_weights with regularizer."""
         n_columns = sum(self.n_ituples[i] * self.n_pseudo[i] for i in range(2, self.degree+1))
-        # TODO: add L2 C regularizer stuff
         gram = np.zeros((n_columns, n_columns))
         ordinate = np.zeros(n_columns)
-        if W_sparsity_reg > 0:
-            pseudo_weights_flat = np.concatenate([self.pseudo_weights[k].flatten()
-                                                for k in range(2, self.degree+1)])
-            gram += sparsity_reg_matrix(pseudo_weights_flat,
-                                        strength=W_sparsity_reg,
-                                        epsilon=W_sparsity_epsilon)
         return gram, ordinate
 
     def feature_matrixW(self, Xs, Cs):
@@ -868,6 +876,29 @@ class AlchemicalModel(ls.WeightedLinearModel):
         XC = np.hstack(XCs)
         Y_hat_1b = Xs[1] @ Cs[1]
         return XC, Y_hat_1b
+
+    def update_reg_gramW(self, gram, C_regularizers, W_sparsity_reg, W_sparsity_epsilon):
+        """
+        Update the gram matrix for fitting the pseudo_weights W with alchemical
+        regularizers.
+
+        Args:
+            gram (np.ndarray): current gram matrix
+            C_regularizers (Dict): dictionary of regularization matrices for
+                alchemical spline coefficients. See the class docstring for
+                more information about the format.
+            W_sparsity_reg (float): regularization strength for sparsity of
+                pseudo-weights (L1 penalty).
+            W_sparsity_epsilon (float): small value for L1 penalty to avoid
+                division by zero.
+        """
+        # TODO: add L2 C regularizer stuff
+        if W_sparsity_reg > 0:
+            pseudo_weights_flat = np.concatenate([self.pseudo_weights[k].flatten()
+                                                for k in range(2, self.degree+1)])
+            gram += sparsity_reg_matrix(pseudo_weights_flat,
+                                        strength=W_sparsity_reg,
+                                        epsilon=W_sparsity_epsilon)
 
 
 class AlchemicalModelTorch(AlchemicalModel, torch.nn.Module):
