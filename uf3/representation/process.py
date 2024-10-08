@@ -557,6 +557,16 @@ class BasisFeaturizer:
         return x, y, w
 
 
+def cs_array_to_h5_group(cs_array, file_obj, group):
+    """
+    Save a scipy.sparse.csc_array or scipy.sparse.csr_array to an HDF5 group.
+    """
+    file_obj.create_array(group, 'data', cs_array.data)
+    file_obj.create_array(group, 'indices', cs_array.indices)
+    file_obj.create_array(group, 'indptr', cs_array.indptr)
+    file_obj.create_array(group, 'shape', np.array(cs_array.shape))
+
+
 def save_feature_db(dataframe, filename, table_name='features', sparse_hdf5=False):
     """
     Save dataframe with HDF5.
@@ -576,12 +586,7 @@ def save_feature_db(dataframe, filename, table_name='features', sparse_hdf5=Fals
 
                 # Pandas can't save sparse dataframes to HDF5 yet. So we do this manually.
                 csc_arr = scipy.sparse.csc_array(dataframe.values)
-
-                # Store the CSC matrix components
-                f.create_array(group, 'data', csc_arr.data)
-                f.create_array(group, 'indices', csc_arr.indices)
-                f.create_array(group, 'indptr', csc_arr.indptr)
-                f.create_array(group, 'shape', np.array(csc_arr.shape))
+                cs_array_to_h5_group(csc_arr, f, group)
                 
                 # Store row and column names
                 geom_labels = dataframe.index.get_level_values(0).astype(str).to_list()
@@ -593,6 +598,18 @@ def save_feature_db(dataframe, filename, table_name='features', sparse_hdf5=Fals
                 f.create_array(group, 'axis0', feature_labels)
     else:
         dataframe.to_hdf(filename, table_name, mode="a", format='fixed')
+
+
+def cs_array_from_h5_group(file_obj, group, cstype='csc'):
+    """
+    Load a scipy.sparse.csc_array or scipy.sparse.csr_array from an HDF5 group.
+    """
+    data = file_obj.get_node(group, 'data')[:]
+    indices = file_obj.get_node(group, 'indices')[:]
+    indptr = file_obj.get_node(group, 'indptr')[:]
+    shape = file_obj.get_node(group, 'shape')[:]
+    cs_class = getattr(scipy.sparse, cstype + '_matrix')
+    return cs_class((data, indices, indptr), shape=shape)
 
 
 def load_feature_db(filename, table_name='features', sparse_hdf5=False):
@@ -611,19 +628,13 @@ def load_feature_db(filename, table_name='features', sparse_hdf5=False):
         try:
             with tables.open_file(filename, mode='r') as f:
                 group = f.get_node("/" + table_name)
-                data = f.get_node(group, 'data')[:]
-                indices = f.get_node(group, 'indices')[:]
-                indptr = f.get_node(group, 'indptr')[:]
-                shape = f.get_node(group, 'shape')[:]
+                csc_arr = cs_array_from_h5_group(f, group, cstype='csc')
                 geom_labels = [x.decode('utf-8')
                             for x in f.get_node(group, 'axis1_level0')[:]]
                 component_labels = [x.decode('utf-8')
                                     for x in f.get_node(group, 'axis1_level1')[:]]
                 feature_labels = [x.decode('utf-8')
                                 for x in f.get_node(group, 'axis0')[:]]
-                
-                csc_arr = scipy.sparse.csc_array((data, indices, indptr),
-                                                 shape=shape)
                 row_indices = pd.MultiIndex.from_arrays(
                     [geom_labels, component_labels]
                     )
