@@ -210,6 +210,7 @@ class AlchemicalModel(ls.WeightedLinearModel):
                                 epsilon: float = 1e-12,
                                 preprocessed_file: str = 'preprocessed.h5',
                                 coverage_file: str = 'coverage.npz',
+                                metadata_file: str = 'metadata.npz',
                                 USE_MPI: bool = False,
                                 ):
         """
@@ -221,16 +222,11 @@ class AlchemicalModel(ls.WeightedLinearModel):
             - ensuring C-style contiguous arrays
             - accumulating statistics for energies and forces, including means
                 and variances, and calculating weights for energy and forces
-            - combining energies and forces with appropriate weights
             - accumulating data coverage and frozen data coverage for each
                 interaction order
+            - saving statistics and data coverages to disk
             - XXX: append real regularizer to dataset (do later)
             - saving preprocessed data to disk (data as CSR arrays)
-
-        Does 2 complete passes through the dataset:
-            1. Metadata collection and everything else except energy-force
-                combination.
-            2. Energy-force combination.
 
         Args:
             filename (str): path to HDF5 file.
@@ -252,8 +248,10 @@ class AlchemicalModel(ls.WeightedLinearModel):
             epsilon (float): small value for filtering frozen data coverage.
             preprocessed_file (str): filename to save preprocessed data.
             coverage_file (str): filename to save data coverage arrays.
+            metadata_file (str): filename to save dataset statistics.
             USE_MPI (bool): whether to use MPI for parallel processing.
         """
+        lock = fasteners.InterProcessLock(preprocessed_file+".lock")  # for parallel writing
         if USE_MPI and not GLOBAL_USE_MPI:
             raise ImportError("MPI not available. Exiting...")
         if USE_MPI:
@@ -357,15 +355,13 @@ class AlchemicalModel(ls.WeightedLinearModel):
                 frozen_data_coverage[i] = np.logical_or(frozen_data_coverage[i],
                                                         data_coverage_f)
 
-            # save preprocessed energy and force features (will be combined in 2nd pass)
-            save_preprocessed_db(x_es, y_e, preprocessed_file+".tmp"+str(rank),
-                                 degree=self.degree,
-                                 batch_name=table_name+"_e",
-                                 )
-            save_preprocessed_db(x_fs, y_f, preprocessed_file+".tmp"+str(rank),
-                                 degree=self.degree,
-                                 batch_name=table_name+"_f",
-                                 )
+            # save preprocessed energy and force features
+            lock.acquire()
+            save_preprocessed_db(x_es, y_e, x_fs, y_f, preprocessed_file,
+                                degree=self.degree,
+                                batch_name=table_name,
+                                )
+            lock.release()
 
         # set data coverages as class attributes
         # reduce data_coverage
@@ -397,14 +393,26 @@ class AlchemicalModel(ls.WeightedLinearModel):
             f_variance = ls.VarianceRecorder()
             f_variance.update_with_stats(f_means, f_stds, f_ns)
 
-        # calculate energy and force weights
-        energy_weight, force_weight = ls.calc_E_F_weights(e_variance.n,
-                                                          f_variance.n,
-                                                          e_variance.std,
-                                                          f_variance.std)
-        energy_weight *= np.sqrt(weight)
-        force_weight *= np.sqrt(1 - weight)
+        # calculate energy and force weights and store to metadata file
+        if rank == 0:
+            energy_weight, force_weight = ls.calc_E_F_weights(e_variance.n,
+                                                            f_variance.n,
+                                                            e_variance.std,
+                                                            f_variance.std)
+            energy_weight *= np.sqrt(weight)
+            force_weight *= np.sqrt(1 - weight)
+            np.savez(metadata_file,
+                     w_e=energy_weight,
+                     w_f=force_weight,
+                     n_e=e_variance.n,
+                     mean_e=e_variance.mean,
+                     std_e=e_variance.std,
+                     n_f=f_variance.n,
+                     mean_f=f_variance.mean,
+                     std_f=f_variance.std,
+                     )
 
+        '''
         # loop over batches and combine energies and forces
         if rank == 0:  # show progress only on rank 0
             table_iterator = parallel.progress_iter(np.arange(n_tables),
@@ -439,10 +447,12 @@ class AlchemicalModel(ls.WeightedLinearModel):
                                 )
             lock.release()
         os.remove(preprocessed_file+".tmp"+str(rank))
+        '''
 
     def initialize_training(self,
                             preprocessed_file: str,
                             coverage_file: str,
+                            metadata_file: str,
                             init_params: Union[dict, np.lib.npyio.NpzFile],
                             max_iter: int,
                             checkpoint: int,
@@ -464,6 +474,15 @@ class AlchemicalModel(ls.WeightedLinearModel):
             raise FileNotFoundError(f"'{coverage_file}' not found.\n"
                 "Please run `preprocess_for_training()` first.\n"
                 "Exiting...")
+        if not os.path.isfile(metadata_file):
+            raise FileNotFoundError(f"'{metadata_file}' not found.\n"
+                "Please run `preprocess_for_training()` first.\n"
+                "Exiting...")
+        metadata = np.load(metadata_file)
+        w_e = metadata['w_e']
+        w_f = metadata['w_f']
+        n_e = metadata['n_e']
+        n_f = metadata['n_f']
         self.load_data_coverage(coverage_file)  # load and set data coverage attributes
         with tables.open_file(preprocessed_file, mode="r") as f:
             table_names = [group._v_name for group in f.list_nodes("/")]
@@ -560,11 +579,13 @@ class AlchemicalModel(ls.WeightedLinearModel):
 
         return init_iter, get_params_dir, get_params_path, tracker_filename, \
                train_iter_filename, change_pw_tracker, \
-               change_coeff_tracker, time_tracker, params_fit_order, table_names,
+               change_coeff_tracker, time_tracker, params_fit_order, table_names, \
+               w_e, w_f, n_e, n_f
 
     def fit_from_file(self,
                       preprocessed_file: str = "preprocessed.h5",
                       coverage_file: str = "coverage.npz",
+                      metadata_file: str = "metadata.npz",
                       init_params: Union[dict, np.lib.npyio.NpzFile] = None,
                       C_regularizers: Dict = None,
                       W_sparsity_reg: float = 0.0,
@@ -588,7 +609,9 @@ class AlchemicalModel(ls.WeightedLinearModel):
         Args:
             preprocessed_file (str): path to preprocessed HDF5 data file created
                 by `preprocess_for_training()`.
-            coverage_file (str): filename for saving data coverages during
+            coverage_file (str): path to data coverages file created by
+                `preprocess_for_training()`.
+            metadata_file (str): path to metadata file created by
                 `preprocess_for_training()`.
             init_params (dict | np.lib.npyio.NpzFile ): initial parameters for training.
                 Should be an object with keys 'coeff_1b', 'coeff_2b', 'pseudo_weights_2b'
@@ -621,9 +644,11 @@ class AlchemicalModel(ls.WeightedLinearModel):
         # initialize training
         init_iter, get_params_dir, get_params_path, tracker_filename, \
         train_iter_filename, change_pw_tracker, \
-        change_coeff_tracker, time_tracker, params_fit_order, table_names = \
+        change_coeff_tracker, time_tracker, params_fit_order, table_names, \
+        w_e, w_f, n_e, n_f = \
             self.initialize_training(preprocessed_file=preprocessed_file,
                                      coverage_file=coverage_file,
+                                     metadata_file=metadata_file,
                                      init_params=init_params,
                                      max_iter=max_iter,
                                      checkpoint=checkpoint,
@@ -663,19 +688,30 @@ class AlchemicalModel(ls.WeightedLinearModel):
                                                         style=progress,
                                                         leave=False)
                 for table_name in table_iterator:
-                    xs, y = load_preprocessed_db(preprocessed_file,
-                                                 table_name,
-                                                 load_sparse=False)
+                    x_es, y_e, x_fs, y_f = load_preprocessed_db(preprocessed_file,
+                                                                table_name,
+                                                                load_sparse=False)
 
                     if param_to_fit == "coeff":
-                        feature_matrix = self.feature_matrixC(xs, self.pseudo_weights)
+                        feature_matrix_e = self.feature_matrixC(x_es, self.pseudo_weights)
+                        feature_matrix_f = self.feature_matrixC(x_fs, self.pseudo_weights)
                     elif param_to_fit == "pseudo_weights":
-                        feature_matrix, yhat_e_1b = self.feature_matrixW(xs, self.coeff)
-                        y -= yhat_e_1b
+                        feature_matrix_e, yhat_e_1b = self.feature_matrixW(x_es,
+                                                                           self.coeff,
+                                                                           return_1b=True)
+                        y_e -= yhat_e_1b
+                        feature_matrix_f = self.feature_matrixW(x_fs,
+                                                                self.coeff,
+                                                                return_1b=False)
                     else:
                         raise ValueError("Something went wrong.")
-                    gram += feature_matrix.T @ feature_matrix
-                    ordinate += feature_matrix.T @ y
+                    feature_matrix_e *= w_e
+                    feature_matrix_f *= w_f
+                    y_e *= w_e
+                    y_f *= w_f
+                    gram += feature_matrix_e.T @ feature_matrix_e + \
+                            feature_matrix_f.T @ feature_matrix_f
+                    ordinate += feature_matrix_e.T @ y_e + feature_matrix_f.T @ y_f
 
                 if param_to_fit == "coeff":
                     self.update_reg_gramC(gram, C_regularizers)
@@ -686,7 +722,7 @@ class AlchemicalModel(ls.WeightedLinearModel):
                     raise ValueError("Something went wrong.")
 
                 fitted_params = solver(gram, ordinate)
-                del xs, y, gram, ordinate
+                del x_es, y_e, x_fs, y_f, gram, ordinate
                 gc.collect()
 
                 # Update.
@@ -845,7 +881,7 @@ class AlchemicalModel(ls.WeightedLinearModel):
         ordinate = np.zeros(n_columns)
         return gram, ordinate
 
-    def feature_matrixW(self, Xs, Cs):
+    def feature_matrixW(self, Xs, Cs, return_1b=False):
         """
         Given the preprocessed feature dictionary Xs with feature matrices of
         shape (n_data, n_basis[i] * n_ituples[i] for valid i>1) and
@@ -861,6 +897,7 @@ class AlchemicalModel(ls.WeightedLinearModel):
                 keys (interaction order, >=1) and feature matrices
             Cs (Dict[int, np.ndarray]): i-body alchemical spline coefficients of
                 shape (n_basis[i], n_pseudo[i]), for valid i>=1
+            return_1b (bool): whether to return the 1-body contribution.
 
         Returns:
             XC (np.ndarray): feature matrix for training the pseudo_weights W
@@ -874,8 +911,10 @@ class AlchemicalModel(ls.WeightedLinearModel):
             XC_i = XC_i.reshape(n_data, self.n_ituples[i] * self.n_pseudo[i])
             XCs.append(XC_i)
         XC = np.hstack(XCs)
-        Y_hat_1b = Xs[1] @ Cs[1]
-        return XC, Y_hat_1b
+        if return_1b:
+            Y_hat_1b = Xs[1] @ Cs[1]
+            return XC, Y_hat_1b
+        return XC
 
     def update_reg_gramW(self, gram, C_regularizers, W_sparsity_reg, W_sparsity_epsilon):
         """
@@ -1309,8 +1348,10 @@ class AlchemicalModelTorch(AlchemicalModel, torch.nn.Module):
         return self.train_from_file(*args, **kwargs)
 
 
-def save_preprocessed_db(feature_dict: dict,
-                         y: np.ndarray,
+def save_preprocessed_db(feature_dict_e: dict,
+                         y_e: np.ndarray,
+                         feature_dict_f: dict,
+                         y_f: np.ndarray,
                          filename: str,
                          degree: int,
                          batch_name: str = 'batch',
@@ -1320,33 +1361,38 @@ def save_preprocessed_db(feature_dict: dict,
     Used during alchemical model fitting.
 
     Args:
-        arr_dict (dict): dictionary of feature matrices for each
+        feature_dict_e (dict): dictionary of energy feature matrices for each
             interaction order (1, 2, ..., degree).
-        y (np.ndarray): target vector.
+        y_e (np.ndarray): vector of target energies.
+        feature_dict_f (dict): dictionary of force feature matrices for each
+            interaction order (2, 3, ..., degree).
+        y_f (np.ndarray): vector of target forces.
         filename (str): path to HDF5 file.
         degree (int): maximum interaction order.
         batch_name (str): name of batch group in HDF5 file.
     """
     # sanity checks
     expected_keys = range(1, degree + 1)
-    assert set(feature_dict.keys()).issubset(expected_keys)
+    assert set(feature_dict_e.keys()).issubset(expected_keys)
+    assert set(feature_dict_f.keys()).issubset(expected_keys)
 
     # save to HDF5
     with tables.open_file(filename, mode='a') as f:
         if ('/' + batch_name) in f:
             warnings.warn(f"Table {batch_name} already exists in {filename}. Skipping...")
         else:
-            group = f.create_group("/", batch_name, batch_name)
+            batch_group = f.create_group("/", batch_name, batch_name)
 
-            for key, arr in feature_dict.items():
-                subgroup_name = f"_{key}"
-                subgroup = f.create_group(group, subgroup_name, subgroup_name)
-                csr_arr = scipy.sparse.csr_array(arr)
-                f.create_array(subgroup, 'data', csr_arr.data)
-                f.create_array(subgroup, 'indices', csr_arr.indices)
-                f.create_array(subgroup, 'indptr', csr_arr.indptr)
-                f.create_array(subgroup, 'shape', np.array(csr_arr.shape))
-            f.create_array(group, 'y', y)
+            for dtype, feature_dict, y in zip(['energy', 'force'],
+                                              [feature_dict_e, feature_dict_f],
+                                              [y_e, y_f]):
+                group = f.create_group(batch_group, dtype, dtype)
+                for key, arr in feature_dict.items():
+                    subgroup_name = f"_{key}"
+                    subgroup = f.create_group(group, subgroup_name, subgroup_name)
+                    csr_arr = scipy.sparse.csr_array(arr)
+                    process.cs_array_to_h5_group(csr_arr, f, subgroup)
+                f.create_array(group, 'y', y)
 
 
 def load_preprocessed_db(filename: str,
@@ -1363,31 +1409,34 @@ def load_preprocessed_db(filename: str,
         load_sparse (bool): whether to load as sparse matrix (CSR format).
 
     Returns:
-        arr_dict (dict): dictionary of feature matrices for each
+        feature_dict_e (dict): dictionary of energy feature matrices for each
             interaction order (1, 2, ..., degree).
-        y (np.ndarray): target vector.
+        y_e (np.ndarray): vector of target energies.
+        feature_dict_f (dict): dictionary of force feature matrices for each
+            interaction order (2, 3, ..., degree).
+        y_f (np.ndarray): vector of target forces.
     """
-    arr_dict = {}
+    feature_dict_e = {}
+    feature_dict_f = {}
+    ys = []
     with tables.open_file(filename, mode='r') as f:
-        group = f.get_node("/" + batch_name)
-        group_names = [node._v_name for node in group._f_list_nodes() if node._v_name != 'y']
-        for subgroup_name in group_names:
-            subgroup = f.get_node(group, subgroup_name)
-            data = f.get_node(subgroup, 'data')[:]
-            indices = f.get_node(subgroup, 'indices')[:]
-            indptr = f.get_node(subgroup, 'indptr')[:]
-            shape = f.get_node(subgroup, 'shape')[:]
+        batch_group = f.get_node("/" + batch_name)
 
-            arr = scipy.sparse.csr_array((data, indices, indptr),
-                                         shape=shape)
-            if not load_sparse:
-                arr = arr.toarray()
-            key = int(subgroup_name[1:])
-            arr_dict[int(key)] = arr
+        for dtype, feature_dict in zip(['energy', 'force'],
+                                       [feature_dict_e, feature_dict_f]):
+            group = f.get_node(batch_group, dtype)
+            group_names = [node._v_name for node in group._f_list_nodes() if node._v_name != 'y']
+            for subgroup_name in group_names:
+                subgroup = f.get_node(group, subgroup_name)
+                arr = process.cs_array_from_h5_group(f, subgroup, cstype='csr')
+                if not load_sparse:
+                    arr = arr.toarray()
+                key = int(subgroup_name[1:])
+                feature_dict[int(key)] = arr
+            y = f.get_node(group, 'y')[:]
+            ys.append(y)
 
-        y = f.get_node(group, 'y')[:]
-
-    return arr_dict, y
+    return feature_dict_e, ys[0], feature_dict_f, ys[1]
 
 
 def legacy_broad_row_krp_sum(A, B):
