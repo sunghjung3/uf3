@@ -706,12 +706,13 @@ class AlchemicalModel(ls.WeightedLinearModel):
                     else:
                         raise ValueError("Something went wrong.")
                     feature_matrix_e *= w_e
-                    feature_matrix_f *= w_f
                     y_e *= w_e
+                    gram += feature_matrix_e.T @ feature_matrix_e
+                    ordinate += feature_matrix_e.T @ y_e
+                    feature_matrix_f *= w_f
                     y_f *= w_f
-                    gram += feature_matrix_e.T @ feature_matrix_e + \
-                            feature_matrix_f.T @ feature_matrix_f
-                    ordinate += feature_matrix_e.T @ y_e + feature_matrix_f.T @ y_f
+                    gram += feature_matrix_f.T @ feature_matrix_f
+                    ordinate += feature_matrix_f.T @ y_f
 
                 if param_to_fit == "coeff":
                     self.update_reg_gramC(gram, C_regularizers)
