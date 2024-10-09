@@ -1,5 +1,5 @@
 from typing import List, Dict, Collection, Callable, Union
-import os, time, warnings, re, gc
+import os, time, warnings, re, gc, datetime
 import numpy as np
 import scipy
 from numba import jit
@@ -412,43 +412,6 @@ class AlchemicalModel(ls.WeightedLinearModel):
                      std_f=f_variance.std,
                      )
 
-        '''
-        # loop over batches and combine energies and forces
-        if rank == 0:  # show progress only on rank 0
-            table_iterator = parallel.progress_iter(np.arange(n_tables),
-                                                    style=progress,
-                                                    total=n_tables,
-                                                    leave=True)
-        else:
-            table_iterator = np.arange(n_tables)
-        lock = fasteners.InterProcessLock(preprocessed_file+".lock")
-        for j in table_iterator:
-            table_name = table_names[j]
-            if table_name in skip_tables:
-                continue
-            x_es, y_e = load_preprocessed_db(preprocessed_file+".tmp"+str(rank),
-                                             table_name+"_e",
-                                             load_sparse=False,
-                                             )
-            x_es = {i: x_es[i] * energy_weight for i in x_es}
-            y_e = y_e * energy_weight
-            x_fs, y_f = load_preprocessed_db(preprocessed_file+".tmp"+str(rank),
-                                             table_name+"_f",
-                                             load_sparse=False,
-                                             )
-            x_fs = {i: x_fs[i] * force_weight for i in x_fs}
-            y_f = y_f * force_weight
-            x_s = {i: np.vstack((x_es[i], x_fs[i])) for i in x_es}
-            y_s = np.concatenate((y_e, y_f))
-            lock.acquire()
-            save_preprocessed_db(x_s, y_s, preprocessed_file,
-                                degree=self.degree,
-                                batch_name=table_name,
-                                )
-            lock.release()
-        os.remove(preprocessed_file+".tmp"+str(rank))
-        '''
-
     def initialize_training(self,
                             preprocessed_file: str,
                             coverage_file: str,
@@ -528,6 +491,38 @@ class AlchemicalModel(ls.WeightedLinearModel):
                 time_tracker = np.concatenate((time_tracker,
                                                 np.full(max_iter - len(time_tracker) + 1,
                                                         np.nan)))
+            rmse_e_tracker = train_tracker["rmse_e"]
+            if not len(rmse_e_tracker) == 2*max_iter:
+                warnings.warn(f"Attempting to resume with a different `max_iter` than before.\n"
+                                f"Before: {len(rmse_e_tracker)//2} iterations\n"
+                                f"Now: {max_iter} iterations")
+                rmse_e_tracker = np.concatenate((rmse_e_tracker,
+                                                np.full(2*max_iter - len(rmse_e_tracker),
+                                                        np.nan)))
+            rmse_f_tracker = train_tracker["rmse_f"]
+            if not len(rmse_f_tracker) == 2*max_iter:
+                warnings.warn(f"Attempting to resume with a different `max_iter` than before.\n"
+                                f"Before: {len(rmse_f_tracker)//2} iterations\n"
+                                f"Now: {max_iter} iterations")
+                rmse_f_tracker = np.concatenate((rmse_f_tracker,
+                                                np.full(2*max_iter - len(rmse_f_tracker),
+                                                        np.nan)))
+            data_loss_tracker = train_tracker["data_loss"]
+            if not len(data_loss_tracker) == 2*max_iter:
+                warnings.warn(f"Attempting to resume with a different `max_iter` than before.\n"
+                                f"Before: {len(data_loss_tracker)//2} iterations\n"
+                                f"Now: {max_iter} iterations")
+                data_loss_tracker = np.concatenate((data_loss_tracker,
+                                                np.full(2*max_iter - len(data_loss_tracker),
+                                                        np.nan)))
+            total_loss_tracker = train_tracker["total_loss"]
+            if not len(total_loss_tracker) == 2*max_iter:
+                warnings.warn(f"Attempting to resume with a different `max_iter` than before.\n"
+                                f"Before: {len(total_loss_tracker)//2} iterations\n"
+                                f"Now: {max_iter} iterations")
+                total_loss_tracker = np.concatenate((total_loss_tracker,
+                                                np.full(2*max_iter - len(total_loss_tracker),
+                                                        np.nan)))
 
             # find iteration to resume from
             try:
@@ -569,6 +564,11 @@ class AlchemicalModel(ls.WeightedLinearModel):
             time_tracker = np.full((max_iter+1,), np.nan)
             time_tracker[0] = 0
 
+            rmse_e_tracker = np.full((2*max_iter,), np.nan)
+            rmse_f_tracker = np.full((2*max_iter,), np.nan)
+            data_loss_tracker = np.full((2*max_iter,), np.nan)
+            total_loss_tracker = np.full((2*max_iter,), np.nan)
+
         if fit_first == "C":
             params_fit_order = ("coeff", "pseudo_weights")
         elif fit_first == "W":
@@ -579,7 +579,8 @@ class AlchemicalModel(ls.WeightedLinearModel):
 
         return init_iter, get_params_dir, get_params_path, tracker_filename, \
                train_iter_filename, change_pw_tracker, \
-               change_coeff_tracker, time_tracker, params_fit_order, table_names, \
+               change_coeff_tracker, time_tracker, rmse_e_tracker, rmse_f_tracker, \
+               data_loss_tracker, total_loss_tracker, params_fit_order, table_names, \
                w_e, w_f, n_e, n_f
 
     def fit_from_file(self,
@@ -626,8 +627,7 @@ class AlchemicalModel(ls.WeightedLinearModel):
             progress (str): style for progress indicators.
             max_iter (int): maximum number of iterations for alternating
                 least-squares optimization.
-            checkpoint (int): frequency of checkpointing the training RMSE and
-                saving parameters to disk.
+            checkpoint (int): frequency of saving parameters to disk.
             checkpoint_dir (str): directory for saving checkpoints.
             params_filename (str): filename for saving parameters during
                 checkpoints. Will be saved to `checkpoint_dir/<iteration>/`.
@@ -641,10 +641,11 @@ class AlchemicalModel(ls.WeightedLinearModel):
             solver (Callable): linear algebra solver to use. Defaults to
                 `np.linalg.solve`.
         """
-        # initialize training
+        ### Initialize training ###
         init_iter, get_params_dir, get_params_path, tracker_filename, \
         train_iter_filename, change_pw_tracker, \
-        change_coeff_tracker, time_tracker, params_fit_order, table_names, \
+        change_coeff_tracker, time_tracker, rmse_e_tracker, rmse_f_tracker, \
+        data_loss_tracker, total_loss_tracker, params_fit_order, table_names, \
         w_e, w_f, n_e, n_f = \
             self.initialize_training(preprocessed_file=preprocessed_file,
                                      coverage_file=coverage_file,
@@ -660,7 +661,7 @@ class AlchemicalModel(ls.WeightedLinearModel):
                                      fit_first=fit_first,
                                      )
         
-        # Outer-most ALS loop
+        ### Outer-most ALS loop ###
         print(f"Beginning alternating least-squares optimization:")
         print(f"\tResume: {resume}")
         print(f"\tMax iterations: {max_iter}")
@@ -673,17 +674,27 @@ class AlchemicalModel(ls.WeightedLinearModel):
             print(f"Iteration {i+1}/{max_iter}")
             starttime = time.time()
 
-            for param_to_fit in params_fit_order:
+            for j, param_to_fit in enumerate(params_fit_order):
+                # initialize gram and ordinate
+                current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 if param_to_fit == "coeff":
-                    print(f"\tFitting alchemical spline coefficients.")
+                    print(f"\tFitting alchemical spline coefficients ({current_time}).")
                     gram, ordinate = self.initialize_gramC_ordinateC()
                 elif param_to_fit == "pseudo_weights":
-                    print(f"\tFitting pseudo weights.")
+                    print(f"\tFitting pseudo weights ({current_time}).")
                     gram, ordinate = self.initialize_gramW_ordinateW()
                     #gram += np.eye(gram.shape[0]) * 1e-7  # XXX: temporary
                 else:
                     raise ValueError("Something went wrong.")
 
+                # initialization for loss calculation
+                sse_e = 0.0
+                #sse_f = 0.0
+                flat_params = self.flattened_C() if param_to_fit == "coeff" \
+                   else self.flattened_W()
+                yTy = 0.0
+
+                # loop over batches
                 table_iterator = parallel.progress_iter(table_names,
                                                         style=progress,
                                                         leave=False)
@@ -705,15 +716,36 @@ class AlchemicalModel(ls.WeightedLinearModel):
                                                                 return_1b=False)
                     else:
                         raise ValueError("Something went wrong.")
+
+                    # update loss, gram, and ordinate
+                    sse_e += np.sum((y_e - feature_matrix_e @ flat_params)**2)
                     feature_matrix_e *= w_e
                     y_e *= w_e
                     gram += feature_matrix_e.T @ feature_matrix_e
                     ordinate += feature_matrix_e.T @ y_e
+                    #sse_f += np.sum((y_f - feature_matrix_f @ flat_params)**2)
                     feature_matrix_f *= w_f
                     y_f *= w_f
                     gram += feature_matrix_f.T @ feature_matrix_f
                     ordinate += feature_matrix_f.T @ y_f
+                    yTy += np.sum(y_e**2) + np.sum(y_f**2)
 
+                # calculate RMSE and data loss
+                rmse_e = np.sqrt(sse_e / n_e)
+                #rmse_f = np.sqrt(sse_f / n_f)
+                #data_loss = sse_e * w_e**2 + sse_f * w_f**2
+                data_loss = sse_from_gram_ordinate(gram, ordinate, yTy, flat_params)
+                sse_f = (data_loss - sse_e * w_e**2) / w_f**2
+                rmse_f = np.sqrt(sse_f / n_f)
+                rmse_e_tracker[2*i+j] = rmse_e
+                rmse_f_tracker[2*i+j] = rmse_f
+                data_loss_tracker[2*i+j] = data_loss
+                print(f"\t\tRMSE (energy): {rmse_e}")
+                print(f"\t\tRMSE (forces): {rmse_f}")
+                print(f"\t\tData loss: {data_loss}")
+
+
+                # add regularizers to gram
                 if param_to_fit == "coeff":
                     self.update_reg_gramC(gram, C_regularizers)
                 elif param_to_fit == "pseudo_weights":
@@ -722,11 +754,17 @@ class AlchemicalModel(ls.WeightedLinearModel):
                 else:
                     raise ValueError("Something went wrong.")
 
+                # calculate total loss (data loss + regularizer loss)
+                total_loss = sse_from_gram_ordinate(gram, ordinate, yTy, flat_params)
+                total_loss_tracker[2*i+j] = total_loss
+                print(f"\t\tTotal loss: {total_loss}")
+                
+                # solve
                 fitted_params = solver(gram, ordinate)
                 del x_es, y_e, x_fs, y_f, gram, ordinate
                 gc.collect()
 
-                # Update.
+                ### Update ###
                 # NOTE: self.coeff and self.pseudo_weights must be updated every
                 # half iteration because the updated values are used in the next
                 # half iteration.
@@ -752,7 +790,8 @@ class AlchemicalModel(ls.WeightedLinearModel):
                         self.pseudo_weights[k] /= normalization_factor
                         self.coeff[k] *= normalization_factor  # not necessary if coeffs are trained again
                 
-                # Record change at the end of every whole iteration
+                ### Record change at the end of every whole iteration ###
+                print()
                 if param_to_fit == params_fit_order[-1]:
                     for k in range(2, self.degree+1):
                         max_change_pseudo = np.max(np.abs(self.pseudo_weights[k] - old_pseudo_weights[k]))
@@ -776,19 +815,12 @@ class AlchemicalModel(ls.WeightedLinearModel):
             time_tracker[i+1] = elapsed_time + time_tracker[i]
             print(f"\tTime elapsed: {elapsed_time:.3F} seconds\n")
         
-            # Checkpoint
+            ### Checkpoint ###
             if ((i+1) % checkpoint == 0) or (i+1 == max_iter):
                 print("Checkpointing.")
 
                 # Decompress and store to self.coefficients
                 self.decompress_alchemical_parameters()
-
-                # Check RMSE
-                #_, _, _, _, rmse_e, rmse_f = self.batched_predict(filename,
-                #                                        keys=subset,
-                #                                        sparse_hdf5=sparse_hdf5,
-                #                                        client=client,
-                #                                        )
 
                 os.makedirs(get_params_dir(i+1), exist_ok=True)
                 self.save_alchemical_params(get_params_path(i+1))
@@ -798,6 +830,10 @@ class AlchemicalModel(ls.WeightedLinearModel):
                          **{f"change_coeff_{k}b": change_coeff_tracker[k]
                             for k in range(1, self.degree+1)},
                          time=time_tracker,
+                         rmse_e=rmse_e_tracker,
+                         rmse_f=rmse_f_tracker,
+                         data_loss=data_loss_tracker,
+                         total_loss=total_loss_tracker,
                          )
 
                 with open(train_iter_filename, "w") as f:
@@ -816,6 +852,16 @@ class AlchemicalModel(ls.WeightedLinearModel):
                                                      self.frozen_c,
                                                      self.col_idx)
         self.coefficients = coefficients
+
+    def flattened_C(self):
+        """Return the flattened alchemical spline coefficients."""
+        return np.concatenate([self.coeff[i].flatten(order="F")
+                               for i in range(1, self.degree+1)])
+ 
+    def flattened_W(self):
+        """Return the flattened pseudo-weights."""
+        return np.concatenate([self.pseudo_weights[i].flatten(order="C")
+                               for i in range(2, self.degree+1)])
 
     def initialize_gramC_ordinateC(self):
         """Initialize empty gram matrices and ordinates for fitting the
@@ -1605,6 +1651,24 @@ def sparsity_reg_matrix(params, strength, epsilon=1e-12):
     params = np.where(np.abs(params) < epsilon, epsilon, params)
     reg_matrix = np.diag(1/params) * strength
     return reg_matrix
+
+
+def sse_from_gram_ordinate(gram, ordinate, yTy, beta):
+    """
+    Compute the sum of squared errors when gram and ordiante matrices have
+    already been computed.
+
+    SSE = (y - X @ beta)^T @ (y - X @ beta)
+        = y.T @ y - 2 * y.T @ X @ beta + beta.T @ X.T @ X @ beta
+        = y.T @ y - 2 * ordinate @ beta + beta.T @ gram @ beta
+
+    Args:
+        gram (np.ndarray): gram matrix of shape (n x n).
+        ordinate (np.ndarray): ordinate vector of shape (n,).
+        yTy (float): y.T @ y.
+        beta (np.ndarray): parameter vector of shape (n,)
+    """
+    return yTy - 2 * ordinate @ beta + beta @ gram @ beta
 
 
 def expand_alchemical_init_params(params_dict, n_pseudo):
