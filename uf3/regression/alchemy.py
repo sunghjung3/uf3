@@ -28,7 +28,8 @@ class AlchemicalModel(ls.WeightedLinearModel):
     Note about spline coefficient regularization:
     * Alchemical spline coefficient regularizers ("C_regularizers"):
         * Should be in the form of a dictionary with keys as interaction orders
-            (1, 2, ..., degree) and values as matrices.
+            (1, 2, ..., degree) and values as 3D arrays of shape
+            (_, n_basis[i], n_pseudo[i]).
         * The regularizer matrices should already have frozen coefficients removed.
         * The regularizer matrices should have no cross-coupling between different
             pseudo-interactions.
@@ -417,6 +418,7 @@ class AlchemicalModel(ls.WeightedLinearModel):
                             coverage_file: str,
                             metadata_file: str,
                             init_params: Union[dict, np.lib.npyio.NpzFile],
+                            C_regularizers: Dict,
                             max_iter: int,
                             checkpoint: int,
                             checkpoint_dir: str,
@@ -577,11 +579,26 @@ class AlchemicalModel(ls.WeightedLinearModel):
             raise ValueError(f"Unrecognized value for `fit_first`: {fit_first}\n"
                                 "Expected 'C' or 'W'.")
 
+        # determine activation of each slice of the regularizer
+        C_reg_slice_idxs = dict()
+        C_reg_pseudo_idxs = dict()
+        if C_regularizers is not None:
+            for i in range(2, self.degree+1):
+                if i not in C_regularizers:
+                    continue
+                assert C_regularizers[i].shape[1:] == (self.n_basis[i], self.n_pseudo[i])
+                compressed_C_reg = np.sum(np.abs(C_regularizers[i]), axis=1)
+                # each slice activates a certain alchemical interaction only if nonzero
+                C_reg_slice_idx, C_reg_pseudo_idx = np.where(compressed_C_reg > 0)
+                assert len(np.unique(C_reg_slice_idx)) == len(C_reg_slice_idx)  # no cross-coupling
+                C_reg_slice_idxs[i] = C_reg_slice_idx
+                C_reg_pseudo_idxs[i] = C_reg_pseudo_idx
+
         return init_iter, get_params_dir, get_params_path, tracker_filename, \
                train_iter_filename, change_pw_tracker, \
                change_coeff_tracker, time_tracker, rmse_e_tracker, rmse_f_tracker, \
                data_loss_tracker, total_loss_tracker, params_fit_order, table_names, \
-               w_e, w_f, n_e, n_f
+               w_e, w_f, n_e, n_f, C_reg_slice_idxs, C_reg_pseudo_idxs
 
     def fit_from_file(self,
                       preprocessed_file: str = "preprocessed.h5",
@@ -646,11 +663,12 @@ class AlchemicalModel(ls.WeightedLinearModel):
         train_iter_filename, change_pw_tracker, \
         change_coeff_tracker, time_tracker, rmse_e_tracker, rmse_f_tracker, \
         data_loss_tracker, total_loss_tracker, params_fit_order, table_names, \
-        w_e, w_f, n_e, n_f = \
+        w_e, w_f, n_e, n_f, C_reg_slice_idxs, C_reg_pseudo_idxs = \
             self.initialize_training(preprocessed_file=preprocessed_file,
                                      coverage_file=coverage_file,
                                      metadata_file=metadata_file,
                                      init_params=init_params,
+                                     C_regularizers=C_regularizers,
                                      max_iter=max_iter,
                                      checkpoint=checkpoint,
                                      checkpoint_dir=checkpoint_dir,
@@ -749,13 +767,32 @@ class AlchemicalModel(ls.WeightedLinearModel):
                 if param_to_fit == "coeff":
                     self.update_reg_gramC(gram, C_regularizers)
                 elif param_to_fit == "pseudo_weights":
-                    self.update_reg_gramW(gram, C_regularizers,
-                                          W_sparsity_reg, W_sparsity_epsilon)
+                    self.update_reg_gramW(gram, W_sparsity_reg, W_sparsity_epsilon,
+                                          C_regularizers, C_reg_slice_idxs, C_reg_pseudo_idxs)
                 else:
                     raise ValueError("Something went wrong.")
 
+                # manual total loss (for debugging)
+                #reg_loss = 0
+                #reg_loss += ((C_regularizers[1] @ self.coeff[1])**2).sum()
+                #for k in range(2, self.degree+1):
+                #    L2_norm_W = np.linalg.norm(self.pseudo_weights[k], axis=0)
+                #    reg_loss += ((C_regularizers[k] * self.coeff[k] * L2_norm_W).sum((1, 2))**2).sum()
+                #reg_loss += np.abs(self.flattened_W()).sum() * W_sparsity_reg
+                #print(f"\t\tTotal loss manual: {data_loss + reg_loss}")
+
                 # calculate total loss (data loss + regularizer loss)
                 total_loss = sse_from_gram_ordinate(gram, ordinate, yTy, flat_params)
+                # add missing terms to total loss
+                if param_to_fit == "coeff":
+                    # missing from pseudo-weight sparsity penalty
+                    if W_sparsity_reg > 0:
+                        total_loss += np.abs(self.flattened_W()).sum() * W_sparsity_reg
+                elif param_to_fit == "pseudo_weights":
+                    # missing from 1b C_regularizers
+                    total_loss += ((C_regularizers[1] @ self.coeff[1])**2).sum()
+                else:
+                    raise ValueError("Something went wrong.")
                 total_loss_tracker[2*i+j] = total_loss
                 print(f"\t\tTotal loss: {total_loss}")
                 
@@ -785,11 +822,12 @@ class AlchemicalModel(ls.WeightedLinearModel):
                         idx_hi = self.pseudo_offsets[k+1]
                         self.pseudo_weights[k] = fitted_params[idx_lo:idx_hi].\
                                 reshape(self.n_ituples[k], self.n_pseudo[k])
-                        # normalize weights s.t. each column is between -1 and 1
-                        normalization_factor = np.max(np.abs(self.pseudo_weights[k]), axis=0)
+                        # normalize weights s.t. each column proportional its L2 norm
+                        normalization_factor = \
+                            np.linalg.norm(self.pseudo_weights[k], axis=0) / np.sqrt(self.n_ituples[k])
                         self.pseudo_weights[k] /= normalization_factor
                         self.coeff[k] *= normalization_factor  # not necessary if coeffs are trained again
-                
+
                 ### Record change at the end of every whole iteration ###
                 print()
                 if param_to_fit == params_fit_order[-1]:
@@ -911,14 +949,25 @@ class AlchemicalModel(ls.WeightedLinearModel):
                 alchemical spline coefficients. See the class docstring for
                 more information about the format.
         """
-        if C_regularizers is not None:
-            for i in range(1, self.degree+1):
-                if i in C_regularizers:
-                    reg = C_regularizers[i]
-                    idx_lo = 0 if i == 1 else self.alchemical_coeff_offsets[i]
-                    idx_hi = self.n_elements if i == 1 else \
-                        self.alchemical_coeff_offsets[i+1]
-                    gram[idx_lo:idx_hi, idx_lo:idx_hi] += reg.T @ reg
+        if C_regularizers is None:
+            return
+
+        # 1b
+        if 1 in C_regularizers:
+            reg = C_regularizers[1]
+            gram[:self.n_elements, :self.n_elements] += reg.T @ reg
+        
+        # 2b, 3b, ...
+        for i in range(2, self.degree+1):
+            if i not in C_regularizers:
+                continue
+            reg = C_regularizers[i]
+            idx_lo = self.alchemical_coeff_offsets[i]
+            idx_hi = self.alchemical_coeff_offsets[i+1]
+            L2_norm_W = np.linalg.norm(self.pseudo_weights[i], axis=0)
+            reg = reg * L2_norm_W  # can't write *= to avoid in-place modification
+            reg = reg.transpose(0, 2, 1).reshape(-1, self.n_pseudo[i] * self.n_basis[i])
+            gram[idx_lo:idx_hi, idx_lo:idx_hi] += reg.T @ reg
 
     def initialize_gramW_ordinateW(self):
         """Initialize gram matrices and ordinates for fitting
@@ -963,28 +1012,49 @@ class AlchemicalModel(ls.WeightedLinearModel):
             return XC, Y_hat_1b
         return XC
 
-    def update_reg_gramW(self, gram, C_regularizers, W_sparsity_reg, W_sparsity_epsilon):
+    def update_reg_gramW(self, gram, W_sparsity_reg, W_sparsity_epsilon,
+                         C_regularizers, C_reg_slice_idxs, C_reg_pseudo_idxs):
         """
         Update the gram matrix for fitting the pseudo_weights W with alchemical
         regularizers.
 
         Args:
             gram (np.ndarray): current gram matrix
-            C_regularizers (Dict): dictionary of regularization matrices for
-                alchemical spline coefficients. See the class docstring for
-                more information about the format.
             W_sparsity_reg (float): regularization strength for sparsity of
                 pseudo-weights (L1 penalty).
             W_sparsity_epsilon (float): small value for L1 penalty to avoid
                 division by zero.
+            C_regularizers (Dict): dictionary of regularization matrices for
+                alchemical spline coefficients. See the class docstring for
+                more information about the format.
+            C_reg_slice_idxs (Dict): dictionary of indices of nonzero slices in
+                `C_regularizer`s for each interaction order.
+                Created in `initialize_training()`.
+            C_reg_pseudo_idxs (Dict): dictionary of alchemical indices where
+                each slice of `C_regularizer` is nonzero for each interaction
+                order. Created in `initialize_training()`.
         """
-        # TODO: add L2 C regularizer stuff
+        # pseudo-weight sparsity penalty
         if W_sparsity_reg > 0:
-            pseudo_weights_flat = np.concatenate([self.pseudo_weights[k].flatten()
-                                                for k in range(2, self.degree+1)])
+            pseudo_weights_flat = self.flattened_W()
             gram += sparsity_reg_matrix(pseudo_weights_flat,
                                         strength=W_sparsity_reg,
                                         epsilon=W_sparsity_epsilon)
+
+        # contribution from C_regularizers
+        if C_regularizers is None:
+            return
+        for i in range(2, self.degree+1):
+            if i not in C_regularizers:
+                continue
+            DC = np.sum(C_regularizers[i] * self.coeff[i], axis=1)
+            DC_nonzero_sq = DC[C_reg_slice_idxs[i], C_reg_pseudo_idxs[i]]**2
+            for i_reg in range(len(C_reg_slice_idxs[i])):
+                reg_gram_contrib = np.ones(self.n_ituples[i]) * DC_nonzero_sq[i_reg]
+                # apply to alchemical index C_reg_pseudo_idxs[i][i_reg] for all ituples
+                gram_contrib_idx = C_reg_pseudo_idxs[i][i_reg] + \
+                                    self.n_pseudo[i] * np.arange(self.n_ituples[i])
+                gram[gram_contrib_idx, gram_contrib_idx] += reg_gram_contrib
 
 
 class AlchemicalModelTorch(AlchemicalModel, torch.nn.Module):
@@ -1631,7 +1701,8 @@ def get_C_regularizers(bspline_config: bspline.BSplineBasis,
                     "Four-body terms and beyond are not yet implemented.")
             matrices.append(matrix)
         combined_matrix = regularize.combine_regularizer_matrices(matrices)
-        C_reg_dict[degree] = combined_matrix
+        C_reg_dict[degree] = combined_matrix.reshape(-1, n_pseudo[degree], n_basis[degree]).\
+            transpose(0, 2, 1)
 
     return C_reg_dict
 
