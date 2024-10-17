@@ -1052,7 +1052,8 @@ class AlchemicalModel(ls.WeightedLinearModel):
             for i_reg in range(len(C_reg_slice_idxs[i])):
                 reg_gram_contrib = np.ones(self.n_ituples[i]) * DC_nonzero_sq[i_reg]
                 # apply to alchemical index C_reg_pseudo_idxs[i][i_reg] for all ituples
-                gram_contrib_idx = C_reg_pseudo_idxs[i][i_reg] + \
+                gram_contrib_idx = self.pseudo_offsets[i] + \
+                                    C_reg_pseudo_idxs[i][i_reg] + \
                                     self.n_pseudo[i] * np.arange(self.n_ituples[i])
                 gram[gram_contrib_idx, gram_contrib_idx] += reg_gram_contrib
 
