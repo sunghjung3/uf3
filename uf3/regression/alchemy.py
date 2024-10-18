@@ -759,7 +759,7 @@ class AlchemicalModel(ls.WeightedLinearModel):
                 #reg_loss += ((C_regularizers[1] @ self.coeff[1])**2).sum()
                 #for k in range(2, self.degree+1):
                 #    L2_norm_W = np.linalg.norm(self.pseudo_weights[k], axis=0)
-                #    reg_loss += (C_regularizers[k] @ self.coeff[k] * L2_norm_W)**2.sum()
+                #    reg_loss += ((C_regularizers[k] @ self.coeff[k] * L2_norm_W)**2).sum()
                 #reg_loss += np.abs(self.flattened_W()).sum() * W_sparsity_reg
                 #print(f"\t\tTotal loss manual: {data_loss + reg_loss}")
 
@@ -944,12 +944,12 @@ class AlchemicalModel(ls.WeightedLinearModel):
             if i not in C_regularizers:
                 continue
             reg = C_regularizers[i]
+            reg_gram = reg.T @ reg
             L2_norm_W = np.linalg.norm(self.pseudo_weights[i], axis=0)
             for k in range(self.n_pseudo[i]):
-                reg = reg * L2_norm_W[k]  # can't write *= to avoid in-place modification
                 idx_lo = self.alchemical_coeff_offsets[i] + k * self.n_basis[i]
                 idx_hi = self.alchemical_coeff_offsets[i] + (k+1) * self.n_basis[i] 
-                gram[idx_lo:idx_hi, idx_lo:idx_hi] += reg.T @ reg
+                gram[idx_lo:idx_hi, idx_lo:idx_hi] += reg_gram * L2_norm_W[k]**2
 
     def initialize_gramW_ordinateW(self):
         """Initialize gram matrices and ordinates for fitting
@@ -1024,11 +1024,11 @@ class AlchemicalModel(ls.WeightedLinearModel):
             if i not in C_regularizers:
                 continue
             DC_nonzero_sq = np.sum((C_regularizers[i] @ self.coeff[i])**2, axis=0)
-            for k in range(self.n_pseudo[i]):
-                reg_gram_contrib = np.ones(self.n_ituples[i]) * DC_nonzero_sq[k]
-                gram_contrib_idx = self.pseudo_offsets[i] + \
-                                   k + self.n_pseudo[i] * np.arange(self.n_ituples[i])
-                gram[gram_contrib_idx, gram_contrib_idx] += reg_gram_contrib
+            for k in range(self.n_ituples[i]):
+                idx_lo = self.pseudo_offsets[i] + k * self.n_pseudo[i]
+                idx_hi = self.pseudo_offsets[i] + (k+1) * self.n_pseudo[i]
+                indices = np.arange(idx_lo, idx_hi)
+                gram[indices, indices] += DC_nonzero_sq
 
 
 class AlchemicalModelTorch(AlchemicalModel, torch.nn.Module):
