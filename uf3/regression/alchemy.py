@@ -28,11 +28,10 @@ class AlchemicalModel(ls.WeightedLinearModel):
     Note about spline coefficient regularization:
     * Alchemical spline coefficient regularizers ("C_regularizers"):
         * Should be in the form of a dictionary with keys as interaction orders
-            (1, 2, ..., degree) and values as 3D arrays of shape
-            (_, n_basis[i], n_pseudo[i]).
+            (1, 2, ..., degree) and values as 2D arrays of shape (_, n_elements)
+            for 1-body and (_, n_basis[i]) for i-body. For i>1, the same regularizer
+            will be applied to all alchemical interactions of that order.
         * The regularizer matrices should already have frozen coefficients removed.
-        * The regularizer matrices should have no cross-coupling between different
-            pseudo-interactions.
 
     Args:
         bspline_config (bspline.BSplineBasis): basis set configuration.
@@ -418,7 +417,6 @@ class AlchemicalModel(ls.WeightedLinearModel):
                             coverage_file: str,
                             metadata_file: str,
                             init_params: Union[dict, np.lib.npyio.NpzFile],
-                            C_regularizers: Dict,
                             max_iter: int,
                             checkpoint: int,
                             checkpoint_dir: str,
@@ -579,26 +577,11 @@ class AlchemicalModel(ls.WeightedLinearModel):
             raise ValueError(f"Unrecognized value for `fit_first`: {fit_first}\n"
                                 "Expected 'C' or 'W'.")
 
-        # determine activation of each slice of the regularizer
-        C_reg_slice_idxs = dict()
-        C_reg_pseudo_idxs = dict()
-        if C_regularizers is not None:
-            for i in range(2, self.degree+1):
-                if i not in C_regularizers:
-                    continue
-                assert C_regularizers[i].shape[1:] == (self.n_basis[i], self.n_pseudo[i])
-                compressed_C_reg = np.sum(np.abs(C_regularizers[i]), axis=1)
-                # each slice activates a certain alchemical interaction only if nonzero
-                C_reg_slice_idx, C_reg_pseudo_idx = np.where(compressed_C_reg > 0)
-                assert len(np.unique(C_reg_slice_idx)) == len(C_reg_slice_idx)  # no cross-coupling
-                C_reg_slice_idxs[i] = C_reg_slice_idx
-                C_reg_pseudo_idxs[i] = C_reg_pseudo_idx
-
         return init_iter, get_params_dir, get_params_path, tracker_filename, \
                train_iter_filename, change_pw_tracker, \
                change_coeff_tracker, time_tracker, rmse_e_tracker, rmse_f_tracker, \
                data_loss_tracker, total_loss_tracker, params_fit_order, table_names, \
-               w_e, w_f, n_e, n_f, C_reg_slice_idxs, C_reg_pseudo_idxs
+               w_e, w_f, n_e, n_f
 
     def fit_from_file(self,
                       preprocessed_file: str = "preprocessed.h5",
@@ -663,12 +646,11 @@ class AlchemicalModel(ls.WeightedLinearModel):
         train_iter_filename, change_pw_tracker, \
         change_coeff_tracker, time_tracker, rmse_e_tracker, rmse_f_tracker, \
         data_loss_tracker, total_loss_tracker, params_fit_order, table_names, \
-        w_e, w_f, n_e, n_f, C_reg_slice_idxs, C_reg_pseudo_idxs = \
+        w_e, w_f, n_e, n_f = \
             self.initialize_training(preprocessed_file=preprocessed_file,
                                      coverage_file=coverage_file,
                                      metadata_file=metadata_file,
                                      init_params=init_params,
-                                     C_regularizers=C_regularizers,
                                      max_iter=max_iter,
                                      checkpoint=checkpoint,
                                      checkpoint_dir=checkpoint_dir,
@@ -768,7 +750,7 @@ class AlchemicalModel(ls.WeightedLinearModel):
                     self.update_reg_gramC(gram, C_regularizers)
                 elif param_to_fit == "pseudo_weights":
                     self.update_reg_gramW(gram, W_sparsity_reg, W_sparsity_epsilon,
-                                          C_regularizers, C_reg_slice_idxs, C_reg_pseudo_idxs)
+                                          C_regularizers)
                 else:
                     raise ValueError("Something went wrong.")
 
@@ -777,7 +759,7 @@ class AlchemicalModel(ls.WeightedLinearModel):
                 #reg_loss += ((C_regularizers[1] @ self.coeff[1])**2).sum()
                 #for k in range(2, self.degree+1):
                 #    L2_norm_W = np.linalg.norm(self.pseudo_weights[k], axis=0)
-                #    reg_loss += ((C_regularizers[k] * self.coeff[k] * L2_norm_W).sum((1, 2))**2).sum()
+                #    reg_loss += (C_regularizers[k] @ self.coeff[k] * L2_norm_W)**2.sum()
                 #reg_loss += np.abs(self.flattened_W()).sum() * W_sparsity_reg
                 #print(f"\t\tTotal loss manual: {data_loss + reg_loss}")
 
@@ -962,12 +944,12 @@ class AlchemicalModel(ls.WeightedLinearModel):
             if i not in C_regularizers:
                 continue
             reg = C_regularizers[i]
-            idx_lo = self.alchemical_coeff_offsets[i]
-            idx_hi = self.alchemical_coeff_offsets[i+1]
             L2_norm_W = np.linalg.norm(self.pseudo_weights[i], axis=0)
-            reg = reg * L2_norm_W  # can't write *= to avoid in-place modification
-            reg = reg.transpose(0, 2, 1).reshape(-1, self.n_pseudo[i] * self.n_basis[i])
-            gram[idx_lo:idx_hi, idx_lo:idx_hi] += reg.T @ reg
+            for k in range(self.n_pseudo[i]):
+                reg = reg * L2_norm_W[k]  # can't write *= to avoid in-place modification
+                idx_lo = self.alchemical_coeff_offsets[i] + k * self.n_basis[i]
+                idx_hi = self.alchemical_coeff_offsets[i] + (k+1) * self.n_basis[i] 
+                gram[idx_lo:idx_hi, idx_lo:idx_hi] += reg.T @ reg
 
     def initialize_gramW_ordinateW(self):
         """Initialize gram matrices and ordinates for fitting
@@ -1013,7 +995,7 @@ class AlchemicalModel(ls.WeightedLinearModel):
         return XC
 
     def update_reg_gramW(self, gram, W_sparsity_reg, W_sparsity_epsilon,
-                         C_regularizers, C_reg_slice_idxs, C_reg_pseudo_idxs):
+                         C_regularizers):
         """
         Update the gram matrix for fitting the pseudo_weights W with alchemical
         regularizers.
@@ -1027,12 +1009,6 @@ class AlchemicalModel(ls.WeightedLinearModel):
             C_regularizers (Dict): dictionary of regularization matrices for
                 alchemical spline coefficients. See the class docstring for
                 more information about the format.
-            C_reg_slice_idxs (Dict): dictionary of indices of nonzero slices in
-                `C_regularizer`s for each interaction order.
-                Created in `initialize_training()`.
-            C_reg_pseudo_idxs (Dict): dictionary of alchemical indices where
-                each slice of `C_regularizer` is nonzero for each interaction
-                order. Created in `initialize_training()`.
         """
         # pseudo-weight sparsity penalty
         if W_sparsity_reg > 0:
@@ -1047,14 +1023,11 @@ class AlchemicalModel(ls.WeightedLinearModel):
         for i in range(2, self.degree+1):
             if i not in C_regularizers:
                 continue
-            DC = np.sum(C_regularizers[i] * self.coeff[i], axis=1)
-            DC_nonzero_sq = DC[C_reg_slice_idxs[i], C_reg_pseudo_idxs[i]]**2
-            for i_reg in range(len(C_reg_slice_idxs[i])):
-                reg_gram_contrib = np.ones(self.n_ituples[i]) * DC_nonzero_sq[i_reg]
-                # apply to alchemical index C_reg_pseudo_idxs[i][i_reg] for all ituples
+            DC_nonzero_sq = np.sum((C_regularizers[i] @ self.coeff[i])**2, axis=0)
+            for k in range(self.n_pseudo[i]):
+                reg_gram_contrib = np.ones(self.n_ituples[i]) * DC_nonzero_sq[k]
                 gram_contrib_idx = self.pseudo_offsets[i] + \
-                                    C_reg_pseudo_idxs[i][i_reg] + \
-                                    self.n_pseudo[i] * np.arange(self.n_ituples[i])
+                                   k + self.n_pseudo[i] * np.arange(self.n_ituples[i])
                 gram[gram_contrib_idx, gram_contrib_idx] += reg_gram_contrib
 
 
@@ -1607,16 +1580,33 @@ def broad_row_krp_sum(A, B):
 
 
 def get_C_regularizers(bspline_config: bspline.BSplineBasis,
-                       n_pseudo: Union[int, Dict[int, int]],
                        ridge_map={},
                        curvature_map={},
                        **kwargs):
+    """
+    Generate regularization matrices for the alchemical spline coefficients C.
+    For each interaction order (>1), the regularization matrix of only a single pseudo
+    interaction is generated, which will be applied to all pseudo interactions
+    during fitting. For 1-body terms, the matrix is the same as the typical 1-body
+    regularization matrix (number of columns == number of elements).
+
+    Args:
+        bspline_config (bspline.BSplineBasis): bspline configuration object.
+        ridge_map (dict): dictionary of ridge regularization strengths for each
+            interaction order. Defaults to {}.
+        curvature_map (dict): dictionary of curvature regularization strengths
+            for each interaction order. Defaults to {}.
+        **kwargs: additional keyword arguments for ridge_map and curvature_map.
+
+    Returns:
+        C_reg_dict (dict): dictionary of regularization matrices for the alchemical
+            spline coefficients. The keys are the interaction orders and the values
+            are the regularization matrices of shape (_, n_basis).
+    """
     # determine AlchemicalModel structure
     n_elements = len(bspline_config.element_list)
     lead_trim = bspline_config.leading_trim
     trail_trim = bspline_config.trailing_trim
-    default_n_pseudo = {2: 3, 3: 2}
-    n_pseudo = user_config.process_order_dict(n_pseudo, default_n_pseudo)
 
     component_sizes = bspline_config.get_interaction_partitions()[0]
     n_basis = {i: component_sizes[bspline_config.interactions_map[i][0]]
@@ -1652,59 +1642,53 @@ def get_C_regularizers(bspline_config: bspline.BSplineBasis,
     C_reg_dict = {1: matrix}
     # two- and three-body terms
     for degree in range(2, bspline_config.degree + 1):
-        matrices = []
         r = ridge_map[degree]
         c = curvature_map[degree]
-        for _ in range(n_pseudo[degree]):  # each pseudo interaction
-            if degree == 2:
-                #matrix = bspline_config.get_regularization_matrix_2b(interaction,
-                #                                            ridge=r,
-                #                                            curvature=c)
-                matrix = regularize.get_ridge_penalty_matrix(n_basis[degree] + lead_trim + trail_trim)
-                matrix *= np.sqrt(r)
-                if c > 0:
-                    matrix_c = regularize.get_curvature_penalty_matrix_1D(n_basis[degree] + lead_trim + trail_trim)
-                    matrix_c *= np.sqrt(c)
-                    matrix = np.vstack((matrix, matrix_c))
-                mask = np.arange(lead_trim, lead_trim + n_basis[degree])
-                matrix = ls.freeze_regularizer(matrix, mask)
-            elif degree == 3:
-                #matrix = bspline_config.get_regularization_matrix_3b(interaction,
-                #                                               ridge=r,
-                #                                               curvature=c)
-                dummy_interaction = bspline_config.interactions_map[degree][0]  # random choice
-                mask = bspline_config.template_mask[dummy_interaction]  # template must be the same for all
+        if degree == 2:
+            #matrix = bspline_config.get_regularization_matrix_2b(interaction,
+            #                                            ridge=r,
+            #                                            curvature=c)
+            matrix = regularize.get_ridge_penalty_matrix(n_basis[degree] + lead_trim + trail_trim)
+            matrix *= np.sqrt(r)
+            if c > 0:
+                matrix_c = regularize.get_curvature_penalty_matrix_1D(n_basis[degree] + lead_trim + trail_trim)
+                matrix_c *= np.sqrt(c)
+                matrix = np.vstack((matrix, matrix_c))
+            mask = np.arange(lead_trim, lead_trim + n_basis[degree])
+            matrix = ls.freeze_regularizer(matrix, mask)
+        elif degree == 3:
+            #matrix = bspline_config.get_regularization_matrix_3b(interaction,
+            #                                               ridge=r,
+            #                                               curvature=c)
+            dummy_interaction = bspline_config.interactions_map[degree][0]  # random choice
+            mask = bspline_config.template_mask[dummy_interaction]  # template must be the same for all
 
-                # Ridge regularization for compressed coefficients
-                matrix = regularize.get_ridge_penalty_matrix(len(mask))
-                matrix *= np.sqrt(r)
+            # Ridge regularization for compressed coefficients
+            matrix = regularize.get_ridge_penalty_matrix(len(mask))
+            matrix *= np.sqrt(r)
 
-                # Curvature regularization
-                if c > 0:
-                    size = bspline_config.resolution_map[dummy_interaction]
-                    matrix_c = regularize.get_curvature_penalty_matrix_3D(
-                        size[0] + 3,
-                        size[1] + 3,
-                        size[2] + 3,
-                        flatten=False,
-                        )
-                    # compress each row of matrix_c
-                    matrix_c_compressed = np.zeros((len(mask), len(mask)))
-                    for compressed_i, uncompressed_i in enumerate(mask):
-                        row = matrix_c[uncompressed_i]
-                        matrix_c_compressed[compressed_i] = \
-                            bspline_config.compress_3B(row, dummy_interaction)
-                    matrix_c_compressed *= np.sqrt(c)
+            # Curvature regularization
+            if c > 0:
+                size = bspline_config.resolution_map[dummy_interaction]
+                matrix_c = regularize.get_curvature_penalty_matrix_3D(
+                    size[0] + 3,
+                    size[1] + 3,
+                    size[2] + 3,
+                    flatten=False,
+                    )
+                # compress each row of matrix_c
+                matrix_c_compressed = np.zeros((len(mask), len(mask)))
+                for compressed_i, uncompressed_i in enumerate(mask):
+                    row = matrix_c[uncompressed_i]
+                    matrix_c_compressed[compressed_i] = \
+                        bspline_config.compress_3B(row, dummy_interaction)
+                matrix_c_compressed *= np.sqrt(c)
 
-                    matrix = np.vstack((matrix, matrix_c_compressed))
-            else:
-                raise ValueError(
-                    "Four-body terms and beyond are not yet implemented.")
-            matrices.append(matrix)
-        combined_matrix = regularize.combine_regularizer_matrices(matrices)
-        C_reg_dict[degree] = combined_matrix.reshape(-1, n_pseudo[degree], n_basis[degree]).\
-            transpose(0, 2, 1)
-
+                matrix = np.vstack((matrix, matrix_c_compressed))
+        else:
+            raise ValueError(
+                "Four-body terms and beyond are not yet implemented.")
+        C_reg_dict[degree] = matrix
     return C_reg_dict
 
 
