@@ -589,6 +589,7 @@ class AlchemicalModel(ls.WeightedLinearModel):
                       metadata_file: str = "metadata.npz",
                       init_params: Union[dict, np.lib.npyio.NpzFile] = None,
                       C_regularizers: Dict = None,
+                      C_reg_free: bool = False,
                       W_sparsity_reg: float = 0.0,
                       W_sparsity_epsilon: float = 1e-12,
                       progress: str = "bar",
@@ -620,6 +621,9 @@ class AlchemicalModel(ls.WeightedLinearModel):
             C_regularizers (Dict): dictionary of regularization matrices for
                 alchemical spline coefficients. See the class docstring for
                 more information about the format.
+            C_reg_free (bool): whether the c_i is regularized in the regularization
+                term of the loss function (True) or c_i * ||w_i|| (False). Defaults
+                to False.
             W_sparse_reg (float): regularization strength for sparsity of
                 pseudo-weights (L1 penalty). Defaults to 0.0.
             W_sparsity_epsilon (float): small value for L1 penalty to avoid
@@ -747,10 +751,10 @@ class AlchemicalModel(ls.WeightedLinearModel):
 
                 # add regularizers to gram
                 if param_to_fit == "coeff":
-                    self.update_reg_gramC(gram, C_regularizers)
+                    self.update_reg_gramC(gram, C_regularizers, C_reg_free=C_reg_free)
                 elif param_to_fit == "pseudo_weights":
                     self.update_reg_gramW(gram, W_sparsity_reg, W_sparsity_epsilon,
-                                          C_regularizers)
+                                          C_regularizers, C_reg_free=C_reg_free)
                 else:
                     raise ValueError("Something went wrong.")
 
@@ -759,7 +763,9 @@ class AlchemicalModel(ls.WeightedLinearModel):
                 #reg_loss += ((C_regularizers[1] @ self.coeff[1])**2).sum()
                 #for k in range(2, self.degree+1):
                 #    L2_norm_W = np.linalg.norm(self.pseudo_weights[k], axis=0)
-                #    reg_loss += ((C_regularizers[k] @ self.coeff[k] * L2_norm_W)**2).sum()
+                #    C_reg_part = C_regularizers[k] @ self.coeff[k]
+                #    C_reg_part = C_reg_part if C_reg_free else C_reg_part * L2_norm_W
+                #    reg_loss += (C_reg_part**2).sum()
                 #reg_loss += np.abs(self.flattened_W()).sum() * W_sparsity_reg
                 #print(f"\t\tTotal loss manual: {data_loss + reg_loss}")
 
@@ -773,6 +779,11 @@ class AlchemicalModel(ls.WeightedLinearModel):
                 elif param_to_fit == "pseudo_weights":
                     # missing from 1b C_regularizers
                     total_loss += ((C_regularizers[1] @ self.coeff[1])**2).sum()
+                    if C_reg_free:
+                        # missing from 2b and 3b C_regularizers
+                        for k in range(2, self.degree+1):
+                            C_reg_part = C_regularizers[k] @ self.coeff[k]
+                            total_loss += (C_reg_part**2).sum()
                 else:
                     raise ValueError("Something went wrong.")
                 total_loss_tracker[2*i+j] = total_loss
@@ -920,7 +931,7 @@ class AlchemicalModel(ls.WeightedLinearModel):
         WX = np.hstack(WXs)
         return WX
 
-    def update_reg_gramC(self, gram, C_regularizers):
+    def update_reg_gramC(self, gram, C_regularizers, C_reg_free=False):
         """
         Update the gram matrix for fitting the alchemical spline coefficients C
         with alchemical regularizers.
@@ -930,6 +941,8 @@ class AlchemicalModel(ls.WeightedLinearModel):
             C_regularizers (Dict): dictionary of regularization matrices for
                 alchemical spline coefficients. See the class docstring for
                 more information about the format.
+            C_reg_free (bool): whether the c_i is regularized in the regularization
+                term of the loss function (True) or c_i * ||w_i|| (False).
         """
         if C_regularizers is None:
             return
@@ -949,7 +962,10 @@ class AlchemicalModel(ls.WeightedLinearModel):
             for k in range(self.n_pseudo[i]):
                 idx_lo = self.alchemical_coeff_offsets[i] + k * self.n_basis[i]
                 idx_hi = self.alchemical_coeff_offsets[i] + (k+1) * self.n_basis[i] 
-                gram[idx_lo:idx_hi, idx_lo:idx_hi] += reg_gram * L2_norm_W[k]**2
+                if C_reg_free:
+                    gram[idx_lo:idx_hi, idx_lo:idx_hi] += reg_gram
+                else:
+                    gram[idx_lo:idx_hi, idx_lo:idx_hi] += reg_gram * L2_norm_W[k]**2
 
     def initialize_gramW_ordinateW(self):
         """Initialize gram matrices and ordinates for fitting
@@ -995,7 +1011,7 @@ class AlchemicalModel(ls.WeightedLinearModel):
         return XC
 
     def update_reg_gramW(self, gram, W_sparsity_reg, W_sparsity_epsilon,
-                         C_regularizers):
+                         C_regularizers, C_reg_free=False):
         """
         Update the gram matrix for fitting the pseudo_weights W with alchemical
         regularizers.
@@ -1009,6 +1025,8 @@ class AlchemicalModel(ls.WeightedLinearModel):
             C_regularizers (Dict): dictionary of regularization matrices for
                 alchemical spline coefficients. See the class docstring for
                 more information about the format.
+            C_reg_free (bool): whether the c_i is regularized in the regularization
+                term of the loss function (True) or c_i * ||w_i|| (False).
         """
         # pseudo-weight sparsity penalty
         if W_sparsity_reg > 0:
@@ -1017,7 +1035,9 @@ class AlchemicalModel(ls.WeightedLinearModel):
                                         strength=W_sparsity_reg,
                                         epsilon=W_sparsity_epsilon)
 
-        # contribution from C_regularizers
+        # contribution from C_regularizers if C_reg_free is False
+        if C_reg_free:
+            return
         if C_regularizers is None:
             return
         for i in range(2, self.degree+1):
