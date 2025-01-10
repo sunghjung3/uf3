@@ -778,12 +778,14 @@ class AlchemicalModel(ls.WeightedLinearModel):
                         total_loss += np.abs(self.flattened_W()).sum() * W_sparsity_reg
                 elif param_to_fit == "pseudo_weights":
                     # missing from 1b C_regularizers
-                    total_loss += ((C_regularizers[1] @ self.coeff[1])**2).sum()
+                    if 1 in C_regularizers:
+                        total_loss += ((C_regularizers[1] @ self.coeff[1])**2).sum()
                     if C_reg_free:
                         # missing from 2b and 3b C_regularizers
                         for k in range(2, self.degree+1):
-                            C_reg_part = C_regularizers[k] @ self.coeff[k]
-                            total_loss += (C_reg_part**2).sum()
+                            if k in C_regularizers:
+                                C_reg_part = C_regularizers[k] @ self.coeff[k]
+                                total_loss += (C_reg_part**2).sum()
                 else:
                     raise ValueError("Something went wrong.")
                 total_loss_tracker[2*i+j] = total_loss
@@ -891,7 +893,7 @@ class AlchemicalModel(ls.WeightedLinearModel):
  
     def flattened_W(self):
         """Return the flattened pseudo-weights."""
-        return np.concatenate([self.pseudo_weights[i].flatten(order="C")
+        return np.concatenate([self.pseudo_weights[i].flatten()  # order="C"
                                for i in range(2, self.degree+1)])
 
     def initialize_gramC_ordinateC(self):
@@ -914,7 +916,7 @@ class AlchemicalModel(ls.WeightedLinearModel):
 
         Args:
             Xs (Dict[int, np.ndarray]): preprocessed feature dictionary with integer
-                keys (interaction order, >=1) and feature matrices
+                keys (interaction order, >=1) and feature matrix values
             Ws (Dict[int, np.ndarray]): pseudo_weights dictionary with integer keys
                 (interaction order, >=2) and pseudo_weight arrays
 
@@ -988,7 +990,7 @@ class AlchemicalModel(ls.WeightedLinearModel):
 
         Args:
             Xs (Dict[int, np.ndarray]): preprocessed feature dictionary with integer
-                keys (interaction order, >=1) and feature matrices
+                keys (interaction order, >=1) and feature matrix values
             Cs (Dict[int, np.ndarray]): i-body alchemical spline coefficients of
                 shape (n_basis[i], n_pseudo[i]), for valid i>=1
             return_1b (bool): whether to return the 1-body contribution.
@@ -1064,19 +1066,15 @@ class AlchemicalModelTorch(AlchemicalModel, torch.nn.Module):
     XXX: the regularizer matrix should already have frozen coefficients removed.
     """
     def __init__(self,
-                 bspline_config,
-                 n_pseudo,
-                 regularizer=None,
-                 data_coverage=None,
-                 init_params=None,
+                 bspline_config: bspline.BSplineBasis,
+                 n_pseudo: Union[int, Dict[int, int]],
+                 data_coverage: np.ndarray = None,
                  dtype=torch.float64,
                  **args):
         AlchemicalModel.__init__(self,
                                  bspline_config,
                                  n_pseudo,
-                                 regularizer,
                                  data_coverage,
-                                 init_params,
                                  **args)
         torch.nn.Module.__init__(self)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1106,84 +1104,105 @@ class AlchemicalModelTorch(AlchemicalModel, torch.nn.Module):
                                                  dtype=self.dtype, requires_grad=True)
                                 for key, val in self.pseudo_weights.items()
                                 }
-        self.regularizer = torch.tensor(self.regularizer, device=self.device,
-                                        dtype=self.dtype, requires_grad=False)
+
+    def convert2numpy(self):
+        """Convert torch tensor attributes to numpy arrays."""
+        self.coeff = {key: val.detach().cpu().numpy()
+                        for key, val in self.coeff.items()
+                        }
+        self.pseudo_weights = {key: val.detach().cpu().numpy()
+                                for key, val in self.pseudo_weights.items()
+                                }
 
     def parameters(self):
         return list(self.coeff.values()) + list(self.pseudo_weights.values())
 
-    def decompress_alchemical_parameters(self, write2self=False):
-        """Redefining parent method but with torch tensors."""
-        coefficients = [self.coeff[1]]
-        for i in range(2, self.degree+1):
-            coefficients.append( (self.pseudo_weights[i] @ self.coeff[i].T).view(-1))  # row-wise version
-        coefficients = torch.cat(coefficients)
-        if write2self:
-            coefficients = coefficients.detach().cpu().numpy()
-            coefficients = ls.revert_frozen_coefficients(coefficients,
-                                                         self.n_feats,
-                                                         self.mask,
-                                                         self.frozen_c,
-                                                         self.col_idx)
-            self.coefficients = coefficients
-        else:
-            return coefficients
+    def decompress_alchemical_parameters(self):
+        """Ensures that convert2numpy() is called before calling superclass method.
+           Then restore by calling convert2torch()."""
+        self.convert2numpy()
+        super().decompress_alchemical_parameters()
+        self.convert2torch()
 
-    def forward(self, x):
+    def forward(self, xs):
         """
         Forward pass for the alchemical model.
 
         Args:
-            x (torch.Tensor): input tensor of shape (n_data, n_elements + n_basis * n_pairtypes)
+            xs (Dict[torch.Tensor]): input tensor dictionary with integer
+                keys (interaction order, >=1) and feature matrix values
 
         Returns:
             y (torch.Tensor): output tensor of shape (n_data,)
         """
-        decompressed_params = self.decompress_alchemical_parameters(write2self=False)
-        y = torch.matmul(x, decompressed_params)
+        y = xs[1] @ self.coeff[1]
+        for i in range(2, self.degree+1):
+            y += (torch.matmul(xs[i], self.coeff[i]) * self.pseudo_weights[i]).sum(dim=(1,2))
         return y
     
     def normalize_parameters(self):
         """Normalize the alchemical model parameters."""
+        # XXX: Don't use yet.
         for i in range(2, self.degree+1):
-            normalization_factor = torch.max(torch.abs(self.pseudo_weights[i]))[0]
+            normalization_factor = torch.norm(self.pseudo_weights[i], dim=0)
             self.pseudo_weights[i] /= normalization_factor
             self.coeff[i] *= normalization_factor
 
     def regularization_loss(self,
-                            sparse_reg: float = 0.0):
+                            C_regularizers: Dict = None,
+                            W_sparsity_reg: float = 0.0,
+                            C_reg_free: bool = False,):
         """
         Compute the regularization loss for the alchemical model.
 
         Args:
-            sparse_reg (float): regularization strength for sparsity of
+            C_regularizers (Dict): dictionary of regularization matrices for
+                alchemical spline coefficients. See the class docstring for
+                more information about the format.
+            W_sparsity_reg (float): regularization strength for sparsity of
                 pseudo-weights (L1 penalty). Defaults to 0.0.
+            C_reg_free (bool): whether the c_i is regularized in the regularization
+                term of the loss function (True) or c_i * ||w_i|| (False). Defaults
+                to False.
 
         Returns:
             loss (torch.Tensor): regularization loss
         """
+        if C_regularizers is None:
+            return 0.0
         alchemical_coeffs = [self.coeff[1]]
         for i in range(2, self.degree+1):
             alchemical_coeffs.append(self.coeff[i].T.contiguous().view(-1))
         alchemical_coeffs = torch.cat(alchemical_coeffs)
         loss = torch.matmul(self.regularizer, alchemical_coeffs)
         loss = torch.sum(loss**2)
-        pseudo_weights_flat = torch.cat([self.pseudo_weights[k].view(-1)
-                                        for k in range(2, self.degree+1)])
-        loss += sparse_reg * torch.sum(torch.abs(pseudo_weights_flat))
+
+        loss = 0
+        # 1b for alchemical spline coefficients
+        if 1 in C_regularizers:
+            loss += ((torch.tensor(C_regularizers[1]) @ self.coeff[1])**2).sum()
+        # 2b, 3b, ... for alchemical spline coefficients
+        for i in range(2, self.degree+1):
+            if i in C_regularizers:
+                C_reg_part = torch.tensor(C_regularizers[i]) @ self.coeff[i]
+                if not C_reg_free:
+                    L2_norm_W = torch.norm(self.pseudo_weights[i], dim=0)
+                    C_reg_part = C_reg_part * L2_norm_W
+                loss += (C_reg_part**2).sum()
+        # sparse regularization for pseudo-weights
+        loss += W_sparsity_reg * torch.abs(self.flattened_W()).sum()
         return loss
 
     def train_from_file(self,
-                        filename: str,
-                        subset: Collection,
-                        weight: float = 0.5,
-                        sparsity_reg: float = 0.0,
-                        batch_size=1,
-                        sample_weights: Dict = None,
-                        energy_key="energy",
+                        preprocessed_file: str = "preprocessed.h5",
+                        coverage_file: str = "coverage.npz",
+                        metadata_file: str = "metadata.npz",
+                        init_params: Union[dict, np.lib.npyio.NpzFile] = None, 
+                        C_regularizers: Dict = None,
+                        C_reg_free: bool = False,
+                        W_sparsity_reg: float = 0.0,
                         progress: str = "bar",
-                        drop_columns: List[str] = None,
-                        sparse_hdf5: bool = False,
+                        batch_size: int = 1,
                         max_epochs: int = 1,
                         optimizer_class: torch.optim.Optimizer = None,
                         optimizer_kwargs: dict = {},
@@ -1194,7 +1213,6 @@ class AlchemicalModelTorch(AlchemicalModel, torch.nn.Module):
                         dataloader_n_workers: int = 0,
                         params_filename: str = "alchemical_model_params.npz",
                         tracker_filename: str = "train_tracker.npz",
-                        metadata_filename: str = "metadata.npz",
                         train_iter_filename: str = ".train_iter",
                         resume: bool = False,
                         ):
@@ -1204,22 +1222,25 @@ class AlchemicalModelTorch(AlchemicalModel, torch.nn.Module):
         optimizer.
 
         Args:
-            filename (str): path to HDF5 file.
-            subset (list): list of keys for training.
-            weight (float): parameter balancing contribution from energies
-                vs. forces. Higher values favor energies; defaults to 0.5.
-            sparse_reg (float): regularization strength for sparsity of
+            preprocessed_file (str): path to preprocessed HDF5 data file created
+                by `preprocess_for_training()`.
+            coverage_file (str): path to data coverages file created by
+                `preprocess_for_training()`.
+            metadata_file (str): path to metadata file created by
+                `preprocess_for_training()`.
+            init_params (dict | np.lib.npyio.NpzFile ): initial parameters for training.
+                Should be an object with keys 'coeff_1b', 'coeff_2b', 'pseudo_weights_2b'
+                (2b) and 'coeff_3b', 'pseudo_weights_3b' (3b).
+            C_regularizers (Dict): dictionary of regularization matrices for
+                alchemical spline coefficients. See the class docstring for
+                more information about the format.
+            C_reg_free (bool): whether the c_i is regularized in the regularization
+                term of the loss function (True) or c_i * ||w_i|| (False). Defaults
+                to False. Must be False for PyTorch training.
+            W_sparse_reg (float): regularization strength for sparsity of
                 pseudo-weights (L1 penalty). Defaults to 0.0.
-            batch_size (int): batch size, in number of tables from HDF5 file,
-                for PyTorch DataLoader.
-            sample_weights (dict):
-            energy_key (str): column name for energies, default "energy".
             progress (str): style for progress indicators.
-            drop_columns (list): list of columns to drop. Used when modifying
-                the cutoffs of the feature vectors from HDF5 file. No internal
-                checks are performed to see if dropping provided columns produce
-                features of the intended cutoffs. Use with Caution.
-            sparse_hdf5 (bool): whether the HDF5 features file is in sparse format.
+            batch_size (int): batch size for training.
             max_epochs (int): maximum number of iterations for alternating
                 least-squares optimization.
             optimizer_class (torch.optim.Optimizer): optimizer class for training.
@@ -1233,29 +1254,34 @@ class AlchemicalModelTorch(AlchemicalModel, torch.nn.Module):
             dataloader_n_workers (int): number of workers for PyTorch DataLoader.
             params_filename (str): filename for saving parameters during
                 checkpoints.
-            train_tracker (str): filename for saving training tracker during
-                checkpoints.
-            metadata_filename (str): filename for saving metadata during
-                checkpoints.
             train_iter_filename (str): filename for writing current iteration
                 number during checkpoints.
             resume (bool): whether to resume training from a previous checkpoint.
         """
+        if C_reg_free:
+            raise ValueError("C_reg_free must be False for PyTorch training\n"
+                             "because normalization at each epoch is not properly\n"
+                             "implemented yet.")
+
         init_epoch, get_params_dir, get_params_path, tracker_filename, \
-        metadata_filename, train_iter_filename, change_pw_tracker, \
-        change_coeff_tracker, rmse_e_tracker, rmse_f_tracker, \
-        time_tracker, rmse_e, rmse_f, \
-        e_variance, f_variance, energy_weight, force_weight = \
-            self.initialize_training(max_iter=max_epochs,
+        train_iter_filename, change_pw_tracker, \
+        change_coeff_tracker, time_tracker, rmse_e_tracker, rmse_f_tracker, \
+        data_loss_tracker, total_loss_tracker, params_fit_order, table_names, \
+        w_e, w_f, n_e, n_f = \
+            self.initialize_training(preprocessed_file=preprocessed_file,
+                                     coverage_file=coverage_file,
+                                     metadata_file=metadata_file,
+                                     init_params=init_params,
+                                     max_iter=max_epochs,
                                      checkpoint=checkpoint,
                                      checkpoint_dir=checkpoint_dir,
                                      params_filename=params_filename,
                                      tracker_filename=tracker_filename,
-                                     metadata_filename=metadata_filename,
                                      train_iter_filename=train_iter_filename,
                                      resume=resume,
+                                     fit_first="C",  # doesn't matter for PyTorch
                                      )
-        self.convert2torch()
+        self.convert2torch()  # converts self.coeff and self.pseudo_weights to torch tensors
 
         # Optimizer
         if optimizer_class is None:
@@ -1264,18 +1290,15 @@ class AlchemicalModelTorch(AlchemicalModel, torch.nn.Module):
             optimizer = optimizer_class(self.parameters(), **optimizer_kwargs)
 
         # Create PyTorch DataLoader
-        if not os.path.isfile(filename):
-            raise FileNotFoundError(filename)
-        _, _, table_names, _ = io.analyze_hdf_tables(filename)
         assert batch_size == 1  # XXX: for now
-        dataloader = torch_util.hdf5_dataloader(filename,
+        dataloader = torch_util.hdf5_dataloader(preprocessed_file,
                                                 table_names,
-                                                subset,
                                                 batch_size=batch_size,
-                                                sparse_hdf5=sparse_hdf5,
                                                 shuffle=shuffle,
                                                 drop_last=drop_last,
                                                 num_workers=dataloader_n_workers,
+                                                load_fn=load_preprocessed_db,
+                                                load_sparse=False,
                                                 )
         n_batches = len(dataloader)
 
@@ -1311,62 +1334,32 @@ class AlchemicalModelTorch(AlchemicalModel, torch.nn.Module):
                                                     style=progress,
                                                     total=n_batches,
                                                     leave=False)
-            for dfs in table_iterator:
-                df = dfs[0]  # we contrained batch_size=1 above
-                keys = df.index.unique(level=0).intersection(subset)
-                if len(keys) == 0:
-                    continue
-                if drop_columns != None:
-                    df.drop(columns=drop_columns,inplace=True)
-                
-                if i == 0:
-                    self.update_dataset_metadata(df,
-                                                 keys,
-                                                 e_variance,
-                                                 f_variance,
-                                                 sample_weights,
-                                                 energy_key=energy_key,
-                                                 )
-                
-                x_e, y_e, x_f, y_f = ls.dataframe_to_tuples(df.loc[keys],
-                                                            n_elements=self.n_elements,
-                                                            energy_key=energy_key,
-                                                            sample_weights=sample_weights,
-                                                            )
-                x_e, y_e = ls.freeze_columns(x_e,
-                                             y_e,
-                                             self.mask,
-                                             self.frozen_c,
-                                             self.col_idx)
-                x_f, y_f = ls.freeze_columns(x_f,
-                                             y_f,
-                                             self.mask,
-                                             self.frozen_c,
-                                             self.col_idx)
+            for batch_list in table_iterator:
+                batch = batch_list[0]  # we contrained batch_size=1 above
+                x_es, y_e, x_fs, y_f = batch
 
                 # Accumulate losses
-                x_e = torch.tensor(x_e, device=self.device, dtype=self.dtype,
-                                   requires_grad=False)
+                for key, val in x_es.items():
+                    x_es[key] = torch.tensor(val, device=self.device, dtype=self.dtype,
+                                             requires_grad=False)
                 y_e = torch.tensor(y_e, device=self.device, dtype=self.dtype,
                                    requires_grad=False)
-                p_e = self(x_e)
+                p_e = self(x_es)
                 loss_e += torch.nn.functional.mse_loss(p_e, y_e, reduction="sum")
-                x_f = torch.tensor(x_f, device=self.device, dtype=self.dtype,
-                                   requires_grad=False)
+                for key, val in x_fs.items():
+                    x_fs[key] = torch.tensor(val, device=self.device, dtype=self.dtype,
+                                             requires_grad=False)
                 y_f = torch.tensor(y_f, device=self.device, dtype=self.dtype,
                                    requires_grad=False)
-                p_f = self(x_f)
+                p_f = self(x_fs)
                 loss_f += torch.nn.functional.mse_loss(p_f, y_f, reduction="sum")
                 
             # Compute total loss
-            if i == 0:
-                energy_weight, force_weight = ls.calc_E_F_weights(e_variance.n,
-                                                                  f_variance.n,
-                                                                  e_variance.std,
-                                                                  f_variance.std)
-            loss, _ = self.combine_weighted_gram(loss_e, loss_f, 0, 0,
-                                                 energy_weight, force_weight, weight)
-            loss += self.regularization_loss(sparsity_reg)
+            loss = loss_e * w_e**2 + loss_f * w_f**2
+            data_loss_tracker[2*i: 2*i+1] = loss.item()
+            loss += self.regularization_loss(C_regularizers, W_sparsity_reg,
+                                             C_reg_free=C_reg_free)
+            total_loss_tracker[2*i: 2*i+1] = loss.item()
 
             # Backpropagation
             loss.backward()
@@ -1384,10 +1377,10 @@ class AlchemicalModelTorch(AlchemicalModel, torch.nn.Module):
             max_change_coeff = torch.max(torch.abs(self.coeff[1] - old_coeff[1])).item()
             change_coeff_tracker[1][i] = max_change_coeff
             print(f"\tMax change in 1-body coefficients: {max_change_coeff:.5E}")
-            rmse_e = torch.sqrt(loss_e.data / e_variance.n)
-            rmse_f = torch.sqrt(loss_f.data / f_variance.n)
-            rmse_e_tracker[i] = rmse_e.item()
-            rmse_f_tracker[i] = rmse_f.item()
+            rmse_e = torch.sqrt(loss_e.data / n_e)
+            rmse_f = torch.sqrt(loss_f.data / n_f)
+            rmse_e_tracker[2*i: 2*i+1] = rmse_e.item()
+            rmse_f_tracker[2*i: 2*i+1] = rmse_f.item()
             print(f"\tRMSE energy (eV/atom): {rmse_e:.5E}")
             print(f"\tRMSE force (eV/A): {rmse_f:.5E}")
             
@@ -1400,53 +1393,22 @@ class AlchemicalModelTorch(AlchemicalModel, torch.nn.Module):
             if ((i+1) % checkpoint == 0) or (i+1 == max_epochs):
                 print("Checkpointing.")
 
-                # Decompress and store to self.coefficients
-                self.decompress_alchemical_parameters(write2self=True)
-
-                if i+1 == max_epochs:
-                    # Final RMSE check
-                    self.eval()  # set model to evaluation mode
-                    print()
-                    print("Final RMSE check.")
-                    _, _, _, _, rmse_e, rmse_f = self.batched_predict(filename,
-                                                            keys=subset,
-                                                            sparse_hdf5=sparse_hdf5,
-                                                            )
-                    rmse_e_tracker[-1] = rmse_e
-                    rmse_f_tracker[-1] = rmse_f
+                # Decompress and store to self.coefficients (as NumPy arrays)
+                self.decompress_alchemical_parameters()
 
                 os.makedirs(get_params_dir(i+1), exist_ok=True)
                 #torch.save(self.state_dict(), get_params_path(i+1))
-                np.savez(get_params_path(i+1),
-                         **{f"coeff_{k}b": self.coeff[k].detach().cpu().numpy()
-                            for k in range(1, self.degree+1)},
-                         **{f"pseudo_weights_{k}b": self.pseudo_weights[k].detach().cpu().numpy()
-                            for k in range(2, self.degree+1)},
-                        )
-
+                self.save_alchemical_params(get_params_path(i+1))
                 np.savez(tracker_filename,
                          **{f"change_pw_{k}b": change_pw_tracker[k]
                             for k in range(2, self.degree+1)},
                          **{f"change_coeff_{k}b": change_coeff_tracker[k]
                             for k in range(1, self.degree+1)},
+                         time=time_tracker,
                          rmse_e=rmse_e_tracker,
                          rmse_f=rmse_f_tracker,
-                         time=time_tracker,
-                         )
-
-                np.savez(metadata_filename,
-                         latest_rmse_e=rmse_e,
-                         latest_rmse_f=rmse_f,
-                         **{f'frozen_{k}b_data_coverage': self.frozen_data_coverage[k]
-                            for k in range(2, self.degree+1)},
-                         energy_weight=energy_weight,
-                         force_weight=force_weight,
-                         energy_n=e_variance.n,
-                         energy_mean=e_variance.mean,
-                         energy_std=e_variance.std,
-                         force_n=f_variance.n,
-                         force_mean=f_variance.mean,
-                         force_std=f_variance.std,
+                         data_loss=data_loss_tracker,
+                         total_loss=total_loss_tracker,
                          )
 
                 with open(train_iter_filename, "w") as f:
