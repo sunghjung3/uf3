@@ -3,7 +3,10 @@ import os, time, warnings, re, gc, datetime
 import numpy as np
 import scipy
 from numba import jit
-import torch
+try:
+    import torch
+except ImportError:
+    print("Warning: torch import failed. AlchemicalModelTorch will not be available.")
 import tables
 try:
     from mpi4py import MPI
@@ -896,6 +899,12 @@ class AlchemicalModel(ls.WeightedLinearModel):
         return np.concatenate([self.pseudo_weights[i].flatten()  # order="C"
                                for i in range(2, self.degree+1)])
 
+    def tensorizeX(self, X, k):
+        """Tensorize the input array X for k-body interactions."""
+        n_data, _ = np.shape(X)
+        X_tensor = X.reshape(n_data, self.n_ituples[k], self.n_basis[k])
+        return X_tensor
+
     def initialize_gramC_ordinateC(self):
         """Initialize empty gram matrices and ordinates for fitting the
         alchemical spline coefficients."""
@@ -924,10 +933,9 @@ class AlchemicalModel(ls.WeightedLinearModel):
             WX (np.ndarray): feature matrix for training the alchemical spline
                 coefficients C
         """
-        n_data, _ = np.shape(Xs[2])
         WXs = [Xs[1]]
         for i in range(2, self.degree+1):
-            X_i_tensor = Xs[i].reshape(n_data, self.n_ituples[i], self.n_basis[i])
+            X_i_tensor = self.tensorizeX(Xs[i], i)
             WX_i = broad_row_krp_sum(Ws[i], X_i_tensor)
             WXs.append(WX_i)
         WX = np.hstack(WXs)
@@ -1002,7 +1010,7 @@ class AlchemicalModel(ls.WeightedLinearModel):
         n_data, _ = np.shape(Xs[2])
         XCs = []
         for i in range(2, self.degree+1):
-            X_i_tensor = Xs[i].reshape(n_data, self.n_ituples[i], self.n_basis[i])
+            X_i_tensor = self.tensorizeX(Xs[i], i)
             XC_i = X_i_tensor @ Cs[i]
             XC_i = XC_i.reshape(n_data, self.n_ituples[i] * self.n_pseudo[i])
             XCs.append(XC_i)
@@ -1056,14 +1064,7 @@ class AlchemicalModel(ls.WeightedLinearModel):
 class AlchemicalModelTorch(AlchemicalModel, torch.nn.Module):
     """
     Alchemical learning ("pseudo-interaction") model for fitting energies and
-    forces using PyTorch.
-
-    XXX: currently only 2-body interactions and all pseudo-interactions
-    must have the same spline construction and offsets are fit.
-
-    XXX: self.data_coverage is not implemented yet.
-
-    XXX: the regularizer matrix should already have frozen coefficients removed.
+    forces using PyTorch. See AlchemicalModel for more information.
     """
     def __init__(self,
                  bspline_config: bspline.BSplineBasis,
@@ -1340,14 +1341,16 @@ class AlchemicalModelTorch(AlchemicalModel, torch.nn.Module):
 
                 # Accumulate losses
                 for key, val in x_es.items():
-                    x_es[key] = torch.tensor(val, device=self.device, dtype=self.dtype,
+                    x_i_tensor = self.tensorizeX(val, int(key)) if int(key) > 1 else val
+                    x_es[key] = torch.tensor(x_i_tensor, device=self.device, dtype=self.dtype,
                                              requires_grad=False)
                 y_e = torch.tensor(y_e, device=self.device, dtype=self.dtype,
                                    requires_grad=False)
                 p_e = self(x_es)
                 loss_e += torch.nn.functional.mse_loss(p_e, y_e, reduction="sum")
                 for key, val in x_fs.items():
-                    x_fs[key] = torch.tensor(val, device=self.device, dtype=self.dtype,
+                    x_i_tensor = self.tensorizeX(val, int(key)) if int(key) > 1 else val
+                    x_fs[key] = torch.tensor(x_i_tensor, device=self.device, dtype=self.dtype,
                                              requires_grad=False)
                 y_f = torch.tensor(y_f, device=self.device, dtype=self.dtype,
                                    requires_grad=False)

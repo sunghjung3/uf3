@@ -41,7 +41,7 @@ class HDF5Dataset(torch.utils.data.Dataset):
                     idx: int):
         table_name = self.table_names[idx]
         #df = process.load_feature_db(self.filename, table_name, sparse_hdf5=self.sparse_hdf5)
-        df = self.load_fn(self.filename, table_name, *self.load_fn_kwargs)
+        df = self.load_fn(self.filename, table_name, **self.load_fn_kwargs)
         if self.subset is not None:
             keys = df.index.unique(level=0).intersection(self.subset)
             if len(keys) == 0:
