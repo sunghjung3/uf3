@@ -215,7 +215,7 @@ class WeightedLinearModel(BasicLinearModel):
     @staticmethod
     def from_dict(config):
         bspline_config = bspline.BSplineBasis.from_dict(config)
-        regularizer = config.get("regularizer", None)
+        regularizer = config.get("regularizer", 0)
         data_coverage = config.get("data_coverage", None)
         model = WeightedLinearModel(bspline_config,
                                     regularizer=regularizer,
