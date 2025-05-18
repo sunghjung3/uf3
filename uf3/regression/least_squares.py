@@ -176,7 +176,7 @@ class WeightedLinearModel(BasicLinearModel):
                  bspline_config,
                  regularizer=None,
                  data_coverage=None,
-                 set_regmat=False,
+                 set_regmat=True,
                  **params):
         super().__init__(regularizer)
         self.bspline_config = bspline_config
