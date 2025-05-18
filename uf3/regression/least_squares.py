@@ -176,6 +176,7 @@ class WeightedLinearModel(BasicLinearModel):
                  bspline_config,
                  regularizer=None,
                  data_coverage=None,
+                 set_regmat=False,
                  **params):
         super().__init__(regularizer)
         self.bspline_config = bspline_config
@@ -191,9 +192,11 @@ class WeightedLinearModel(BasicLinearModel):
         else:
             self.data_coverage = np.zeros(n_basis, dtype=bool)
 
-        if self.regularizer is None:
+        if self.regularizer is None and set_regmat:
             # initialize regularizer matrix if unspecified.
             self.set_params(**params)
+        else:
+            self.regularizer = 0.0
 
     def set_params(self, **params):
         """Set parameters from keyword arguments. Initializes
