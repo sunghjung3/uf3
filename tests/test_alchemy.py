@@ -157,3 +157,131 @@ def test_cache_reuse_not_corrupted(small_config, synth_data, tmp_path):
         np.testing.assert_allclose(b[key], a[key], rtol=1e-12, err_msg=key)
 
 
+# --- exact vs diagonal-approximate regularization (C_reg_exact) ---
+
+REG_KW = dict(ridge_1b=1e-3, ridge_2b=1e-2, ridge_3b=1e-2,
+              curvature_2b=1e-1, curvature_3b=1e-1)
+
+
+def reg_model(small_config, n_pseudo, seed=0):
+    """Model with fully populated random C~ and W."""
+    model = alchemy.AlchemicalModel(small_config, n_pseudo)
+    rng = np.random.default_rng(seed)
+    init = {"coeff_1b": rng.standard_normal(model.n_elements)}
+    for k in (2, 3):
+        init[f"coeff_{k}b"] = rng.standard_normal(
+            (model.n_basis[k], model.n_pseudo[k]))
+        init[f"pseudo_weights_{k}b"] = rng.standard_normal(
+            (model.n_ituples[k], model.n_pseudo[k]))
+    model.initialize_parameters(init)
+    return model
+
+
+def block_diag(*blocks):
+    n = sum(b.shape[0] for b in blocks)
+    out = np.zeros((n, n))
+    i = 0
+    for b in blocks:
+        out[i:i + b.shape[0], i:i + b.shape[1]] = b
+        i += b.shape[0]
+    return out
+
+
+@pytest.mark.parametrize("n_pseudo", [{2: 2, 3: 3}, {2: 1, 3: 1}])
+def test_reg_gramC_exact_is_kronecker(small_config, n_pseudo):
+    """C-step exact penalty is (W W^T) kron (R^T R) per order."""
+    model = reg_model(small_config, n_pseudo)
+    regs = alchemy.get_C_regularizers(small_config, **REG_KW)
+    gram, _ = model.initialize_gramC_ordinateC()
+    model.update_reg_gramC(gram, regs, C_reg_exact=True)
+    expect = block_diag(regs[1].T @ regs[1],
+                        *[np.kron(model.pseudo_weights[k].T @ model.pseudo_weights[k],
+                                  regs[k].T @ regs[k]) for k in (2, 3)])
+    np.testing.assert_allclose(gram, expect, rtol=0, atol=1e-12)
+
+
+@pytest.mark.parametrize("n_pseudo", [{2: 2, 3: 3}, {2: 1, 3: 1}])
+def test_reg_gramC_default_is_diagonal_approx(small_config, n_pseudo):
+    """Default C-step keeps only the diagonal blocks (pre-change behaviour)."""
+    model = reg_model(small_config, n_pseudo)
+    regs = alchemy.get_C_regularizers(small_config, **REG_KW)
+    gram, _ = model.initialize_gramC_ordinateC()
+    model.update_reg_gramC(gram, regs)
+    expect = block_diag(
+        regs[1].T @ regs[1],
+        *[np.kron(np.diag(np.diag(model.pseudo_weights[k].T
+                                  @ model.pseudo_weights[k])),
+                  regs[k].T @ regs[k]) for k in (2, 3)])
+    np.testing.assert_allclose(gram, expect, rtol=0, atol=1e-12)
+
+
+@pytest.mark.parametrize("n_pseudo", [{2: 2, 3: 3}, {2: 1, 3: 1}])
+def test_reg_gramW_exact_and_default(small_config, n_pseudo):
+    """W-step exact adds (R C~)^T (R C~) per ituple; default only its diagonal."""
+    model = reg_model(small_config, n_pseudo)
+    regs = alchemy.get_C_regularizers(small_config, **REG_KW)
+    exact, _ = model.initialize_gramW_ordinateW()
+    approx, _ = model.initialize_gramW_ordinateW()
+    model.update_reg_gramW(exact, 0.0, 1e-12, regs, C_reg_exact=True)
+    model.update_reg_gramW(approx, 0.0, 1e-12, regs)
+    blocks_exact, blocks_approx = [], []
+    for k in (2, 3):
+        RC = regs[k] @ model.coeff[k]
+        blocks_exact += [RC.T @ RC] * model.n_ituples[k]
+        blocks_approx += [np.diag(np.sum(RC ** 2, axis=0))] * model.n_ituples[k]
+    np.testing.assert_allclose(exact, block_diag(*blocks_exact), rtol=0, atol=1e-12)
+    np.testing.assert_allclose(approx, block_diag(*blocks_approx), rtol=0, atol=1e-12)
+
+
+def test_reg_exact_quadratic_equals_penalty(small_config):
+    """Both exact half-step forms evaluate to ||R C~ W||_F^2 at the current
+    parameters; the diagonal approximation does not."""
+    model = reg_model(small_config, {2: 2, 3: 3})
+    regs = alchemy.get_C_regularizers(small_config, **REG_KW)
+    penalty = sum(np.sum((regs[k] @ model.coeff[k]
+                          @ model.pseudo_weights[k].T) ** 2) for k in (2, 3))
+    one_body = model.coeff[1] @ (regs[1].T @ regs[1]) @ model.coeff[1]
+
+    gram, _ = model.initialize_gramC_ordinateC()
+    model.update_reg_gramC(gram, regs, C_reg_exact=True)
+    v = np.concatenate([model.coeff[1]]
+                       + [model.coeff[k].T.flatten() for k in (2, 3)])
+    np.testing.assert_allclose(v @ gram @ v - one_body, penalty, rtol=1e-12)
+
+    gram, _ = model.initialize_gramW_ordinateW()
+    model.update_reg_gramW(gram, 0.0, 1e-12, regs, C_reg_exact=True)
+    w = model.flattened_W()
+    np.testing.assert_allclose(w @ gram @ w, penalty, rtol=1e-12)
+
+    gram, _ = model.initialize_gramC_ordinateC()
+    model.update_reg_gramC(gram, regs)
+    assert abs(v @ gram @ v - one_body - penalty) > 1e-6 * penalty
+
+
+def test_reg_exact_equals_default_at_rank_one(small_config):
+    """With one pseudo-interaction per order the approximation is exact."""
+    model = reg_model(small_config, {2: 1, 3: 1})
+    regs = alchemy.get_C_regularizers(small_config, **REG_KW)
+    a, _ = model.initialize_gramC_ordinateC()
+    b, _ = model.initialize_gramC_ordinateC()
+    model.update_reg_gramC(a, regs, C_reg_exact=True)
+    model.update_reg_gramC(b, regs)
+    # ||w||^2 via norm() vs the dot product differ only in rounding
+    np.testing.assert_allclose(a, b, rtol=1e-14, atol=0)
+    a, _ = model.initialize_gramW_ordinateW()
+    b, _ = model.initialize_gramW_ordinateW()
+    model.update_reg_gramW(a, 0.0, 1e-12, regs, C_reg_exact=True)
+    model.update_reg_gramW(b, 0.0, 1e-12, regs)
+    np.testing.assert_allclose(a, b, rtol=1e-14, atol=0)
+
+
+def test_reg_exact_ignored_when_free(small_config):
+    """C_reg_free takes precedence; C_reg_exact must not change that path."""
+    model = reg_model(small_config, {2: 2, 3: 3})
+    regs = alchemy.get_C_regularizers(small_config, **REG_KW)
+    a, _ = model.initialize_gramC_ordinateC()
+    b, _ = model.initialize_gramC_ordinateC()
+    model.update_reg_gramC(a, regs, C_reg_free=True, C_reg_exact=True)
+    model.update_reg_gramC(b, regs, C_reg_free=True)
+    np.testing.assert_array_equal(a, b)
+

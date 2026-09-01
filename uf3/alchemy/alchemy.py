@@ -598,6 +598,7 @@ class AlchemicalModel(ls.WeightedLinearModel):
                       init_params: Union[dict, np.lib.npyio.NpzFile] = None,
                       C_regularizers: Dict = None,
                       C_reg_free: bool = False,
+                      C_reg_exact: bool = False,
                       W_sparsity_reg: float = 0.0,
                       W_sparsity_epsilon: float = 1e-12,
                       progress: str = "bar",
@@ -634,6 +635,9 @@ class AlchemicalModel(ls.WeightedLinearModel):
             C_reg_free (bool): whether the c_i is regularized in the regularization
                 term of the loss function (True) or c_i * ||w_i|| (False). Defaults
                 to False.
+            C_reg_exact (bool): use the exact quadratic form of the penalty
+                ||R C W||_F^2 in both half-steps instead of its diagonal
+                approximation. Ignored when C_reg_free is True. Defaults to False.
             W_sparse_reg (float): regularization strength for sparsity of
                 pseudo-weights (L1 penalty). Defaults to 0.0.
             W_sparsity_epsilon (float): small value for L1 penalty to avoid
@@ -777,10 +781,12 @@ class AlchemicalModel(ls.WeightedLinearModel):
 
                 # add regularizers to gram
                 if param_to_fit == "coeff":
-                    self.update_reg_gramC(gram, C_regularizers, C_reg_free=C_reg_free)
+                    self.update_reg_gramC(gram, C_regularizers, C_reg_free=C_reg_free,
+                                          C_reg_exact=C_reg_exact)
                 elif param_to_fit == "pseudo_weights":
                     self.update_reg_gramW(gram, W_sparsity_reg, W_sparsity_epsilon,
-                                          C_regularizers, C_reg_free=C_reg_free)
+                                          C_regularizers, C_reg_free=C_reg_free,
+                                          C_reg_exact=C_reg_exact)
                 else:
                     raise ValueError("Something went wrong.")
 
@@ -974,7 +980,8 @@ class AlchemicalModel(ls.WeightedLinearModel):
         return WX
 
 
-    def update_reg_gramC(self, gram, C_regularizers, C_reg_free=False):
+    def update_reg_gramC(self, gram, C_regularizers, C_reg_free=False,
+                         C_reg_exact=False):
         """
         Update the gram matrix for fitting the alchemical spline coefficients C
         with alchemical regularizers.
@@ -986,6 +993,9 @@ class AlchemicalModel(ls.WeightedLinearModel):
                 more information about the format.
             C_reg_free (bool): whether the c_i is regularized in the regularization
                 term of the loss function (True) or c_i * ||w_i|| (False).
+            C_reg_exact (bool): use the exact quadratic form of the penalty
+                ||R C W||_F^2 in both half-steps instead of its diagonal
+                approximation. Ignored when C_reg_free is True.
         """
         if C_regularizers is None:
             return
@@ -1002,11 +1012,20 @@ class AlchemicalModel(ls.WeightedLinearModel):
             reg = C_regularizers[i]
             reg_gram = reg.T @ reg
             L2_norm_W = np.linalg.norm(self.pseudo_weights[i], axis=0)
+            # exact penalty ||R C W||_F^2 is (W W^T) kron (R^T R); the default
+            # keeps only its diagonal blocks, (W W^T)_pp = ||w_p||^2
+            GW = (self.pseudo_weights[i].T @ self.pseudo_weights[i]
+                  if C_reg_exact and not C_reg_free else None)
             for k in range(self.n_pseudo[i]):
                 idx_lo = self.alchemical_coeff_offsets[i] + k * self.n_basis[i]
                 idx_hi = self.alchemical_coeff_offsets[i] + (k+1) * self.n_basis[i] 
                 if C_reg_free:
                     gram[idx_lo:idx_hi, idx_lo:idx_hi] += reg_gram
+                elif GW is not None:
+                    for k2 in range(self.n_pseudo[i]):
+                        jdx_lo = self.alchemical_coeff_offsets[i] + k2 * self.n_basis[i]
+                        jdx_hi = jdx_lo + self.n_basis[i]
+                        gram[idx_lo:idx_hi, jdx_lo:jdx_hi] += reg_gram * GW[k, k2]
                 else:
                     gram[idx_lo:idx_hi, idx_lo:idx_hi] += reg_gram * L2_norm_W[k]**2
 
@@ -1060,7 +1079,7 @@ class AlchemicalModel(ls.WeightedLinearModel):
         return XC
 
     def update_reg_gramW(self, gram, W_sparsity_reg, W_sparsity_epsilon,
-                         C_regularizers, C_reg_free=False):
+                         C_regularizers, C_reg_free=False, C_reg_exact=False):
         """
         Update the gram matrix for fitting the pseudo_weights W with alchemical
         regularizers.
@@ -1076,6 +1095,9 @@ class AlchemicalModel(ls.WeightedLinearModel):
                 more information about the format.
             C_reg_free (bool): whether the c_i is regularized in the regularization
                 term of the loss function (True) or c_i * ||w_i|| (False).
+            C_reg_exact (bool): use the exact quadratic form of the penalty
+                ||R C W||_F^2 in both half-steps instead of its diagonal
+                approximation. Ignored when C_reg_free is True.
         """
         # pseudo-weight sparsity penalty
         if W_sparsity_reg > 0:
@@ -1092,12 +1114,18 @@ class AlchemicalModel(ls.WeightedLinearModel):
         for i in range(2, self.degree+1):
             if i not in C_regularizers:
                 continue
-            DC_nonzero_sq = np.sum((C_regularizers[i] @ self.coeff[i])**2, axis=0)
+            RC = C_regularizers[i] @ self.coeff[i]
+            # exact penalty adds (R C)^T (R C) to every ituple block; the
+            # default keeps only its diagonal
+            DC_nonzero_sq = np.sum(RC**2, axis=0)
             for k in range(self.n_ituples[i]):
                 idx_lo = self.pseudo_offsets[i] + k * self.n_pseudo[i]
                 idx_hi = self.pseudo_offsets[i] + (k+1) * self.n_pseudo[i]
-                indices = np.arange(idx_lo, idx_hi)
-                gram[indices, indices] += DC_nonzero_sq
+                if C_reg_exact:
+                    gram[idx_lo:idx_hi, idx_lo:idx_hi] += RC.T @ RC
+                else:
+                    indices = np.arange(idx_lo, idx_hi)
+                    gram[indices, indices] += DC_nonzero_sq
 
 
 class AlchemicalModelTorch(AlchemicalModel,
