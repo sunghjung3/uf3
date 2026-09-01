@@ -117,6 +117,28 @@ def test_feature_matrixW_sparse_equals_dense(small_config, synth_data):
         np.testing.assert_allclose(alt_1b, ref_1b, atol=1e-12)
 
 
+@pytest.mark.parametrize("col_chunks", [1, 3])
+def test_accumulate_gram_blocks(small_config, synth_data, tmp_path, col_chunks):
+    alchemy.accumulate_gram(synth_data["preprocessed"], str(tmp_path / "gram"),
+                            progress="none", col_chunks=col_chunks)
+    tabs = load_tables(synth_data)
+    for t, xi, yi in (("e", 0, 1), ("f", 2, 3)):
+        X = {a: np.vstack([tab[xi][a].toarray() for tab in tabs])
+             for a in (1, 2, 3)}
+        y = np.concatenate([tab[yi] for tab in tabs])
+        meta = np.load(tmp_path / "gram" / "gram_meta.npz")
+        assert meta[f"yTy_{t}"] == pytest.approx(y @ y)
+        assert meta[f"n_{t}"] == len(y)
+        for a in (1, 2, 3):
+            b = np.load(tmp_path / "gram" / f"b{t}_{a}.npy")
+            np.testing.assert_allclose(b, X[a].T @ y, atol=1e-10)
+            for c in (1, 2, 3):
+                if c < a:
+                    continue
+                G = np.load(tmp_path / "gram" / f"G{t}_{a}_{c}.npy")
+                np.testing.assert_allclose(G, X[a].T @ X[c], atol=1e-10)
+
+
 def run_fit(small_config, synth_data, workdir, method, **kwargs):
     import os
     cwd = os.getcwd()
@@ -148,6 +170,32 @@ def run_fit(small_config, synth_data, workdir, method, **kwargs):
         os.chdir(cwd)
 
 
+def test_fit_paths_agree(small_config, synth_data, tmp_path):
+    base, m0 = run_fit(small_config, synth_data, tmp_path / "base", "file")
+    opt, m1 = run_fit(small_config, synth_data, tmp_path / "opt", "file",
+                      sparse_tables=True, cache_tables=True)
+    gram, m2 = run_fit(small_config, synth_data, tmp_path / "gram", "gram")
+    for tag, res, m in (("opt", opt, m1), ("gram", gram, m2)):
+        for key in base:
+            np.testing.assert_allclose(res[key], base[key], rtol=1e-6,
+                                       err_msg=f"{tag}:{key}")
+        np.testing.assert_allclose(m.coefficients, m0.coefficients,
+                                   rtol=1e-4, atol=1e-8, err_msg=tag)
+
+
+def test_fit_paths_agree_force_only(small_config, synth_data, tmp_path):
+    meta = dict(np.load(synth_data["metadata"]))
+    meta["w_e"] = 0.0
+    files = dict(synth_data, metadata=str(tmp_path / "metadata_f.npz"))
+    np.savez(files["metadata"], **meta)
+    base, m0 = run_fit(small_config, files, tmp_path / "base", "file")
+    gram, m1 = run_fit(small_config, files, tmp_path / "gram", "gram")
+    for key in ("rmse_f", "data_loss", "total_loss"):
+        np.testing.assert_allclose(gram[key], base[key], rtol=1e-6, err_msg=key)
+    np.testing.assert_allclose(m1.coefficients, m0.coefficients,
+                               rtol=1e-4, atol=1e-8)
+
+
 def test_cache_reuse_not_corrupted(small_config, synth_data, tmp_path):
     a, _ = run_fit(small_config, synth_data, tmp_path / "nc", "file",
                    sparse_tables=True, cache_tables=False)
@@ -155,6 +203,95 @@ def test_cache_reuse_not_corrupted(small_config, synth_data, tmp_path):
                    sparse_tables=True, cache_tables=True)
     for key in a:
         np.testing.assert_allclose(b[key], a[key], rtol=1e-12, err_msg=key)
+
+
+def stacked_design(model, files, w_e, w_f):
+    """Dense weighted design [w_e X_e; w_f X_f], target, and per-t parts."""
+    tabs = load_tables(files)
+    X, y = {}, {}
+    for t, xi, yi in (("e", 0, 1), ("f", 2, 3)):
+        X[t] = np.hstack([np.vstack([tab[xi][a].toarray() for tab in tabs])
+                          for a in (1, 2, 3)])
+        y[t] = np.concatenate([tab[yi] for tab in tabs])
+    return X, y
+
+
+def test_gram_rmse(small_config, synth_data, tmp_path):
+    model = make_model(small_config)
+    alchemy.accumulate_gram(synth_data["preprocessed"], str(tmp_path / "gram"),
+                            progress="none", col_chunks=2)
+    rng = np.random.default_rng(3)
+    off = {1: 0, **model.real_coeff_offsets}
+    flat = rng.standard_normal(off[4])
+    coeff = {k: flat[off[k]:off[k + 1]] for k in (1, 2, 3)}
+    X, y = stacked_design(model, synth_data, 1.0, 1.0)
+    for t in "ef":
+        ref = np.sqrt(np.mean((X[t] @ flat - y[t])**2))
+        got = alchemy.gram_rmse(str(tmp_path / "gram"), coeff, t=t)
+        assert got == pytest.approx(ref, rel=1e-10)
+
+
+def test_gram_rmse_matches_model_tracker(small_config, synth_data, tmp_path):
+    # rmse_f recorded at a half-step equals gram_rmse of the parameters
+    # entering it: run 1 iteration from init and compare the first entry.
+    model = make_model(small_config)
+    model.load_alchemical_params(synth_data["init"])
+    alchemy.accumulate_gram(synth_data["preprocessed"], str(tmp_path / "gram"),
+                            progress="none")
+    got = alchemy.gram_rmse(str(tmp_path / "gram"), model.gram_coefficients())
+    res, _ = run_fit(small_config, synth_data, tmp_path / "fit", "gram")
+    assert got == pytest.approx(res["rmse_f"][0], rel=1e-10)
+
+
+@pytest.mark.parametrize("w_e", [0.05, 0.0])
+def test_fit_linear_from_gram_matches_vanilla(small_config, synth_data,
+                                              tmp_path, w_e):
+    model = make_model(small_config)
+    reg_kw = dict(ridge_1b=1e-8, ridge_2b=1e-8, ridge_3b=1e-6,
+                  curvature_2b=1e-6, curvature_3b=1e-8)
+    meta = dict(np.load(synth_data["metadata"]))
+    meta["w_e"] = w_e
+    np.savez(tmp_path / "meta.npz", **meta)
+    alchemy.accumulate_gram(synth_data["preprocessed"], str(tmp_path / "gram"),
+                            progress="none", col_chunks=2)
+    got = model.fit_linear_from_gram(
+        str(tmp_path / "gram"), str(tmp_path / "meta.npz"),
+        alchemy.get_C_regularizers(small_config, **reg_kw))
+    # reference: vanilla UF3 normal equations with the full regularizer
+    R = small_config.get_regularization_matrix(**reg_kw)[:, model.mask]
+    X, y = stacked_design(model, synth_data, w_e, meta["w_f"])
+    A = R.T @ R
+    b = np.zeros(len(A))
+    for t, w in (("e", w_e), ("f", meta["w_f"])):
+        A += w**2 * X[t].T @ X[t]
+        b += w**2 * X[t].T @ y[t]
+    ref = np.linalg.solve(A, b)
+    flat = np.concatenate([got[k] for k in (1, 2, 3)])
+    np.testing.assert_allclose(flat, ref, rtol=1e-8, atol=1e-10)
+    from uf3.regression import least_squares as ls
+    np.testing.assert_allclose(
+        model.coefficients,
+        ls.revert_frozen_coefficients(flat, model.n_feats, model.mask,
+                                      model.frozen_c, model.col_idx))
+
+
+def test_load_populated_identical(tmp_path):
+    rng = np.random.default_rng(5)
+    for shape in [(3,), (7, 11), (4, 5, 6)]:
+        arr = rng.standard_normal(shape)
+        np.save(tmp_path / "a.npy", arr)
+        got = alchemy.load_populated(str(tmp_path / "a.npy"))
+        assert got.shape == arr.shape and got.dtype == arr.dtype
+        assert np.array_equal(got, arr)
+        assert got.flags.c_contiguous and not got.flags.writeable
+        np.save(tmp_path / "f.npy", np.asfortranarray(arr))
+        got = alchemy.load_populated(str(tmp_path / "f.npy"))
+        assert np.array_equal(got, arr) and got.shape == arr.shape
+    big = np.lib.format.open_memmap(tmp_path / "b.npy", mode="w+",
+                                    dtype=np.float64, shape=(3000, 5000))
+    big[:] = rng.standard_normal(big.shape); big.flush(); del big
+    got = alchemy.load_populated(str(tmp_path / "b.npy"))
+    assert np.array_equal(got, np.load(tmp_path / "b.npy"))
 
 
 # --- exact vs diagonal-approximate regularization (C_reg_exact) ---
@@ -284,4 +421,27 @@ def test_reg_exact_ignored_when_free(small_config):
     model.update_reg_gramC(a, regs, C_reg_free=True, C_reg_exact=True)
     model.update_reg_gramC(b, regs, C_reg_free=True)
     np.testing.assert_array_equal(a, b)
+
+
+@pytest.mark.parametrize("method", ["file", "gram"])
+def test_fit_default_unchanged_by_new_argument(small_config, synth_data,
+                                               tmp_path, method):
+    """Passing C_reg_exact=False is bitwise identical to not passing it."""
+    a, ma = run_fit(small_config, synth_data, tmp_path / f"{method}_a", method)
+    b, mb = run_fit(small_config, synth_data, tmp_path / f"{method}_b", method,
+                    C_reg_exact=False)
+    for key in a:
+        np.testing.assert_array_equal(a[key], b[key], err_msg=key)
+    np.testing.assert_array_equal(ma.coefficients, mb.coefficients)
+
+
+@pytest.mark.parametrize("method", ["file", "gram"])
+def test_fit_exact_runs_and_differs(small_config, synth_data, tmp_path, method):
+    """The exact penalty changes the fit but keeps both paths consistent."""
+    approx, ma = run_fit(small_config, synth_data, tmp_path / f"{method}_ap", method)
+    exact, me = run_fit(small_config, synth_data, tmp_path / f"{method}_ex", method,
+                        C_reg_exact=True)
+    assert not np.allclose(ma.coefficients, me.coefficients)
+    assert np.isfinite(exact["total_loss"]).all()
+
 

@@ -905,8 +905,262 @@ class AlchemicalModel(ls.WeightedLinearModel):
                     f.write(f"{i+1}\n")
                 print()
 
+    def fit_from_gram(self,
+                      gram_dir: str,
+                      metadata_file: str = "metadata.npz",
+                      coverage_file: str = "coverage.npz",
+                      init_params: Union[dict, np.lib.npyio.NpzFile] = None,
+                      C_regularizers: Dict = None,
+                      C_reg_free: bool = False,
+                      C_reg_exact: bool = False,
+                      W_sparsity_reg: float = 0.0,
+                      W_sparsity_epsilon: float = 1e-12,
+                      max_iter: int = 1,
+                      fit_first: str = "C",
+                      solver: Callable = np.linalg.solve,
+                      checkpoint: int = 10,
+                      checkpoint_dir: str = "./checkpoint",
+                      params_filename: str = "alchemical_model_params.npz",
+                      tracker_filename: str = "train_tracker.npz",
+                      ):
+        """
+        ALS training using precomputed gram blocks from `accumulate_gram()`.
+        Mathematically equivalent to `fit_from_file()` (up to floating-point
+        summation order), but each half-step contracts the precomputed
+        X^T X blocks with the current parameters instead of streaming the
+        dataset. Resume is not supported.
 
+        Args:
+            gram_dir (str): directory written by `accumulate_gram()`.
+            (remaining arguments as in `fit_from_file()`)
+        """
+        meta = np.load(os.path.join(gram_dir, "gram_meta.npz"))
+        yTy_e, yTy_f = float(meta["yTy_e"]), float(meta["yTy_f"])
+        n_e, n_f = float(meta["n_e"]), float(meta["n_f"])
+        metadata = np.load(metadata_file)
+        w_e, w_f = float(metadata["w_e"]), float(metadata["w_f"])
+        self.load_data_coverage(coverage_file)
+        orders = list(range(1, self.degree + 1))
+        ws = {t: w for t, w in (("e", w_e), ("f", w_f)) if w != 0}
+        G, b = {}, {}
+        for t in ws:
+            for a in orders:
+                b[t, a] = np.load(os.path.join(gram_dir, f"b{t}_{a}.npy"))
+                for c in orders:
+                    if c >= a:
+                        G[t, a, c] = load_populated(
+                            os.path.join(gram_dir, f"G{t}_{a}_{c}.npy"))
 
+        def block(t, a, c):
+            return G[t, a, c] if c >= a else G[t, c, a].T
+
+        def kleft(k, M):
+            # K_k^T @ M with K_k = I (kind None), kron(W, I_N) ("C") or
+            # kron(I_Z, C) ("W"), without forming K_k
+            kind, F = Kf[k]
+            if kind is None:
+                return M
+            if kind == "C":
+                Mr = M.reshape(F.shape[0], -1)
+                out = np.empty((F.shape[1], Mr.shape[1]))
+                for j in range(0, Mr.shape[1], 1 << 20):  # stream memmaps
+                    out[:, j:j + (1 << 20)] = \
+                        F.T @ np.ascontiguousarray(Mr[:, j:j + (1 << 20)])
+                return out.reshape(F.shape[1] * self.n_basis[k], M.shape[1])
+            Z = self.n_ituples[k]
+            return np.matmul(F.T, M.reshape(Z, F.shape[0], -1)).reshape(
+                Z * F.shape[1], M.shape[1])
+
+        def assemble(use_orders, badj=None):
+            # gram = K^T G K and ordinate = K^T b per t in {e, f}
+            grams, ords = {}, {}
+            for t in ws:
+                rows = []
+                for a in use_orders:
+                    cols = []
+                    for c in use_orders:
+                        Gac = block(t, a, c)
+                        GacT = Gac if a == c else np.asarray(Gac).T
+                        cols.append(kleft(a, kleft(c, GacT).T))
+                    rows.append(np.hstack(cols))
+                grams[t] = np.vstack(rows)
+                bs = {a: (b[t, a] if badj is None else badj(t, a))
+                      for a in use_orders}
+                ords[t] = np.concatenate(
+                    [kleft(a, bs[a][:, None]).ravel() for a in use_orders])
+            gram = sum(w**2 * grams[t] for t, w in ws.items())
+            ordinate = sum(w**2 * ords[t] for t, w in ws.items())
+            return gram, ordinate, grams, ords
+
+        self.initialize_parameters(init_params)
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        if fit_first == "C":
+            params_fit_order = ("coeff", "pseudo_weights")
+        elif fit_first == "W":
+            params_fit_order = ("pseudo_weights", "coeff")
+        else:
+            raise ValueError(f"Unrecognized value for `fit_first`: {fit_first}")
+        rmse_e_tracker = np.full(2 * max_iter, np.nan)
+        rmse_f_tracker = np.full(2 * max_iter, np.nan)
+        data_loss_tracker = np.full(2 * max_iter, np.nan)
+        total_loss_tracker = np.full(2 * max_iter, np.nan)
+        time_tracker = np.full(max_iter + 1, np.nan)
+        time_tracker[0] = 0
+
+        for i in range(max_iter):
+            print(f"Iteration {i+1}/{max_iter}")
+            starttime = time.time()
+            for j, param_to_fit in enumerate(params_fit_order):
+                if param_to_fit == "coeff":
+                    Kf = {1: (None, None)}
+                    Kf.update({k: ("C", self.pseudo_weights[k])
+                               for k in orders[1:]})
+                    gram, ordinate, grams, ords = assemble(orders)
+                    flat_params = self.flattened_C()
+                    yTy_e_adj, yTy_f_adj = yTy_e, yTy_f
+                else:
+                    c1 = self.coeff[1]
+                    Kf = {k: ("W", self.coeff[k]) for k in orders[1:]}
+                    badj = lambda t, a: b[t, a] - np.asarray(block(t, a, 1)) @ c1
+                    gram, ordinate, grams, ords = assemble(orders[1:], badj)
+                    flat_params = self.flattened_W()
+                    yTy_e_adj = yTy_e - 2 * c1 @ b["e", 1] \
+                        + c1 @ np.asarray(G["e", 1, 1]) @ c1 \
+                        if "e" in ws else yTy_e
+                    yTy_f_adj = yTy_f - 2 * c1 @ b["f", 1] \
+                        + c1 @ np.asarray(G["f", 1, 1]) @ c1 \
+                        if "f" in ws else yTy_f
+
+                sse_e = sse_from_gram_ordinate(grams["e"], ords["e"], yTy_e_adj,
+                                               flat_params) \
+                    if "e" in ws else np.nan
+                sse_f = sse_from_gram_ordinate(grams["f"], ords["f"], yTy_f_adj,
+                                               flat_params) \
+                    if "f" in ws else np.nan
+                rmse_e = np.sqrt(sse_e / n_e)
+                rmse_f = np.sqrt(sse_f / n_f)
+                data_loss = np.nansum([sse_e * w_e**2, sse_f * w_f**2])
+                rmse_e_tracker[2*i+j] = rmse_e
+                rmse_f_tracker[2*i+j] = rmse_f
+                data_loss_tracker[2*i+j] = data_loss
+                print(f"\t\tRMSE (energy): {rmse_e}")
+                print(f"\t\tRMSE (forces): {rmse_f}")
+                print(f"\t\tData loss: {data_loss}")
+
+                if param_to_fit == "coeff":
+                    self.update_reg_gramC(gram, C_regularizers,
+                                          C_reg_free=C_reg_free,
+                                          C_reg_exact=C_reg_exact)
+                else:
+                    self.update_reg_gramW(gram, W_sparsity_reg,
+                                          W_sparsity_epsilon,
+                                          C_regularizers, C_reg_free=C_reg_free,
+                                          C_reg_exact=C_reg_exact)
+                yTy_eff = w_e**2 * yTy_e_adj + w_f**2 * yTy_f_adj
+                total_loss = sse_from_gram_ordinate(gram, ordinate, yTy_eff,
+                                                    flat_params)
+                if param_to_fit == "coeff":
+                    if W_sparsity_reg > 0:
+                        total_loss += np.abs(self.flattened_W()).sum() \
+                            * W_sparsity_reg
+                else:
+                    if C_regularizers is not None and 1 in C_regularizers:
+                        total_loss += ((C_regularizers[1] @ self.coeff[1])**2).sum()
+                    if C_reg_free and C_regularizers is not None:
+                        for k in orders[1:]:
+                            if k in C_regularizers:
+                                total_loss += ((C_regularizers[k] @ self.coeff[k])**2).sum()
+                total_loss_tracker[2*i+j] = total_loss
+                print(f"\t\tTotal loss: {total_loss}")
+
+                fitted_params = solver(gram, ordinate)
+                if param_to_fit == "coeff":
+                    self.coeff = {1: fitted_params[:self.n_elements]}
+                    for k in orders[1:]:
+                        idx_lo = self.alchemical_coeff_offsets[k]
+                        idx_hi = self.alchemical_coeff_offsets[k+1]
+                        self.coeff[k] = fitted_params[idx_lo:idx_hi].\
+                            reshape(self.n_pseudo[k], self.n_basis[k]).T
+                else:
+                    self.pseudo_weights = {}
+                    for k in orders[1:]:
+                        idx_lo = self.pseudo_offsets[k]
+                        idx_hi = self.pseudo_offsets[k+1]
+                        self.pseudo_weights[k] = fitted_params[idx_lo:idx_hi].\
+                            reshape(self.n_ituples[k], self.n_pseudo[k])
+                        normalization_factor = \
+                            np.linalg.norm(self.pseudo_weights[k], axis=0) \
+                            / np.sqrt(self.n_ituples[k])
+                        self.pseudo_weights[k] /= normalization_factor
+                        self.coeff[k] *= normalization_factor
+
+            elapsed_time = time.time() - starttime
+            time_tracker[i+1] = elapsed_time + time_tracker[i]
+            print(f"\tTime elapsed: {elapsed_time:.3F} seconds\n")
+            if ((i+1) % checkpoint == 0) or (i+1 == max_iter):
+                self.decompress_alchemical_parameters()
+                params_dir = os.path.join(checkpoint_dir, str(i+1))
+                os.makedirs(params_dir, exist_ok=True)
+                self.save_alchemical_params(
+                    os.path.join(params_dir, params_filename))
+                np.savez(os.path.join(checkpoint_dir, tracker_filename),
+                         time=time_tracker,
+                         rmse_e=rmse_e_tracker,
+                         rmse_f=rmse_f_tracker,
+                         data_loss=data_loss_tracker,
+                         total_loss=total_loss_tracker,
+                         )
+
+    def gram_coefficients(self):
+        """Decompressed coefficients per order in gram column order."""
+        return {1: self.coeff[1],
+                **{k: (self.coeff[k] @ self.pseudo_weights[k].T).flatten(order="F")
+                   for k in range(2, self.degree + 1)}}
+
+    def fit_linear_from_gram(self,
+                             gram_dir: str,
+                             metadata_file: str,
+                             C_regularizers: Dict,
+                             ):
+        """
+        Standard (unfactorized) UF3 solve from the blocks of
+        `accumulate_gram()`, with `C_regularizers[k]` applied to every
+        k-body interaction tuple. Sets `self.coefficients` and returns the
+        solution per order in gram column order.
+        """
+        metadata = np.load(metadata_file)
+        ws = {t: float(metadata[f"w_{t}"]) for t in "ef"}
+        orders = list(range(1, self.degree + 1))
+        off = {1: 0, **self.real_coeff_offsets}
+        n = off[self.degree + 1]
+        A = np.zeros((n, n))
+        rhs = np.zeros(n)
+        for t, w in ws.items():
+            if w == 0:
+                continue
+            for a in orders:
+                rhs[off[a]:off[a + 1]] += w**2 * np.load(
+                    os.path.join(gram_dir, f"b{t}_{a}.npy"))
+                for c in orders[a - 1:]:
+                    G = np.load(os.path.join(gram_dir, f"G{t}_{a}_{c}.npy"),
+                                mmap_mode="r")
+                    for r in range(0, G.shape[0], 4096):
+                        hi = min(r + 4096, G.shape[0])
+                        A[off[a] + r:off[a] + hi, off[c]:off[c + 1]] += \
+                            w**2 * G[r:hi]
+        for k in orders:
+            RtR = C_regularizers[k].T @ C_regularizers[k]
+            for lo in range(off[k], off[k + 1], len(RtR)):
+                A[lo:lo + len(RtR), lo:lo + len(RtR)] += RtR
+        for a in orders:
+            for c in orders[a:]:
+                A[off[c]:off[c + 1], off[a]:off[a + 1]] = \
+                    A[off[a]:off[a + 1], off[c]:off[c + 1]].T
+        coef = scipy.linalg.solve(A.T, rhs, assume_a="pos", overwrite_a=True,
+                                  check_finite=False)  # A.T: F-order, no copy
+        self.coefficients = ls.revert_frozen_coefficients(
+            coef, self.n_feats, self.mask, self.frozen_c, self.col_idx)
+        return {k: coef[off[k]:off[k + 1]] for k in orders}
 
     def decompress_alchemical_parameters(self):
         """Decompress the alchemical spline coefficients and store to self.coefficients."""
@@ -1585,10 +1839,110 @@ def load_preprocessed_db(filename: str,
     return feature_dict_e, ys[0], feature_dict_f, ys[1]
 
 
+def accumulate_gram(preprocessed_file: str,
+                    out_dir: str,
+                    progress: str = "bar",
+                    col_chunks: int = 1,
+                    ):
+    """
+    Pass over the preprocessed tables accumulating the dense gram blocks
+    G{e,f}_{a}_{b} = X_a^T X_b, ordinates b{e,f}_{a} = X_a^T y, and scalar
+    statistics, saved to `out_dir` for use with `fit_from_gram()`.
+    Energy (e) and force (f) rows are kept separate so that any energy/force
+    weighting can be applied afterwards. `col_chunks` > 1 accumulates the
+    blocks involving the highest order in column slabs over repeated passes,
+    bounding memory to ~1/col_chunks of the largest block (per e/f).
+    """
+    from scipy.linalg.blas import dgemm
+    os.makedirs(out_dir, exist_ok=True)
+    path = lambda name: os.path.join(out_dir, name)
+    with tables.open_file(preprocessed_file, mode="r") as f:
+        table_names = [g._v_name for g in f.list_nodes("/")]
+    x_es = load_preprocessed_db(preprocessed_file, table_names[0],
+                                load_sparse=True)[0]
+    orders = sorted(x_es)
+    widths = {a: x_es[a].shape[1] for a in orders}
+    kmax = orders[-1]
+    bounds = np.linspace(0, widths[kmax], col_chunks + 1).astype(int)
+    del x_es
+    bvec = {(t, a): np.zeros(widths[a]) for t in "ef" for a in orders}
+    yTy = {"e": 0.0, "f": 0.0}
+    n = {"e": 0, "f": 0}
+    big = {(t, a): np.lib.format.open_memmap(
+               path(f"G{t}_{a}_{kmax}.npy"), mode="w+", dtype=np.float64,
+               shape=(widths[a], widths[kmax]))
+           for t in "ef" for a in orders}
+    for j in range(col_chunks):
+        lo, hi = bounds[j], bounds[j + 1]
+        G = {}
+        for table_name in parallel.progress_iter(table_names, style=progress,
+                                                 leave=True):
+            x_es, y_e, x_fs, y_f = load_preprocessed_db(preprocessed_file,
+                                                        table_name,
+                                                        load_sparse=True)
+            for t, xs, y in (("e", x_es, y_e), ("f", x_fs, y_f)):
+                xs = {a: np.ascontiguousarray(v.toarray())
+                      for a, v in xs.items()}
+                if j == 0:
+                    yTy[t] += y @ y
+                    n[t] += len(y)
+                    for a in orders:
+                        bvec[t, a] += xs[a].T @ y
+                for a in orders:
+                    for c in orders:
+                        if c < a or (j > 0 and c < kmax):
+                            continue
+                        xc = xs[c][:, lo:hi] if c == kmax else xs[c]
+                        if (t, a, c) not in G:
+                            G[t, a, c] = np.zeros((widths[a], xc.shape[1]),
+                                                  order="F")
+                        G[t, a, c] = dgemm(1.0, xs[a].T, xc, beta=1.0,
+                                           c=G[t, a, c], overwrite_c=True)
+        for (t, a, c), arr in G.items():
+            if c == kmax:
+                big[t, a][:, lo:hi] = arr
+            else:
+                np.save(path(f"G{t}_{a}_{c}.npy"), arr)
+        del G
+    for m in big.values():
+        m.flush()
+    for (t, a), arr in bvec.items():
+        np.save(path(f"b{t}_{a}.npy"), arr)
+    np.savez(path("gram_meta.npz"),
+             yTy_e=yTy["e"], yTy_f=yTy["f"], n_e=n["e"], n_f=n["f"])
 
 
+def load_populated(path: str):
+    """
+    Read-only mapped array like `np.load(path, mmap_mode="r")`, but with the
+    page tables populated up front (MAP_POPULATE) so that threaded BLAS over
+    the array does not page-fault.
+    """
+    m = np.load(path, mmap_mode="r")
+    with open(path, "rb") as f:
+        buf = mmap.mmap(f.fileno(), 0, flags=mmap.MAP_SHARED | mmap.MAP_POPULATE,
+                        prot=mmap.PROT_READ)
+    arr = np.frombuffer(buf, dtype=m.dtype, count=m.size, offset=m.offset)
+    if m.flags.f_contiguous and not m.flags.c_contiguous:
+        return arr.reshape(m.shape[::-1]).T
+    return arr.reshape(m.shape)
 
 
+def gram_rmse(gram_dir: str, coeff: Dict, t: str = "f"):
+    """
+    RMSE of target t ("e" or "f") for `coeff` = {order: flat vector in gram
+    column order}, from the blocks of `accumulate_gram()`.
+    """
+    path = lambda name: os.path.join(gram_dir, name)
+    meta = np.load(path("gram_meta.npz"))
+    orders = sorted(coeff)
+    sse = float(meta[f"yTy_{t}"])
+    for a in orders:
+        sse -= 2 * np.load(path(f"b{t}_{a}.npy")) @ coeff[a]
+        for c in orders[orders.index(a):]:
+            G = np.load(path(f"G{t}_{a}_{c}.npy"), mmap_mode="r")
+            sse += (2 if c > a else 1) * coeff[a] @ (G @ coeff[c])
+    return np.sqrt(sse / float(meta[f"n_{t}"]))
 
 
 def legacy_broad_row_krp_sum(A, B):
