@@ -1508,8 +1508,12 @@ class AlchemicalModelTorch(AlchemicalModel,
                  bspline_config: bspline.BSplineBasis,
                  n_pseudo: Union[int, Dict[int, int]],
                  data_coverage: np.ndarray = None,
-                 dtype=torch.float64,
+                 dtype=None,
                  **args):
+        if not TORCH_AVAILABLE:
+            raise ImportError("PyTorch is required for AlchemicalModelTorch.")
+        if dtype is None:
+            dtype = torch.float64
         AlchemicalModel.__init__(self,
                                  bspline_config,
                                  n_pseudo,
@@ -1544,7 +1548,31 @@ class AlchemicalModelTorch(AlchemicalModel,
                                 for key, val in self.pseudo_weights.items()
                                 }
 
+    def save_alchemical_params(self, path):
+        """Save detached copies of the parameters.
 
+        The parent hands the arrays straight to np.savez, which cannot take
+        tensors that require grad, and converting them in place would break the
+        optimizer's references to them.
+        """
+        def to_numpy(t):
+            return t.detach().cpu().numpy() if isinstance(t, torch.Tensor) else t
+
+        np.savez(path,
+                 **{f"coeff_{k}b": to_numpy(self.coeff[k])
+                     for k in range(1, self.degree+1)},
+                 **{f"pseudo_weights_{k}b": to_numpy(self.pseudo_weights[k])
+                     for k in range(2, self.degree+1)},
+                 )
+
+    def flattened_W(self):
+        """Torch-native counterpart of AlchemicalModel.flattened_W.
+
+        The parent builds this with np.concatenate, which cannot consume tensors
+        that require grad, so the sparsity term needs its own implementation.
+        """
+        return torch.cat([self.pseudo_weights[i].flatten()
+                          for i in range(2, self.degree+1)])
 
     def convert2numpy(self):
         """Convert torch tensor attributes to numpy arrays."""
@@ -1559,11 +1587,19 @@ class AlchemicalModelTorch(AlchemicalModel,
         return list(self.coeff.values()) + list(self.pseudo_weights.values())
 
     def decompress_alchemical_parameters(self):
-        """Ensures that convert2numpy() is called before calling superclass method.
-           Then restore by calling convert2torch()."""
+        """Store self.coefficients without rebinding the parameter tensors.
+
+        convert2numpy() followed by convert2torch() would replace every tensor
+        with a new object, orphaning the references an optimizer captured when
+        it was constructed and silently freezing training at the first
+        checkpoint. Swap in detached copies for the superclass call instead.
+        """
+        coeff, pseudo_weights = self.coeff, self.pseudo_weights
         self.convert2numpy()
-        super().decompress_alchemical_parameters()
-        self.convert2torch()
+        try:
+            super().decompress_alchemical_parameters()
+        finally:
+            self.coeff, self.pseudo_weights = coeff, pseudo_weights
 
     def forward(self, xs):
         """
@@ -1611,13 +1647,6 @@ class AlchemicalModelTorch(AlchemicalModel,
         """
         if C_regularizers is None:
             return 0.0
-        alchemical_coeffs = [self.coeff[1]]
-        for i in range(2, self.degree+1):
-            alchemical_coeffs.append(self.coeff[i].T.contiguous().view(-1))
-        alchemical_coeffs = torch.cat(alchemical_coeffs)
-        loss = torch.matmul(self.regularizer, alchemical_coeffs)
-        loss = torch.sum(loss**2)
-
         loss = 0
         # 1b for alchemical spline coefficients
         if 1 in C_regularizers:
@@ -1645,7 +1674,7 @@ class AlchemicalModelTorch(AlchemicalModel,
                         progress: str = "bar",
                         batch_size: int = 1,
                         max_epochs: int = 1,
-                        optimizer_class: torch.optim.Optimizer = None,
+                        optimizer_class: "torch.optim.Optimizer" = None,
                         optimizer_kwargs: dict = {},
                         checkpoint: int = 10,
                         checkpoint_dir: str = ".",
