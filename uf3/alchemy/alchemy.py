@@ -1233,6 +1233,122 @@ class AlchemicalModel(ls.WeightedLinearModel):
         WX = np.hstack(WXs)
         return WX
 
+    def fit_lbfgs_from_gram(self,
+                            gram_dir: str,
+                            metadata_file: str = "metadata.npz",
+                            coverage_file: str = "coverage.npz",
+                            init_params: Union[dict, np.lib.npyio.NpzFile] = None,
+                            C_regularizers: Dict = None,
+                            max_iter: int = 1000,
+                            tracker_filename: str = "lbfgs_tracker.npz",
+                            ):
+        """
+        Joint L-BFGS optimization of the factorized model on the precomputed
+        gram blocks, minimizing the same objective as `fit_from_gram()` with
+        `C_reg_exact=True`. Provided for comparison with ALS.
+
+        Args:
+            gram_dir (str): directory written by `accumulate_gram()`.
+            metadata_file (str): dataset statistics, for the e/f weights.
+            coverage_file (str): data coverage arrays.
+            init_params (dict): initial parameters, as in `fit_from_file()`.
+            C_regularizers (Dict): regularization matrices per interaction
+                order. See the class docstring for the format.
+            max_iter (int): maximum number of L-BFGS iterations.
+            tracker_filename (str): file to save the loss history to.
+
+        Returns:
+            result (scipy.optimize.OptimizeResult): the optimizer result.
+        """
+        meta = np.load(os.path.join(gram_dir, "gram_meta.npz"))
+        yTy = {t: float(meta[f"yTy_{t}"]) for t in "ef"}
+        metadata = np.load(metadata_file)
+        ws = {t: float(metadata[f"w_{t}"]) for t in "ef"}
+        ws = {t: w for t, w in ws.items() if w != 0}
+        self.load_data_coverage(coverage_file)
+        orders = list(range(1, self.degree + 1))
+        G, b = {}, {}
+        for t in ws:
+            for a in orders:
+                b[t, a] = np.load(os.path.join(gram_dir, f"b{t}_{a}.npy"))
+                for c in orders:
+                    if c >= a:
+                        G[t, a, c] = load_populated(
+                            os.path.join(gram_dir, f"G{t}_{a}_{c}.npy"))
+
+        def block(t, a, c):
+            return G[t, a, c] if c >= a else G[t, c, a].T
+
+        self.initialize_parameters(init_params)
+        shapes = [("c1", (self.n_elements,))]
+        shapes += [(f"C{k}", (self.n_basis[k], self.n_pseudo[k]))
+                   for k in orders[1:]]
+        shapes += [(f"W{k}", (self.n_ituples[k], self.n_pseudo[k]))
+                   for k in orders[1:]]
+        cuts = np.cumsum([0] + [int(np.prod(shape)) for _, shape in shapes])
+
+        def unpack(theta):
+            return {name: theta[cuts[i]:cuts[i + 1]].reshape(shape)
+                    for i, (name, shape) in enumerate(shapes)}
+
+        def pack(parts):
+            return np.concatenate([parts[name].ravel() for name, _ in shapes])
+
+        history = []
+        start = time.time()
+
+        def objective(theta):
+            p = unpack(theta)
+            coeff = {1: p["c1"]}
+            real = {1: p["c1"]}
+            for k in orders[1:]:
+                coeff[k] = p[f"C{k}"]
+                real[k] = (p[f"C{k}"] @ p[f"W{k}"].T).flatten(order="F")
+            loss = 0.0
+            d_real = {a: np.zeros_like(real[a]) for a in orders}
+            for t, w in ws.items():
+                loss += w**2 * yTy[t]
+                for a in orders:
+                    q = sum(np.asarray(block(t, a, c)) @ real[c] for c in orders)
+                    loss += w**2 * (real[a] @ q - 2 * b[t, a] @ real[a])
+                    d_real[a] += 2 * w**2 * (q - b[t, a])
+            grad = {"c1": d_real[1]}
+            for k in orders[1:]:
+                D = d_real[k].reshape(self.n_basis[k], self.n_ituples[k],
+                                      order="F")
+                grad[f"C{k}"] = D @ p[f"W{k}"]
+                grad[f"W{k}"] = D.T @ p[f"C{k}"]
+            if C_regularizers is not None:
+                if 1 in C_regularizers:
+                    R = C_regularizers[1]
+                    loss += np.sum((R @ p["c1"])**2)
+                    grad["c1"] = grad["c1"] + 2 * R.T @ (R @ p["c1"])
+                for k in orders[1:]:
+                    if k not in C_regularizers:
+                        continue
+                    R = C_regularizers[k]
+                    RtR = R.T @ R
+                    Ck, Wk = p[f"C{k}"], p[f"W{k}"]
+                    loss += np.sum((R @ Ck @ Wk.T)**2)
+                    grad[f"C{k}"] = grad[f"C{k}"] + 2 * RtR @ Ck @ (Wk.T @ Wk)
+                    grad[f"W{k}"] = grad[f"W{k}"] + 2 * Wk @ (Ck.T @ RtR @ Ck)
+            history.append((time.time() - start, loss))
+            return loss, pack(grad)
+
+        theta0 = pack({"c1": self.coeff[1],
+                       **{f"C{k}": self.coeff[k] for k in orders[1:]},
+                       **{f"W{k}": self.pseudo_weights[k] for k in orders[1:]}})
+        result = scipy.optimize.minimize(
+            objective, theta0, jac=True, method="L-BFGS-B",
+            options=dict(maxiter=max_iter, maxfun=10 * max_iter, ftol=0.0,
+                         gtol=0.0))
+        p = unpack(result.x)
+        self.coeff = {1: p["c1"], **{k: p[f"C{k}"] for k in orders[1:]}}
+        self.pseudo_weights = {k: p[f"W{k}"] for k in orders[1:]}
+        if tracker_filename:
+            np.savez(tracker_filename, time=np.array([h[0] for h in history]),
+                     total_loss=np.array([h[1] for h in history]))
+        return result
 
     def update_reg_gramC(self, gram, C_regularizers, C_reg_free=False,
                          C_reg_exact=False):

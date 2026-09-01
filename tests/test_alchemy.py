@@ -445,3 +445,112 @@ def test_fit_exact_runs_and_differs(small_config, synth_data, tmp_path, method):
     assert np.isfinite(exact["total_loss"]).all()
 
 
+# --- L-BFGS on the gram objective (comparison optimizer for ALS) ---
+
+def lbfgs_setup(small_config, synth_data, workdir):
+    import os
+    os.makedirs(workdir, exist_ok=True)
+    cwd = os.getcwd()
+    os.chdir(workdir)
+    model = make_model(small_config)
+    alchemy.accumulate_gram(synth_data["preprocessed"], "gram", progress="none")
+    regs = alchemy.get_C_regularizers(
+        small_config, ridge_1b=1e-8, ridge_2b=1e-8, ridge_3b=1e-6,
+        curvature_2b=1e-6, curvature_3b=1e-8)
+    return model, regs, np.load(synth_data["init"]), cwd
+
+
+def test_lbfgs_gradient_matches_finite_differences(small_config, synth_data,
+                                                   tmp_path):
+    import os
+    model, regs, init, cwd = lbfgs_setup(small_config, synth_data,
+                                         tmp_path / "grad")
+    try:
+        captured = {}
+        real_minimize = alchemy.scipy.optimize.minimize
+
+        def spy(fun, x0, **kwargs):
+            captured["fun"], captured["x0"] = fun, x0
+            return real_minimize(fun, x0, **dict(kwargs, options=dict(maxiter=0)))
+
+        alchemy.scipy.optimize.minimize = spy
+        try:
+            model.fit_lbfgs_from_gram("gram", metadata_file=synth_data["metadata"],
+                                      coverage_file=synth_data["coverage"],
+                                      init_params=init, C_regularizers=regs,
+                                      tracker_filename=None)
+        finally:
+            alchemy.scipy.optimize.minimize = real_minimize
+        fun, x0 = captured["fun"], captured["x0"]
+        f0, g0 = fun(x0)
+        rng = np.random.default_rng(1)
+        idx = rng.choice(len(x0), 25, replace=False)
+        h = 1e-6
+        for i in idx:
+            xp, xm = x0.copy(), x0.copy()
+            xp[i] += h
+            xm[i] -= h
+            fd = (fun(xp)[0] - fun(xm)[0]) / (2 * h)
+            np.testing.assert_allclose(g0[i], fd, rtol=2e-5,
+                                       atol=1e-6 * max(1.0, abs(f0)))
+    finally:
+        os.chdir(cwd)
+
+
+def test_lbfgs_objective_matches_als_total_loss(small_config, synth_data,
+                                                tmp_path):
+    """At the shared initial parameters the L-BFGS objective equals the total
+    loss ALS reports in its first C-step with the exact penalty."""
+    import os
+    model, regs, init, cwd = lbfgs_setup(small_config, synth_data,
+                                         tmp_path / "loss")
+    try:
+        captured = {}
+        real_minimize = alchemy.scipy.optimize.minimize
+
+        def spy(fun, x0, **kwargs):
+            captured["f0"] = fun(x0)[0]
+            return real_minimize(fun, x0, **dict(kwargs, options=dict(maxiter=0)))
+
+        alchemy.scipy.optimize.minimize = spy
+        try:
+            model.fit_lbfgs_from_gram("gram", metadata_file=synth_data["metadata"],
+                                      coverage_file=synth_data["coverage"],
+                                      init_params=init, C_regularizers=regs,
+                                      tracker_filename=None)
+        finally:
+            alchemy.scipy.optimize.minimize = real_minimize
+
+        als = make_model(small_config)
+        als.fit_from_gram("gram", metadata_file=synth_data["metadata"],
+                          coverage_file=synth_data["coverage"],
+                          init_params=init, C_regularizers=regs,
+                          C_reg_exact=True, max_iter=1, checkpoint=1)
+        tracker = np.load("checkpoint/train_tracker.npz")
+        np.testing.assert_allclose(captured["f0"], tracker["total_loss"][0],
+                                   rtol=1e-10)
+    finally:
+        os.chdir(cwd)
+
+
+def test_lbfgs_decreases_loss(small_config, synth_data, tmp_path):
+    import os
+    model, regs, init, cwd = lbfgs_setup(small_config, synth_data,
+                                         tmp_path / "run")
+    try:
+        result = model.fit_lbfgs_from_gram(
+            "gram", metadata_file=synth_data["metadata"],
+            coverage_file=synth_data["coverage"], init_params=init,
+            C_regularizers=regs, max_iter=50)
+        hist = np.load("lbfgs_tracker.npz")["total_loss"]
+        assert result.fun < hist[0]
+        assert np.isfinite(result.fun)
+        assert model.coeff[2].shape == (model.n_basis[2], model.n_pseudo[2])
+        assert model.pseudo_weights[3].shape == (model.n_ituples[3],
+                                                 model.n_pseudo[3])
+    finally:
+        os.chdir(cwd)
+
+
+torch = pytest.importorskip("torch")
+
