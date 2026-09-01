@@ -1,25 +1,30 @@
 from typing import List, Dict, Collection, Callable, Union
-import os, time, warnings, re, gc, datetime
+import os, time, warnings, re, gc, datetime, mmap
 import numpy as np
 import scipy
+import scipy.optimize
 from numba import jit
 try:
     import torch
+    TORCH_AVAILABLE = True
 except ImportError:
     print("Warning: torch import failed. AlchemicalModelTorch will not be available.")
+    TORCH_AVAILABLE = False
 import tables
+import fasteners
 try:
     from mpi4py import MPI
-    import fasteners
     GLOBAL_USE_MPI = True
 except ImportError:
-    print("MPI not available: trouble importing mpi4py and/or fasteners.")
+    print("MPI not available: trouble importing mpi4py.")
     GLOBAL_USE_MPI = False
 from uf3.data import io
 from uf3.representation import bspline, process
 from uf3.regression import least_squares as ls
 from uf3.regression import regularize
-from uf3.util import user_config, torch_util, parallel
+from uf3.util import user_config, parallel
+if TORCH_AVAILABLE:
+    from uf3.util import torch_util
 
 
 class AlchemicalModel(ls.WeightedLinearModel):
@@ -605,6 +610,8 @@ class AlchemicalModel(ls.WeightedLinearModel):
                       resume: bool = False,
                       fit_first: str = "C",
                       solver: Callable = np.linalg.solve,
+                      sparse_tables: bool = False,
+                      cache_tables: bool = False,
                       ):
         """
         Accumulate inputs and outputs from batched parsing of HDF5 file
@@ -647,6 +654,10 @@ class AlchemicalModel(ls.WeightedLinearModel):
                 coefficients and "W" for pseudo-weights. Defaults to "C".
             solver (Callable): linear algebra solver to use. Defaults to
                 `np.linalg.solve`.
+            sparse_tables (bool): keep feature tables sparse and use sparse
+                contractions to build the effective feature matrices.
+            cache_tables (bool): keep loaded tables in memory across ALS
+                iterations instead of re-reading them from disk.
         """
         ### Initialize training ###
         init_iter, get_params_dir, get_params_path, tracker_filename, \
@@ -668,6 +679,8 @@ class AlchemicalModel(ls.WeightedLinearModel):
                                      fit_first=fit_first,
                                      )
         
+        table_cache = {}
+
         ### Outer-most ALS loop ###
         print(f"Beginning alternating least-squares optimization:")
         print(f"\tResume: {resume}")
@@ -706,9 +719,19 @@ class AlchemicalModel(ls.WeightedLinearModel):
                                                         style=progress,
                                                         leave=False)
                 for table_name in table_iterator:
-                    x_es, y_e, x_fs, y_f = load_preprocessed_db(preprocessed_file,
-                                                                table_name,
-                                                                load_sparse=False)
+                    if table_name in table_cache:
+                        x_es, y_e, x_fs, y_f = table_cache[table_name]
+                    else:
+                        x_es, y_e, x_fs, y_f = load_preprocessed_db(preprocessed_file,
+                                                                    table_name,
+                                                                    load_sparse=sparse_tables)
+                        if sparse_tables:
+                            x_es[1] = x_es[1].toarray()
+                            x_fs[1] = x_fs[1].toarray()
+                        if cache_tables:
+                            table_cache[table_name] = (x_es, y_e, x_fs, y_f)
+                    y_e = y_e.copy()  # mutated below; keep cached originals intact
+                    y_f = y_f.copy()
 
                     if param_to_fit == "coeff":
                         feature_matrix_e = self.feature_matrixC(x_es, self.pseudo_weights)
@@ -876,6 +899,9 @@ class AlchemicalModel(ls.WeightedLinearModel):
                     f.write(f"{i+1}\n")
                 print()
 
+
+
+
     def decompress_alchemical_parameters(self):
         """Decompress the alchemical spline coefficients and store to self.coefficients."""
         coefficients = [self.coeff[1]]
@@ -935,11 +961,18 @@ class AlchemicalModel(ls.WeightedLinearModel):
         """
         WXs = [Xs[1]]
         for i in range(2, self.degree+1):
-            X_i_tensor = self.tensorizeX(Xs[i], i)
-            WX_i = broad_row_krp_sum(Ws[i], X_i_tensor)
+            if scipy.sparse.issparse(Xs[i]):
+                K = scipy.sparse.kron(scipy.sparse.csr_matrix(Ws[i]),
+                                      scipy.sparse.identity(self.n_basis[i]),
+                                      format="csr")
+                WX_i = np.asarray((Xs[i] @ K).todense())
+            else:
+                X_i_tensor = self.tensorizeX(Xs[i], i)
+                WX_i = broad_row_krp_sum(Ws[i], X_i_tensor)
             WXs.append(WX_i)
         WX = np.hstack(WXs)
         return WX
+
 
     def update_reg_gramC(self, gram, C_regularizers, C_reg_free=False):
         """
@@ -1007,12 +1040,18 @@ class AlchemicalModel(ls.WeightedLinearModel):
             XC (np.ndarray): feature matrix for training the pseudo_weights W
             Y_hat_1b (np.ndarray): 1-body contribution
         """
-        n_data, _ = np.shape(Xs[2])
+        n_data = np.shape(Xs[2])[0]
         XCs = []
         for i in range(2, self.degree+1):
-            X_i_tensor = self.tensorizeX(Xs[i], i)
-            XC_i = X_i_tensor @ Cs[i]
-            XC_i = XC_i.reshape(n_data, self.n_ituples[i] * self.n_pseudo[i])
+            if scipy.sparse.issparse(Xs[i]):
+                K = scipy.sparse.kron(scipy.sparse.identity(self.n_ituples[i]),
+                                      scipy.sparse.csr_matrix(Cs[i]),
+                                      format="csr")
+                XC_i = np.asarray((Xs[i] @ K).todense())
+            else:
+                X_i_tensor = self.tensorizeX(Xs[i], i)
+                XC_i = X_i_tensor @ Cs[i]
+                XC_i = XC_i.reshape(n_data, self.n_ituples[i] * self.n_pseudo[i])
             XCs.append(XC_i)
         XC = np.hstack(XCs)
         if return_1b:
@@ -1061,7 +1100,8 @@ class AlchemicalModel(ls.WeightedLinearModel):
                 gram[indices, indices] += DC_nonzero_sq
 
 
-class AlchemicalModelTorch(AlchemicalModel, torch.nn.Module):
+class AlchemicalModelTorch(AlchemicalModel,
+                           torch.nn.Module if TORCH_AVAILABLE else object):
     """
     Alchemical learning ("pseudo-interaction") model for fitting energies and
     forces using PyTorch. See AlchemicalModel for more information.
@@ -1105,6 +1145,8 @@ class AlchemicalModelTorch(AlchemicalModel, torch.nn.Module):
                                                  dtype=self.dtype, requires_grad=True)
                                 for key, val in self.pseudo_weights.items()
                                 }
+
+
 
     def convert2numpy(self):
         """Convert torch tensor attributes to numpy arrays."""
@@ -1513,6 +1555,12 @@ def load_preprocessed_db(filename: str,
             ys.append(y)
 
     return feature_dict_e, ys[0], feature_dict_f, ys[1]
+
+
+
+
+
+
 
 
 def legacy_broad_row_krp_sum(A, B):
