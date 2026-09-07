@@ -51,6 +51,9 @@ Getting Started
 
 Please see the examples in uf3/examples/tungsten_extxyz for basic usage.
 
+For PI-UF3 (pseudo-interaction UF3, the factorized model of the ``uf3.alchemy``
+module), start with the notebook in uf3/examples/pi_uf3_tutorial.
+
 Overviews for individual modules can be found in uf3/examples/modules
 (WIP).
 
