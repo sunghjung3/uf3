@@ -1255,7 +1255,13 @@ class AlchemicalModel(ls.WeightedLinearModel):
             C_regularizers (Dict): regularization matrices per interaction
                 order. See the class docstring for the format.
             max_iter (int): maximum number of L-BFGS iterations.
-            tracker_filename (str): file to save the loss history to.
+            tracker_filename (str): file to save the loss history to. Holds
+                one entry per objective evaluation: `time` (seconds since the
+                start), `total_loss` (the objective) and `data_loss` (the
+                objective without the regularization penalty, i.e.
+                sum_t w_t^2 ||y_t - X_t c||^2, from which the force RMSE
+                follows as sqrt(data_loss) / (w_f sqrt(n_f)) when only
+                forces are fit).
 
         Returns:
             result (scipy.optimize.OptimizeResult): the optimizer result.
@@ -1318,6 +1324,7 @@ class AlchemicalModel(ls.WeightedLinearModel):
                                       order="F")
                 grad[f"C{k}"] = D @ p[f"W{k}"]
                 grad[f"W{k}"] = D.T @ p[f"C{k}"]
+            data_loss = loss
             if C_regularizers is not None:
                 if 1 in C_regularizers:
                     R = C_regularizers[1]
@@ -1332,7 +1339,7 @@ class AlchemicalModel(ls.WeightedLinearModel):
                     loss += np.sum((R @ Ck @ Wk.T)**2)
                     grad[f"C{k}"] = grad[f"C{k}"] + 2 * RtR @ Ck @ (Wk.T @ Wk)
                     grad[f"W{k}"] = grad[f"W{k}"] + 2 * Wk @ (Ck.T @ RtR @ Ck)
-            history.append((time.time() - start, loss))
+            history.append((time.time() - start, loss, data_loss))
             return loss, pack(grad)
 
         theta0 = pack({"c1": self.coeff[1],
@@ -1347,7 +1354,8 @@ class AlchemicalModel(ls.WeightedLinearModel):
         self.pseudo_weights = {k: p[f"W{k}"] for k in orders[1:]}
         if tracker_filename:
             np.savez(tracker_filename, time=np.array([h[0] for h in history]),
-                     total_loss=np.array([h[1] for h in history]))
+                     total_loss=np.array([h[1] for h in history]),
+                     data_loss=np.array([h[2] for h in history]))
         return result
 
     def update_reg_gramC(self, gram, C_regularizers, C_reg_free=False,
