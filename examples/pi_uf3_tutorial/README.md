@@ -1,7 +1,7 @@
 # PI-UF3 tutorial
 
 `pi_uf3_hea5_tutorial.ipynb` trains and evaluates pseudo-interaction UF3 (PI-UF3) models on the
-five-element refractory alloy dataset of Byggmästar, Nordlund and Djurabekova, from download to an
+five-element refractory alloy dataset of Byggmästar, Nordlund, and Djurabekova, from download to an
 exported UF3 model. It is the notebook distributed with the PI-UF3 paper.
 
 Create an environment with Jupyter, then open the notebook; its first cells install this fork:
